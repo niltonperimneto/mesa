@@ -13,6 +13,8 @@
 
 #include "kosmickrisp/bridge/mtl_format.h"
 
+#include "poly/nir/poly_nir.h"
+
 #include "vk_pipeline_cache.h"
 
 #include "vk_shader.h"
@@ -95,7 +97,12 @@ struct kk_shader_info {
          uint8_t tcs_nr_patch_outputs;
 
          struct kk_tess_info info;
+
+         /* Outputs a TES stores for a GS */
+         uint64_t tes_outputs;
       } tess;
+
+      struct poly_gs_info gs;
 
       struct {
          bool uses_flat_varyings;
@@ -107,13 +114,18 @@ struct kk_shader_info {
    };
 };
 
+/* Threadgroup size the VS, TES and GS compute passes are compiled for and
+ * dispatched with */
+#define KK_POLY_WG_SIZE 64u
+
 /* Metal handles for binding. */
 struct kk_pipeline_handles {
    union {
       struct {
          mtl_render_pipeline_state *render;
-         /* Vertex, tess ctrl and tess eval at most needed before pre-render. */
-         mtl_compute_pipeline_state *pre_render[3];
+         /* VS, TCS, TES and the GS compute pass at most run before the render
+          * pipeline. */
+         mtl_compute_pipeline_state *pre_render[4];
          mtl_depth_stencil_state *ds_handle;
          uint32_t pre_render_count;
       } gfx;
@@ -132,6 +144,9 @@ struct kk_shader {
    struct kk_pipeline_handles pipeline;
    struct kk_shader_info info;
    struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+   /* Compute pass of a GS. Its rasterization VS is in
+    * msl_data[MESA_SHADER_GEOMETRY]. */
+   struct msl_compile_data gs_main;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
