@@ -172,6 +172,12 @@ etna_resource_can_use_ts(struct etna_screen *screen,
    if (format_is_128bit(prsc->format))
       return false;
 
+   /* Without BLT_8bpp_256TILE_FC_FIX the BLT can not fast clear 8 bpp MSAA */
+   if (screen->specs.use_blt && prsc->nr_samples > 1 &&
+       util_format_get_blocksize(prsc->format) == 1 &&
+       !VIV_FEATURE(screen, ETNA_FEATURE_BLT_8BPP_256TILE_FC_FIX))
+      return false;
+
    return true;
 }
 
@@ -224,6 +230,9 @@ etna_screen_resource_alloc_ts(struct pipe_screen *pscreen,
          else
             ts_mode = TS_MODE_128B;
       }
+   } else if (VIV_FEATURE(screen, ETNA_FEATURE_SMALL_MSAA) &&
+              prsc->nr_samples > 1 && ts_compress_fmt >= 0) {
+      ts_mode = TS_MODE_256B;
    }
 
    tile_size = etna_screen_get_tile_size(screen, ts_mode, prsc->nr_samples > 1);

@@ -217,6 +217,7 @@ etna_set_framebuffer_state(struct pipe_context *pctx,
    int nr_samples_color = -1;
    int nr_samples_depth = -1;
    bool target_16bpp = false;
+   bool target_s8 = false;
    bool target_linear = false;
 
    /* keep copy of original structure */
@@ -234,6 +235,7 @@ etna_set_framebuffer_state(struct pipe_context *pctx,
    unsigned rt_output[PIPE_MAX_COLOR_BUFS] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 
    ctx->framebuffer_s.rt_is_128bit = 0;
+   ctx->framebuffer_s.rt_pack_rgba16 = 0;
    memset(ctx->framebuffer_s.rt_companion, 0, sizeof(ctx->framebuffer_s.rt_companion));
    memset(ctx->framebuffer_s.companion_src, -1, sizeof(ctx->framebuffer_s.companion_src));
 
@@ -256,7 +258,16 @@ etna_set_framebuffer_state(struct pipe_context *pctx,
       struct etna_resource_level *level = &res->levels[surf->level];
 
       bool color_supertiled = (res->layout & ETNA_LAYOUT_BIT_SUPER) != 0;
-      uint32_t fmt = translate_pe_format(surf->format, screen);
+
+      enum pipe_format pe_format = surf->format;
+      if ((surf->format == PIPE_FORMAT_R16G16B16A16_UINT ||
+           surf->format == PIPE_FORMAT_R16G16B16A16_SINT) &&
+          !VIV_FEATURE(screen, ETNA_FEATURE_PE_RGBA16I_FIX)) {
+         ctx->framebuffer_s.rt_pack_rgba16 |= 1u << i;
+         pe_format = PIPE_FORMAT_R32G32_UINT;
+      }
+
+      uint32_t fmt = translate_pe_format(pe_format, screen);
       bool rt_use_ts = etna_framebuffer_rt_use_ts(ctx, i);
 
       /* Resolve TS if this target cannot use it */
@@ -385,7 +396,7 @@ etna_set_framebuffer_state(struct pipe_context *pctx,
       static_assert((VIVS_PS_CONTROL_EXT_OUTPUT_MODE0__MASK << 28) == VIVS_PS_CONTROL_EXT_OUTPUT_MODE7__MASK, "VIVS_PS_CONTROL_EXT_OUTPUT_MODE7__MASK");
 
       cs->PS_CONTROL_EXT |=
-         translate_output_mode(surf->format, screen->info->halti >= 5) << (4 * rt);
+         translate_output_mode(pe_format, screen->info->halti >= 5) << (4 * rt);
 
       /* When there are null render targets we need to modify the fragment
        * shader output mapping.
@@ -444,8 +455,10 @@ etna_set_framebuffer_state(struct pipe_context *pctx,
       /* VIVS_PE_DEPTH_CONFIG_ONLY_DEPTH */
       /* merged with depth_stencil_alpha */
 
-      if (surf->format == PIPE_FORMAT_S8_UINT)
+      if (surf->format == PIPE_FORMAT_S8_UINT) {
          pe_logic_op |= VIVS_PE_LOGIC_OP_UNK20(1);
+         target_s8 = true;
+      }
 
       for (int i = 0; i < screen->specs.pixel_pipes; i++) {
          cs->PE_PIPE_DEPTH_ADDR[i].bo = res->bo;
@@ -547,7 +560,7 @@ etna_set_framebuffer_state(struct pipe_context *pctx,
    if (unlikely(target_linear))
       pe_logic_op |= VIVS_PE_LOGIC_OP_SINGLE_BUFFER(1);
    else if (screen->specs.single_buffer)
-      pe_logic_op |= VIVS_PE_LOGIC_OP_SINGLE_BUFFER(target_16bpp ? 3 : 2);
+      pe_logic_op |= VIVS_PE_LOGIC_OP_SINGLE_BUFFER(target_16bpp || target_s8 ? 3 : 2);
    cs->PE_LOGIC_OP = pe_logic_op;
 
    ctx->dirty |= ETNA_DIRTY_FRAMEBUFFER | ETNA_DIRTY_DERIVE_TS;
