@@ -3407,3 +3407,44 @@ kk_CmdEndTransformFeedback2EXT(
    kk_begin_end_xfb(cmd, firstCounterRange, counterRangeCount, pCounterInfos,
                     false);
 }
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdDrawIndirectByteCount2EXT(
+   VkCommandBuffer commandBuffer, uint32_t instanceCount,
+   uint32_t firstInstance,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pCounterInfo,
+   uint32_t counterOffset, uint32_t vertexStride)
+{
+   /* Metal validation complains about draws with no instances. */
+   if (instanceCount == 0)
+      return;
+
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+
+   struct kk_ptr draw = kk_pool_alloc(cmd, sizeof(VkDrawIndirectCommand), 4u);
+   if (unlikely(!draw.gpu))
+      return;
+
+   libkk_draw_byte_count(cmd, kk_grid_1d(1u), true, draw.gpu,
+                         pCounterInfo->addressRange.address, counterOffset,
+                         vertexStride, instanceCount, firstInstance);
+
+   struct kk_draw_command data = {
+      .prim = vk_topology_to_mesa(dyn->ia.primitive_topology),
+      .upload_mask = build_per_draw_upload_mask(cmd),
+      .indirect = true,
+      .predicate_count = cmd->state.cond_render.enabled ? 1u : 0u,
+      .predicate_op[0] = cmd->state.cond_render.inverted
+                            ? KK_PREDICATE_EQ_ZERO
+                            : KK_PREDICATE_NEQ_ZERO,
+      .draw_count = 1,
+      .predicate_addr[0] = cmd->state.cond_render.address,
+      .indirect_command.addr = draw.gpu,
+      .indirect_command.stride = sizeof(VkDrawIndirectCommand),
+   };
+
+   kk_draw(cmd, &data);
+}
