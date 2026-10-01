@@ -881,6 +881,23 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
          return true;
       }
       return false;
+   case nir_intrinsic_ro_to_rw_poly:
+      /* KK uses the same address for reads and writes. */
+      nir_def_replace(&intrin->def, intrin->src[0].ssa);
+      return true;
+   case nir_intrinsic_load_stat_query_address_poly: {
+      /* KK doesn't expose pipeline statistics. Let pre-GS write them to the
+       * same scratch word as the unused overflow counters. */
+      b->cursor = nir_instr_remove(&intrin->instr);
+      nir_def *params = load_per_draw(
+         b, 1, 64, nir_imm_int(b, kk_per_draw_offset(geometry_params)), 4);
+      nir_def *addr = nir_load_global(
+         b, 1, 64,
+         nir_iadd_imm(b, params,
+                      offsetof(struct poly_geometry_params, xfb_any_overflow)));
+      nir_def_rewrite_uses(&intrin->def, addr);
+      return true;
+   }
    default:
       return false;
    }

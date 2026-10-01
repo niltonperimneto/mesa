@@ -1639,6 +1639,35 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
    struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
    if (gfx->point.gs && fs)
       params.flat_outputs = fs->info.fs.flat_inputs;
+   if (gs->xfb) {
+      if (!gfx->xfb.scratch) {
+         const uint32_t zero[2] = {0u};
+         gfx->xfb.scratch = kk_pool_upload(cmd, zero, sizeof(zero), 4).gpu;
+      }
+
+      uint64_t zero = gfx->xfb.scratch;
+      uint64_t scratch = gfx->xfb.scratch + sizeof(uint32_t);
+
+      for (unsigned i = 0; i < POLY_MAX_SO_BUFFERS; ++i) {
+         if (gfx->xfb.enabled) {
+            params.xfb_base_original[i] = gfx->xfb.buffers[i].addr;
+            params.xfb_size[i] = gfx->xfb.buffers[i].range;
+            params.xfb_offs_ptrs[i] = gfx->xfb.offsets + i * sizeof(uint32_t);
+         } else {
+            params.xfb_offs_ptrs[i] = zero;
+         }
+      }
+
+      for (unsigned i = 0; i < POLY_MAX_VERTEX_STREAMS; ++i) {
+         uint64_t q = gfx->xfb.queries[i];
+         params.xfb_prims_generated_counter[i] = q ? q : scratch;
+         params.prims_generated_counter[i] = q ? q + sizeof(uint64_t) : scratch;
+         params.xfb_overflow[i] = scratch;
+      }
+
+      params.xfb_any_overflow = scratch;
+      params.count_buffer_stride = gs->count_words * sizeof(uint32_t);
+   }
 
    if (indirect) {
       /* The indirect setup kernel writes the draw and allocates from the
@@ -1651,6 +1680,11 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
 
       gfx->gs.index_count = params.draw.index_count;
       gfx->gs.instance_count = params.draw.instance_count;
+
+      uint32_t count_size_B =
+         params.input_primitives * params.count_buffer_stride;
+      if (gs->prefix_sum && count_size_B)
+         params.count_buffer = kk_pool_alloc(cmd, count_size_B, 4).gpu;
 
       if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          uint32_t size_B = gfx->gs.index_count * sizeof(uint32_t);
@@ -2631,6 +2665,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
          .heap = kk_heap(cmd),
          .vs_outputs = kk_gs_input_outputs(cmd),
          .prim = mode,
+         .is_prefix_summing = gs->prefix_sum,
          .max_indices = gs->max_indices,
          .shape = shape,
       };
@@ -2667,6 +2702,29 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    mtl_compute_set_pipeline_state(
       enc, gfx->pre_render[pre_render_count - 2u]);
    kk_dispatch_compute(enc, grid_vs, local_size);
+
+   /* Prefix sum the dynamic counts to find each primitive's capture offset.
+    * Pre-GS limits capture to the buffer space and updates offsets and queries.
+    * This doesn't limit rasterization. */
+   if (gs->xfb) {
+      if (gs->count_words) {
+         mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                          MTL_STAGE_DISPATCH);
+         mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.gs_count);
+         kk_dispatch_compute(enc, grid_gs, local_size);
+      }
+
+      if (gs->prefix_sum) {
+         libkk_prefix_sum_geom(cmd, kk_grid_1d(1024u * gs->count_words), true,
+                               geometry_params);
+      }
+
+      mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                       MTL_STAGE_DISPATCH);
+      mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.pre_gs);
+      mtl_dispatch_threads(enc, (struct mtl_size){1u, 1u, 1u},
+                           (struct mtl_size){1u, 1u, 1u});
+   }
 
    if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED ||
        (cmd->state.shaders[MESA_SHADER_GEOMETRY]
@@ -3241,4 +3299,88 @@ kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
    };
 
    kk_draw(cmd, &data);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBindTransformFeedbackBuffers2EXT(
+   VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pBindingInfos)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   for (uint32_t i = 0; i < bindingCount; i++) {
+      cmd->state.gfx.xfb.buffers[firstBinding + i] = (struct kk_addr_range){
+         .addr = pBindingInfos[i].addressRange.address,
+         .range = pBindingInfos[i].addressRange.size,
+      };
+   }
+}
+
+/* Draws use offsets in command buffer memory. Begin reads supplied counters
+ * and zeros the rest. End writes offsets back to supplied counters. */
+static void
+kk_begin_end_xfb(struct kk_cmd_buffer *cmd, uint32_t first_counter,
+                 uint32_t counter_count,
+                 const VkBindTransformFeedbackBuffer2InfoEXT *counters,
+                 bool begin)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+
+   gfx->xfb.enabled = begin;
+
+   if (!gfx->xfb.offsets) {
+      gfx->xfb.offsets =
+         kk_pool_alloc(cmd, POLY_MAX_SO_BUFFERS * sizeof(uint32_t), 4).gpu;
+   }
+
+   struct libkk_xfb_counter_copy params = {};
+   unsigned copies = 0;
+
+   if (begin) {
+      for (copies = 0; copies < POLY_MAX_SO_BUFFERS; ++copies)
+         params.dest[copies] = gfx->xfb.offsets + copies * sizeof(uint32_t);
+   }
+
+   for (uint32_t i = 0; counters && i < counter_count; ++i) {
+      uint64_t addr = counters[i].addressRange.address;
+      if (!addr)
+         continue;
+
+      uint32_t idx = first_counter + i;
+      if (begin) {
+         params.src[idx] = addr;
+      } else {
+         params.dest[copies] = addr;
+         params.src[copies] = gfx->xfb.offsets + idx * sizeof(uint32_t);
+         ++copies;
+      }
+   }
+
+   if (copies > 0) {
+      libkk_copy_xfb_counters(
+         cmd, kk_grid_1d(copies), true,
+         kk_pool_upload(cmd, &params, sizeof(params), 8).gpu);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginTransformFeedback2EXT(
+   VkCommandBuffer commandBuffer, uint32_t firstCounterRange,
+   uint32_t counterRangeCount,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pCounterInfos)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_begin_end_xfb(cmd, firstCounterRange, counterRangeCount, pCounterInfos,
+                    true);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdEndTransformFeedback2EXT(
+   VkCommandBuffer commandBuffer, uint32_t firstCounterRange,
+   uint32_t counterRangeCount,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pCounterInfos)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_begin_end_xfb(cmd, firstCounterRange, counterRangeCount, pCounterInfos,
+                    false);
 }
