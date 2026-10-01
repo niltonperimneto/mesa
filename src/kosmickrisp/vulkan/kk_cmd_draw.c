@@ -1026,8 +1026,8 @@ kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
    }
 }
 
-/* The VS keeps the pipeline's GS info. Return NULL if the pipeline has no
- * GS. */
+/* The VS keeps the pipeline's GS info, including a passthrough GS added
+ * for transform feedback. Return NULL if the pipeline has no GS. */
 static const struct poly_gs_info *
 kk_gs_info(struct kk_cmd_buffer *cmd)
 {
@@ -1611,8 +1611,15 @@ kk_gs_in_prim(struct kk_cmd_buffer *cmd)
    if (cmd->state.shaders[MESA_SHADER_TESS_EVAL])
       return cmd->state.gfx.tess.prim;
 
-   return vk_topology_to_mesa(
-      cmd->vk.dynamic_graphics_state.ia.primitive_topology);
+   enum mesa_prim prim =
+      vk_topology_to_mesa(cmd->vk.dynamic_graphics_state.ia.primitive_topology);
+
+   /* Unroll adjacency to lines or triangles before the passthrough GS. */
+   if (!cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
+       mesa_prim_has_adjacency(prim))
+      return u_reduced_prim(prim);
+
+   return prim;
 }
 
 static uint64_t
@@ -2400,13 +2407,15 @@ requires_unroll_flatshade(struct kk_cmd_buffer *cmd,
 static bool
 requires_unroll(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
-   /* No need to unroll for tessellation. Robustness is handled by tessellator,
-    * restart is not supported for patch lists, and flat-shading does not have a
-    * well-defined vertex used when tessellating. A GS reads any index size and
-    * topology through poly's bounds-checked input assembly, and
-    * kk_draw_without_restart unrolls restart before it runs. */
+   /* Tessellation doesn't need unrolling: the tessellator handles robustness,
+    * patch lists don't restart, and tessellation has no well-defined provoking
+    * vertex. A GS handles index sizes and topologies through poly's
+    * bounds-checked input assembly, with restart already unrolled by
+    * kk_draw_without_restart. A passthrough GS still needs adjacency unrolled,
+    * just like a draw without a GS. */
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
-   bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY] ||
+               (kk_gs_info(cmd) && !mesa_prim_has_adjacency(data->prim));
    if (tess || geom)
       return false;
 
@@ -2944,6 +2953,12 @@ kk_draw_shaders(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    data->flatshade_first =
       dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
 
+   /* Keep the vertex order when unrolling adjacency; the passthrough GS
+    * handles the provoking vertex itself. */
+   if (kk_gs_info(cmd) && !cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
+       mesa_prim_has_adjacency(data->prim))
+      data->flatshade_first = true;
+
    /* Convert to indirect and process predicates. Skip draw if we fail. */
    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
       return;
@@ -2955,8 +2970,8 @@ kk_draw_shaders(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
       return;
 
-   if (!geom && mesa_prim_has_adjacency(data->prim) &&
-       !kk_unroll_adjacency(cmd, data))
+   if (!cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
+       mesa_prim_has_adjacency(data->prim) && !kk_unroll_adjacency(cmd, data))
       return;
 
    /* Patch lists do not restart, so only a GS fed by the input assembly needs
