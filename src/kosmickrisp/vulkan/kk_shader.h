@@ -105,6 +105,10 @@ struct kk_shader_info {
          bool has_ds;
          bool has_depth_write;
          bool has_stencil_test;
+
+         /* Application or generated GS info, valid when additional_stages_bits
+          * includes a geometry shader */
+         struct poly_gs_info gs;
       } vs;
 
       struct {
@@ -140,7 +144,7 @@ struct kk_shader_info {
    };
 };
 
-static_assert(sizeof(struct kk_shader_info) == 128,
+static_assert(sizeof(struct kk_shader_info) == 216,
               "kk_shader_info is serialized");
 /* Threadgroup size the VS, TES and GS compute passes are compiled for and
  * dispatched with */

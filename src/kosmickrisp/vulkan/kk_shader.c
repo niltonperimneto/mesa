@@ -1574,13 +1574,21 @@ kk_compile_point_variant(struct kk_device *dev, struct kk_shader *shader,
 static VkResult
 kk_upload_gs_indices(struct kk_device *dev, struct kk_shader *shader)
 {
-   if (shader->info.stage != MESA_SHADER_GEOMETRY ||
-       shader->info.gs.shape != POLY_GS_SHAPE_STATIC_INDEXED ||
-       shader->gs_indices)
+   const struct poly_gs_info *gs;
+   if (shader->info.stage == MESA_SHADER_GEOMETRY)
+      gs = &shader->info.gs;
+   else if (shader->info.stage == MESA_SHADER_VERTEX &&
+            (shader->info.vs.additional_stages_bits &
+             BITFIELD_BIT(MESA_SHADER_GEOMETRY)))
+      gs = &shader->info.vs.gs;
+   else
       return VK_SUCCESS;
 
-   uint32_t count = shader->info.gs.max_indices;
-   if (count == 0 || count > ARRAY_SIZE(shader->info.gs.topology))
+   if (gs->shape != POLY_GS_SHAPE_STATIC_INDEXED || shader->gs_indices)
+      return VK_SUCCESS;
+
+   uint32_t count = gs->max_indices;
+   if (count == 0 || count > ARRAY_SIZE(gs->topology))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    VkResult result = kk_alloc_bo(dev, &shader->vk.base,
@@ -1591,7 +1599,7 @@ kk_upload_gs_indices(struct kk_device *dev, struct kk_shader *shader)
 
    uint16_t *indices = shader->gs_indices->cpu;
    for (uint32_t i = 0; i < count; ++i) {
-      uint8_t index = shader->info.gs.topology[i];
+      uint8_t index = gs->topology[i];
       indices[i] = index == UINT8_MAX ? UINT16_MAX : index;
    }
 
@@ -2111,6 +2119,8 @@ gather_graphics_pipeline_create_info(
 
       if (s->info.stage == MESA_SHADER_GEOMETRY) {
          kk_msl_copy(&vs->gs_main, &s->gs_main);
+         info->vs.gs = s->info.gs;
+         info->gs_needs_main = s->info.gs_needs_main;
          gs = s;
       }
    }
@@ -2240,7 +2250,10 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    struct kk_pipeline_handles *pipe = &vs->pipeline;
 
    const struct msl_compile_data *vs_data;
-   VkResult result = kk_build_prerender(device, vs, &vs_data);
+   VkResult result = kk_upload_gs_indices(device, vs);
+   if (result != VK_SUCCESS)
+      return result;
+   result = kk_build_prerender(device, vs, &vs_data);
    if (result != VK_SUCCESS)
       return result;
 
