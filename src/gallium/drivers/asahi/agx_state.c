@@ -1555,7 +1555,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       NIR_PASS(_, nir, poly_nir_lower_tcs, true);
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       NIR_PASS(_, nir, poly_nir_lower_gs, &gs_count, &gs_copy, &pre_gs,
-               &gs_info);
+               &gs_info, false);
 
       agx_preprocess_nir(gs_count);
       agx_preprocess_nir(gs_copy);

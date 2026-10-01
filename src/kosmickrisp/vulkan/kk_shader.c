@@ -1131,7 +1131,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
    } else if (stage == MESA_SHADER_GEOMETRY) {
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
       NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
-               &shader->info.gs);
+               &shader->info.gs, false);
 
       /* Only transform feedback and pipeline statistics need these, and KK
        * exposes neither */

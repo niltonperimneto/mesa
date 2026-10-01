@@ -48,9 +48,14 @@ struct poly_gs_info {
    uint8_t topology[64];
 };
 
+/* side_effects_in_main runs the GS stores and atomics only in the main shader
+ * when the output does not depend on them. A caller asking for it must
+ * dispatch the main shader for every draw, with exactly one thread per
+ * primitive and instance.
+ */
 bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
-                       struct poly_gs_info *info);
+                       struct poly_gs_info *info, bool side_effects_in_main);
 
 bool poly_nir_lower_tcs(struct nir_shader *tcs,
                         bool can_ignore_shader_out_barriers);

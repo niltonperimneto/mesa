@@ -170,6 +170,9 @@ struct lower_gs_state {
    int count_index[POLY_MAX_VERTEX_STREAMS];
 
    struct poly_gs_info *info;
+
+   /* Whether only the main shader runs the side effects */
+   bool side_effects_in_main;
 };
 
 /* Helpers for loading from the vertex state buffer */
@@ -484,6 +487,24 @@ lower_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static bool strip_side_effect_from_copy(nir_builder *b,
+                                        nir_intrinsic_instr *intr, void *data);
+
+/* Strip side effects along with the code that only fed them */
+static void
+strip_side_effects(nir_shader *s, nir_intrinsic_pass_cb strip, void *data)
+{
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, s, nir_shader_intrinsics_pass, strip,
+               nir_metadata_control_flow, data);
+
+      NIR_PASS(progress, s, nir_opt_dce);
+      NIR_PASS(progress, s, nir_opt_dead_cf);
+   } while (progress);
+}
+
 /*
  * Create a "Geometry count" shader. This is a stripped down geometry shader
  * that just write its number of emitted vertices / primitives / transform
@@ -503,6 +524,10 @@ create_geometry_count_shader(nir_shader *gs, struct lower_gs_state *state)
    } else {
       shader->info.name = "count";
    }
+
+   /* Before our own count writes, which must stay */
+   if (state->side_effects_in_main)
+      strip_side_effects(shader, strip_side_effect_from_copy, NULL);
 
    NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_gs_count_instr,
             nir_metadata_control_flow, state);
@@ -648,6 +673,68 @@ strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
    default:
       return false;
    }
+}
+
+/* With the side effects gone, barriers have nothing left to order */
+static bool
+strip_side_effect_from_copy(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   if (intr->intrinsic == nir_intrinsic_barrier) {
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   return strip_side_effect_from_main(b, intr, (void *)true);
+}
+
+static bool
+sees_side_effects(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   bool *sees = data;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_bounded:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_image_load:
+   case nir_intrinsic_image_sparse_load:
+   case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_sparse_load:
+      /* Loads of memory that nothing writes are reorderable */
+      *sees |= !nir_intrinsic_can_reorder(intr);
+      break;
+
+   default:
+      /* Atomics whose result is used */
+      *sees |= nir_intrinsic_writes_external_memory(intr);
+      break;
+   }
+
+   return false;
+}
+
+/*
+ * Clone the GS without its side effects, as the source of the rasterization
+ * shader when the main shader runs them. Returns NULL if the GS output depends
+ * on the side effects: an atomic is left, or a load of memory the draw writes.
+ */
+static nir_shader *
+clone_without_side_effects(const nir_shader *gs)
+{
+   nir_shader *clone = nir_shader_clone(NULL, gs);
+   bool sees = false;
+
+   strip_side_effects(clone, strip_side_effect_from_copy, NULL);
+   nir_shader_intrinsics_pass(clone, sees_side_effects, nir_metadata_all,
+                              &sees);
+
+   if (sees) {
+      ralloc_free(clone);
+      return NULL;
+   }
+
+   return clone;
 }
 
 /*
@@ -1226,7 +1313,8 @@ optimize_static_topology(struct poly_gs_info *info, nir_shader *gs)
 
 bool
 poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
-                  nir_shader **pre_gs, struct poly_gs_info *info)
+                  nir_shader **pre_gs, struct poly_gs_info *info,
+                  bool side_effects_in_main)
 {
    /* Lower I/O as assumed by the rest of GS lowering */
    if (gs->xfb_info != NULL) {
@@ -1332,7 +1420,15 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
    /* Ensure that outputs_written is still accurate after DCE. */
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
 
-   *gs_copy = create_gs_rast_shader(gs, &gs_state);
+   /* Leave the side effects to the main shader if the GS output allows it */
+   nir_shader *stripped = NULL;
+   if (side_effects_in_main && gs->info.writes_memory)
+      stripped = clone_without_side_effects(gs);
+
+   gs_state.side_effects_in_main = stripped != NULL;
+
+   *gs_copy = create_gs_rast_shader(stripped ? stripped : gs, &gs_state);
+   ralloc_free(stripped);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_id,
             nir_metadata_control_flow, NULL);
@@ -1350,15 +1446,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
       *gs_count = NULL;
 
    /* Strip stores and atomics */
-   do {
-      progress = false;
-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
-               strip_side_effect_from_main, nir_metadata_control_flow,
-               (void *)true);
-
-      NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
-   } while (progress);
+   if (!gs_state.side_effects_in_main)
+      strip_side_effects(gs, strip_side_effect_from_main, (void *)true);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_instr,
             nir_metadata_none, &gs_state);
@@ -1382,15 +1471,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
    } while (progress);
 
    /* Strip remaining atomics, but not stores - since those are from us */
-   do {
-      progress = false;
-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
-               strip_side_effect_from_main, nir_metadata_control_flow,
-               (void *)false);
-
-      NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
-   } while (progress);
+   if (!gs_state.side_effects_in_main)
+      strip_side_effects(gs, strip_side_effect_from_main, (void *)false);
 
    /* All those variables we created should've gone away by now */
    NIR_PASS(_, gs, nir_remove_dead_variables, nir_var_function_temp, NULL);
