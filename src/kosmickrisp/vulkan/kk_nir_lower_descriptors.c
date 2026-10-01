@@ -847,6 +847,8 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       return lower_sysval_to_per_draw(b, intrin, geometry_params);
    case nir_intrinsic_load_provoking_last:
       return lower_sysval_to_per_draw(b, intrin, provoking_last);
+   case nir_intrinsic_load_rasterization_stream:
+      return lower_sysval_to_per_draw(b, intrin, rasterization_stream);
    case nir_intrinsic_load_index_size_poly:
       return lower_sysval_to_per_draw(b, intrin, index_size);
    case nir_intrinsic_load_first_vertex:
