@@ -1498,20 +1498,39 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    }
 
    if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
-       IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB) {
+       IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB ||
+       IS_SHADER_DIRTY(VERTEX)) {
       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+      bool dynamic_vi = vs->info.vs.dynamic_vi;
       unsigned slot = 0;
       u_foreach_bit(i, vs->info.vs.attribs_read) {
          if (dyn->vi->attributes_valid & BITFIELD_BIT(i)) {
             struct vk_vertex_attribute_state attr = dyn->vi->attributes[i];
             struct kk_addr_range vb = gfx->vb.addr_range[attr.binding];
+            enum pipe_format format = vk_format_to_pipe_format(attr.format);
+            uint32_t stride = dyn->vi_binding_strides[attr.binding];
 
             desc->root.draw.attrib_clamps[slot] = kk_calculate_vbo_clamp(
-               vb.addr, 0, vk_format_to_pipe_format(attr.format), vb.range,
-               dyn->vi_binding_strides[attr.binding], attr.offset,
+               vb.addr, 0, format, vb.range, stride, attr.offset,
                &desc->root.draw.attrib_base[slot]);
-            desc->root.draw.buffer_strides[attr.binding] =
-               dyn->vi_binding_strides[attr.binding];
+            desc->root.draw.buffer_strides[attr.binding] = stride;
+
+            if (dynamic_vi) {
+               const struct vk_vertex_binding_state *binding =
+                  &dyn->vi->bindings[attr.binding];
+               uint32_t fmt = kk_vbo_encode_format(format);
+               if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE)
+                  fmt |= KK_VBO_FMT_INSTANCED;
+               desc->root.draw.attrib_format[slot] = fmt;
+               desc->root.draw.attrib_divisor[slot] = binding->divisor;
+               desc->root.draw.attrib_stride[slot] = stride;
+            }
+         } else if (dynamic_vi) {
+            desc->root.draw.attrib_format[slot] = 0;
+            desc->root.draw.attrib_divisor[slot] = 0;
+            desc->root.draw.attrib_stride[slot] = 0;
+            desc->root.draw.attrib_clamps[slot] = 0;
+            desc->root.draw.attrib_base[slot] = 0;
          }
          slot++;
       }

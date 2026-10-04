@@ -36,6 +36,9 @@ struct kk_root_descriptor_table {
          uint32_t buffer_strides[KK_MAX_VBUFS];
          uint64_t attrib_base[KK_MAX_ATTRIBS];
          uint32_t attrib_clamps[KK_MAX_ATTRIBS];
+         uint32_t attrib_format[KK_MAX_ATTRIBS];
+         uint32_t attrib_divisor[KK_MAX_ATTRIBS];
+         uint32_t attrib_stride[KK_MAX_ATTRIBS];
 
          float blend_constant[4];
          float clip_z_coeff;
