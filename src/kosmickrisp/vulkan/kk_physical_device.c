@@ -205,6 +205,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_vertex_attribute_robustness = true,
+      .EXT_vertex_input_dynamic_state = true,
 
       .GOOGLE_decorate_string = true,
       .GOOGLE_hlsl_functionality1 = true,
@@ -516,6 +517,9 @@ kk_get_device_features(
 
       /* VK_EXT_vertex_attribute_robustness */
       .vertexAttributeRobustness = true,
+
+      /* VK_EXT_vertex_input_dynamic_state */
+      .vertexInputDynamicState = true,
 
       /* EXT_ycbcr_2plane_444_formats */
       .ycbcr2plane444Formats = true,
