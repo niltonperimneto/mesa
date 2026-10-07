@@ -522,8 +522,7 @@ static void
 util_queue_finish_execute(void *data, void *gdata, int num_thread)
 {
    util_barrier *barrier = data;
-   if (util_barrier_wait(barrier))
-      util_barrier_destroy(barrier);
+   util_barrier_wait(barrier);
 }
 
 void
@@ -729,6 +728,7 @@ util_queue_finish(struct util_queue *queue)
       util_queue_fence_destroy(&fences[i]);
    }
 
+   util_barrier_destroy(&barrier);
    free(fences);
 }
 
