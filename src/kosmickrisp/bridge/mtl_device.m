@@ -5,6 +5,7 @@
  */
 
 #include "mtl_device.h"
+#include <unistd.h>
 
 /* TODO_KOSMICKRISP Remove */
 #include "kk_image_layout.h"
@@ -356,5 +357,45 @@ mtl_new_command_buffer(mtl_device *device)
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
       return [dev newCommandBuffer];
+   }
+}
+
+/* MTLCaptureManager is process-wide even when DXVK probes several devices. */
+static void *bounded_owner;
+static unsigned bounded_remaining;
+
+void
+mtl_bounded_capture_finish(void *owner)
+{
+   @synchronized([MTLCaptureManager sharedCaptureManager]) {
+      if (bounded_owner == owner) {
+         mtl_stop_gpu_capture();
+         bounded_owner = NULL;
+         bounded_remaining = 0;
+         fprintf(stderr, "KK capture finished\n");
+      }
+   }
+}
+
+void
+mtl_bounded_capture_present(void *owner, mtl_device *device,
+                           const char *trigger, const char *directory,
+                           unsigned frame_count, bool success)
+{
+   @synchronized([MTLCaptureManager sharedCaptureManager]) {
+      if (bounded_owner == owner) {
+         if (!success || --bounded_remaining == 0)
+            mtl_bounded_capture_finish(owner);
+      } else if (!bounded_owner && success &&
+                 ![[MTLCaptureManager sharedCaptureManager] isCapturing] &&
+                 unlink(trigger) == 0) {
+         mtl_start_gpu_capture(device, directory);
+         if ([[MTLCaptureManager sharedCaptureManager] isCapturing]) {
+            bounded_owner = owner;
+            bounded_remaining = MAX2(frame_count, 1);
+            fprintf(stderr, "KK capture started frames=%u\n",
+              bounded_remaining);
+         }
+      }
    }
 }

@@ -12,6 +12,11 @@
 #include <Metal/MTL4RenderCommandEncoder.h>
 #include <Metal/MTLRenderPass.h>
 
+static_assert(sizeof(struct mtl_viewport) == sizeof(MTLViewport),
+              "mtl_viewport must match MTLViewport");
+static_assert(sizeof(struct mtl_scissor_rect) == sizeof(MTLScissorRect),
+              "mtl_scissor_rect must match MTLScissorRect");
+
 /* Common encoder utils */
 void
 mtl_end_encoding(void *encoder)
@@ -399,6 +404,16 @@ mtl_set_depth_clip_mode(mtl_render_encoder *encoder,
    @autoreleasepool {
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       [enc setDepthClipMode:(MTLDepthClipMode)mode];
+   }
+}
+
+void
+mtl_set_blend_color(mtl_render_encoder *encoder, const float color[4])
+{
+   @autoreleasepool {
+      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
+      [enc setBlendColorRed:color[0] green:color[1]
+                     blue:color[2] alpha:color[3]];
    }
 }
 

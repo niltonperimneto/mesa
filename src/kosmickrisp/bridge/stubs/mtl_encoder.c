@@ -205,6 +205,11 @@ mtl_set_depth_clip_mode(mtl_render_encoder *encoder,
 }
 
 void
+mtl_set_blend_color(mtl_render_encoder *encoder, const float color[4])
+{
+}
+
+void
 mtl_set_depth_test_bounds(mtl_render_encoder *encoder, float min, float max)
 {
 }

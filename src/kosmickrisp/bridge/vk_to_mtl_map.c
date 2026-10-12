@@ -85,7 +85,7 @@ vk_primitive_topology_to_mtl_primitive_topology_class(
 #pragma GCC diagnostic pop
       return MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE;
    default:
-      UNREACHABLE("Primitive topology not supported!");
+      return MTL_PRIMITIVE_TOPOLOGY_CLASS_UNSPECIFIED;
    }
 }
 
@@ -224,6 +224,87 @@ vk_compare_op_to_mtl_compare_function(enum VkCompareOp op)
    default:
       UNREACHABLE("Unsupported address mode");
    }
+}
+
+enum mtl_blend_factor
+vk_blend_factor_to_mtl_blend_factor(enum VkBlendFactor factor)
+{
+   switch (factor) {
+   case VK_BLEND_FACTOR_ZERO:
+      return MTL_BLEND_FACTOR_ZERO;
+   case VK_BLEND_FACTOR_ONE:
+      return MTL_BLEND_FACTOR_ONE;
+   case VK_BLEND_FACTOR_SRC_COLOR:
+      return MTL_BLEND_FACTOR_SOURCE_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:
+      return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR;
+   case VK_BLEND_FACTOR_DST_COLOR:
+      return MTL_BLEND_FACTOR_DESTINATION_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:
+      return MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR;
+   case VK_BLEND_FACTOR_SRC_ALPHA:
+      return MTL_BLEND_FACTOR_SOURCE_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:
+      return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA;
+   case VK_BLEND_FACTOR_DST_ALPHA:
+      return MTL_BLEND_FACTOR_DESTINATION_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
+      return MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA;
+   case VK_BLEND_FACTOR_CONSTANT_COLOR:
+      return MTL_BLEND_FACTOR_BLEND_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
+      return MTL_BLEND_FACTOR_ONE_MINUS_BLEND_COLOR;
+   case VK_BLEND_FACTOR_CONSTANT_ALPHA:
+      return MTL_BLEND_FACTOR_BLEND_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA:
+      return MTL_BLEND_FACTOR_ONE_MINUS_BLEND_ALPHA;
+   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:
+      return MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED;
+   case VK_BLEND_FACTOR_SRC1_COLOR:
+      return MTL_BLEND_FACTOR_SOURCE1_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:
+      return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE1_COLOR;
+   case VK_BLEND_FACTOR_SRC1_ALPHA:
+      return MTL_BLEND_FACTOR_SOURCE1_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA:
+      return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE1_ALPHA;
+   default:
+      UNREACHABLE("Unsupported blend factor");
+   }
+}
+
+enum mtl_blend_operation
+vk_blend_op_to_mtl_blend_operation(enum VkBlendOp op)
+{
+   switch (op) {
+   case VK_BLEND_OP_ADD:
+      return MTL_BLEND_OPERATION_ADD;
+   case VK_BLEND_OP_SUBTRACT:
+      return MTL_BLEND_OPERATION_SUBTRACT;
+   case VK_BLEND_OP_REVERSE_SUBTRACT:
+      return MTL_BLEND_OPERATION_REVERSE_SUBTRACT;
+   case VK_BLEND_OP_MIN:
+      return MTL_BLEND_OPERATION_MIN;
+   case VK_BLEND_OP_MAX:
+      return MTL_BLEND_OPERATION_MAX;
+   default:
+      UNREACHABLE("Unsupported blend operation");
+   }
+}
+
+uint8_t
+vk_color_write_mask_to_mtl_color_write_mask(uint8_t mask)
+{
+   uint8_t mtl_mask = MTL_COLOR_WRITE_MASK_NONE;
+   if (mask & VK_COLOR_COMPONENT_R_BIT)
+      mtl_mask |= MTL_COLOR_WRITE_MASK_RED;
+   if (mask & VK_COLOR_COMPONENT_G_BIT)
+      mtl_mask |= MTL_COLOR_WRITE_MASK_GREEN;
+   if (mask & VK_COLOR_COMPONENT_B_BIT)
+      mtl_mask |= MTL_COLOR_WRITE_MASK_BLUE;
+   if (mask & VK_COLOR_COMPONENT_A_BIT)
+      mtl_mask |= MTL_COLOR_WRITE_MASK_ALPHA;
+   return mtl_mask;
 }
 
 enum mtl_winding

@@ -6,6 +6,8 @@
 #ifndef KK_MTL_TO_VK_MAP_H
 #define KK_MTL_TO_VK_MAP_H 1
 
+#include <stdint.h>
+
 struct mtl_origin;
 struct mtl_size;
 enum mtl_primitive_type;
@@ -18,6 +20,8 @@ enum mtl_sampler_min_mag_filter;
 enum mtl_sampler_mip_filter;
 enum mtl_sampler_reduction_mode;
 enum mtl_compare_function;
+enum mtl_blend_factor;
+enum mtl_blend_operation;
 enum mtl_winding;
 enum mtl_cull_mode;
 enum mtl_index_type;
@@ -37,6 +41,8 @@ enum VkFilter;
 enum VkSamplerMipmapMode;
 enum VkSamplerReductionMode;
 enum VkCompareOp;
+enum VkBlendFactor;
+enum VkBlendOp;
 enum VkFrontFace;
 enum VkCullModeFlagBits;
 enum VkResolveModeFlagBits;
@@ -79,6 +85,13 @@ vk_sampler_reduction_mode_to_mtl_sampler_reduction_mode(
 
 enum mtl_compare_function
 vk_compare_op_to_mtl_compare_function(enum VkCompareOp op);
+
+enum mtl_blend_factor
+vk_blend_factor_to_mtl_blend_factor(enum VkBlendFactor factor);
+
+enum mtl_blend_operation vk_blend_op_to_mtl_blend_operation(enum VkBlendOp op);
+
+uint8_t vk_color_write_mask_to_mtl_color_write_mask(uint8_t mask);
 
 enum mtl_winding vk_front_face_to_mtl_winding(enum VkFrontFace face);
 

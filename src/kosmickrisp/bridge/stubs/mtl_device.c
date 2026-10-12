@@ -168,3 +168,8 @@ mtl_new_command_buffer(mtl_device *device)
 {
    return NULL;
 }
+
+void mtl_bounded_capture_present(void *owner, mtl_device *device,
+   const char *trigger, const char *directory,
+   unsigned frame_count, bool success) {}
+void mtl_bounded_capture_finish(void *owner) {}

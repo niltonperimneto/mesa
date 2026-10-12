@@ -70,3 +70,9 @@ mtl_command_allocator *mtl_new_command_allocator(mtl_device *device);
 mtl_command_buffer *mtl_new_command_buffer(mtl_device *device);
 
 #endif /* MTL_DEVICE_H */
+
+/* Diagnostic capture owned by one logical device, counted at presentation. */
+void mtl_bounded_capture_present(void *owner, mtl_device *device,
+                                const char *trigger, const char *directory,
+                                unsigned frame_count, bool success);
+void mtl_bounded_capture_finish(void *owner);
