@@ -267,6 +267,27 @@ msl_replace_load_sample_mask_in_for_static_sample_mask(
    return true;
 }
 
+static bool
+msl_lower_sample_mask(nir_builder *b, nir_def *sample_mask)
+{
+   nir_shader *nir = b->shader;
+
+   struct nir_io_semantics io_semantics = {
+      .location = FRAG_RESULT_SAMPLE_MASK,
+      .num_slots = 1u,
+   };
+   nir_store_output(b, nir_load_sample_mask_in(b), nir_imm_int(b, 0u),
+                    .base = 0u, .range = 1u, .write_mask = 0x1, .component = 0u,
+                    .src_type = nir_type_uint32, .io_semantics = io_semantics);
+   BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN);
+
+   nir_shader_intrinsics_pass(
+      nir, msl_replace_load_sample_mask_in_for_static_sample_mask,
+      nir_metadata_control_flow, sample_mask);
+
+   return true;
+}
+
 bool
 msl_lower_static_sample_mask(nir_shader *nir, uint32_t sample_mask)
 {
@@ -276,22 +297,17 @@ msl_lower_static_sample_mask(nir_shader *nir, uint32_t sample_mask)
    /* Embed sample mask */
    nir_function_impl *entrypoint = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_at(nir_before_impl(entrypoint));
+   return msl_lower_sample_mask(&b, nir_imm_int(&b, sample_mask));
+}
 
-   struct nir_io_semantics io_semantics = {
-      .location = FRAG_RESULT_SAMPLE_MASK,
-      .num_slots = 1u,
-   };
-   nir_def *static_sample_mask = nir_imm_int(&b, sample_mask);
-   nir_store_output(&b, nir_load_sample_mask_in(&b), nir_imm_int(&b, 0u),
-                    .base = 0u, .range = 1u, .write_mask = 0x1, .component = 0u,
-                    .src_type = nir_type_uint32, .io_semantics = io_semantics);
-   BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN);
+bool
+msl_lower_dynamic_sample_mask(nir_shader *nir)
+{
+   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
 
-   nir_shader_intrinsics_pass(
-      nir, msl_replace_load_sample_mask_in_for_static_sample_mask,
-      nir_metadata_control_flow, static_sample_mask);
-
-   return true;
+   nir_function_impl *entrypoint = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(entrypoint));
+   return msl_lower_sample_mask(&b, nir_load_api_sample_mask_kk(&b));
 }
 
 static bool
@@ -991,4 +1007,70 @@ msl_nir_lower_multisample_alpha(nir_shader *s, bool alpha_to_coverage,
       NIR_PASS(progress, s, nir_lower_alpha_to_one);
 
    return progress;
+}
+
+static bool
+is_generic_varying(nir_intrinsic_instr *intr)
+{
+   unsigned location = nir_intrinsic_io_semantics(intr).location;
+   return location >= VARYING_SLOT_VAR0 && location <= VARYING_SLOT_VAR31;
+}
+
+static nir_def *
+convert_varying(nir_builder *b, nir_def *def, nir_alu_type base,
+                unsigned bit_size)
+{
+   switch (base) {
+   case nir_type_float:
+      return nir_f2fN(b, def, bit_size);
+   case nir_type_int:
+      return nir_i2iN(b, def, bit_size);
+   default:
+      return nir_u2uN(b, def, bit_size);
+   }
+}
+
+static bool
+widen_generic_varying(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   mesa_shader_stage stage = b->shader->info.stage;
+   bool is_store = intr->intrinsic == nir_intrinsic_store_output &&
+                   stage == MESA_SHADER_VERTEX;
+   bool is_load = (intr->intrinsic == nir_intrinsic_load_input ||
+                   intr->intrinsic == nir_intrinsic_load_interpolated_input) &&
+                  stage == MESA_SHADER_FRAGMENT;
+   if ((!is_store && !is_load) || !is_generic_varying(intr))
+      return false;
+
+   if (is_store) {
+      nir_alu_type type = nir_intrinsic_src_type(intr);
+      if (nir_alu_type_get_type_size(type) != 16)
+         return false;
+
+      nir_alu_type base = nir_alu_type_get_base_type(type);
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *wide = convert_varying(b, intr->src[0].ssa, base, 32);
+      nir_src_rewrite(&intr->src[0], wide);
+      nir_intrinsic_set_src_type(intr, base | 32);
+      return true;
+   }
+
+   nir_alu_type type = nir_intrinsic_dest_type(intr);
+   if (intr->def.bit_size != 16)
+      return false;
+
+   nir_alu_type base = nir_alu_type_get_base_type(type);
+   intr->def.bit_size = 32;
+   nir_intrinsic_set_dest_type(intr, base | 32);
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *narrow = convert_varying(b, &intr->def, base, 16);
+   nir_def_rewrite_uses_after(&intr->def, narrow);
+   return true;
+}
+
+bool
+msl_nir_widen_generic_varyings(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, widen_generic_varying,
+                                     nir_metadata_control_flow, NULL);
 }

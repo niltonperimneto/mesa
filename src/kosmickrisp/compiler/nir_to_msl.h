@@ -23,6 +23,8 @@ struct nir_to_msl_options {
     * the render target has. This leads to an incorrect calculation of the
     * component count for the render target formats. */
    uint8_t rts_component_count[MAX_DRAW_BUFFERS];
+
+   bool separate_io;
 };
 
 /* Assumes nir_shader_gather_info has been called beforehand. */
@@ -80,12 +82,14 @@ bool msl_lower_textures(nir_shader *s);
 bool msl_lower_robustness2_images(nir_shader *s);
 
 bool msl_lower_static_sample_mask(nir_shader *nir, uint32_t sample_mask);
+bool msl_lower_dynamic_sample_mask(nir_shader *nir);
 bool msl_disable_triangle_merge(nir_shader *nir);
 bool msl_ensure_depth_write(nir_shader *nir);
 bool msl_ensure_vertex_position_output(nir_shader *nir);
 bool msl_ensure_vertex_point_size_output(nir_shader *nir);
 bool msl_nir_fs_io_types(nir_shader *nir);
 bool msl_nir_vs_io_types(nir_shader *nir);
+bool msl_nir_widen_generic_varyings(nir_shader *nir);
 bool msl_nir_fake_guard_for_discards(struct nir_shader *nir);
 bool msl_nir_lower_sample_shading(nir_shader *nir);
 void msl_nir_lower_clip_cull_distance(nir_shader *nir,

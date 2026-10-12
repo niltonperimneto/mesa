@@ -1243,12 +1243,19 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       uint32_t component = nir_intrinsic_component(instr);
       uint32_t location = io.location + idx;
 
+      bool bitcast = msl_is_separate_varying(ctx, location) &&
+                     nir_alu_type_get_base_type(nir_intrinsic_dest_type(
+                        instr)) != nir_type_float;
+      if (bitcast)
+         P(ctx, "as_type<%s>(", msl_type_for_def(ctx->types, &instr->def));
       msl_input_name(ctx, location, component);
       if (instr->num_components < msl_input_num_components(ctx, location)) {
          P(ctx, ".");
          for (unsigned i = 0; i < instr->num_components; i++)
             P(ctx, "%c", "xyzw"[component + i]);
       }
+      if (bitcast)
+         P(ctx, ")");
       P(ctx, ";\n");
       break;
    }
@@ -1307,6 +1314,12 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
                P(ctx, "%c", "xyzw"[component + i]);
       }
       P(ctx, " = ");
+      bool bitcast = msl_is_separate_varying(ctx, location) &&
+                     nir_alu_type_get_base_type(nir_intrinsic_src_type(
+                        instr)) != nir_type_float;
+      if (bitcast)
+         P(ctx, "as_type<float%s>(",
+           component_str(util_bitcount(write_mask)));
       src_to_msl(ctx, &instr->src[0]);
       if (num_components > 1u) {
          P(ctx, ".");
@@ -1314,6 +1327,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
             if ((write_mask >> i) & 1)
                P(ctx, "%c", "xyzw"[i]);
       }
+      if (bitcast)
+         P(ctx, ")");
       P(ctx, ";\n");
       break;
    }
@@ -2499,6 +2514,7 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
       .shader = shader,
       .text = _mesa_string_buffer_create(options->mem_ctx, 1024),
       .disabled_workarounds = options->disabled_workarounds,
+      .separate_io = options->separate_io,
    };
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    msl_gather_info(&ctx, options);

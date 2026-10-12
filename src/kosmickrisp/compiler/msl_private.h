@@ -25,6 +25,7 @@ struct nir_to_msl_ctx {
    struct _mesa_string_buffer *text;
    uint64_t disabled_workarounds;
    bool uses_per_draw_data;
+   bool separate_io;
    unsigned short indentlevel;
    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];
@@ -79,6 +80,8 @@ uint32_t msl_input_num_components(struct nir_to_msl_ctx *ctx,
 
 uint32_t msl_output_num_components(struct nir_to_msl_ctx *ctx,
                                    uint32_t location);
+
+bool msl_is_separate_varying(struct nir_to_msl_ctx *ctx, uint32_t location);
 
 bool msl_src_is_float(struct nir_to_msl_ctx *ctx, nir_src *src);
 bool msl_def_is_sampler(struct nir_to_msl_ctx *ctx, nir_def *def);

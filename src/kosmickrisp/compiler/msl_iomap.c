@@ -424,6 +424,26 @@ msl_gather_io_info(struct nir_to_msl_ctx *ctx,
    };
    nir_shader_intrinsics_pass(ctx->shader, msl_nir_gather_io_info,
                               nir_metadata_all, &gather_ctx);
+
+   if (!ctx->separate_io)
+      return;
+
+   struct io_slot_info *varyings =
+      ctx->shader->info.stage == MESA_SHADER_VERTEX ? info_array_output
+                                                    : info_array_input;
+   for (unsigned l = VARYING_SLOT_VAR0; l <= VARYING_SLOT_VAR31; ++l) {
+      if (varyings[l].num_components) {
+         varyings[l].type = nir_type_float32;
+         varyings[l].num_components = 4u;
+      }
+   }
+}
+
+bool
+msl_is_separate_varying(struct nir_to_msl_ctx *ctx, uint32_t location)
+{
+   return ctx->separate_io && location >= VARYING_SLOT_VAR0 &&
+          location <= VARYING_SLOT_VAR31;
 }
 
 /* Generate all the struct definitions needed for shader I/O */
