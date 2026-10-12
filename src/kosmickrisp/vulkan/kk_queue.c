@@ -9,6 +9,8 @@
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
+#include "kk_metal_cache.h"
+#include "vk_common_entrypoints.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
 #include "kk_sync.h"
@@ -138,7 +140,7 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
       goto release;
 
    vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
-                        &dev->vk.dispatch_table);
+                        dev->vk.command_dispatch_table);
 
    result = kk_EndCommandBuffer(rerecord_handle);
    if (result != VK_SUCCESS)
@@ -312,4 +314,22 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
    mtx_destroy(&queue->mutex);
 
    vk_queue_finish(&queue->vk);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_QueueWaitIdle(VkQueue _queue)
+{
+   VkResult result = vk_common_QueueWaitIdle(_queue);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
+   struct kk_device *dev = kk_queue_device(queue);
+   if (util_queue_is_initialized(&dev->pso_cache.prewarm_queue))
+      util_queue_finish(&dev->pso_cache.prewarm_queue);
+   if (util_queue_is_initialized(&dev->pso_cache.exact_queue))
+      util_queue_finish(&dev->pso_cache.exact_queue);
+   kk_metal_cache_flush(dev->metal_cache);
+   return VK_SUCCESS;
 }

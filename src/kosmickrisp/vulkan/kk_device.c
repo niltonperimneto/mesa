@@ -6,10 +6,14 @@
  */
 
 #include "kk_device.h"
+#include "kk_metal_cache.h"
+#include "util/disk_cache.h"
+#include "vk_shader.h"
 
 #include "kk_buffer.h"
 #include "kk_buffer_view.h"
 #include "kk_cmd_buffer.h"
+#include "kk_debug.h"
 #include "kk_entrypoints.h"
 #include "kk_image.h"
 #include "kk_image_view.h"
@@ -30,10 +34,14 @@
 #include "vk_pipeline_cache.h"
 
 #include <time.h>
+#include <pthread.h>
+#include "util/u_atomic.h"
 
 struct kk_mtl_compiler {
    mtl_compiler *handle;
    uint32_t refcount;
+   struct disk_cache *disk;
+   struct kk_metal_cache *cache;
 };
 
 static struct hash_table compilers_ht;
@@ -47,13 +55,50 @@ kk_init_compiler_table()
    simple_mtx_init(&compilers_ht_lock, mtx_plain);
 }
 
+static uint64_t
+kk_metal_blob_budget(void)
+{
+   uint64_t total = kk_metal_cache_parse_size(
+      debug_get_option("MESA_KK_CACHE_MAX_SIZE", NULL));
+   uint64_t parts = MAX2(
+      debug_get_num_option("MESA_DISK_CACHE_DATABASE_NUM_PARTS", 50), 1);
+   return total / parts;
+}
+
+static struct disk_cache *
+kk_create_metal_disk_cache(struct kk_device *dev)
+{
+   if (dev->vk.disable_internal_cache ||
+       debug_get_bool_option("MESA_KK_PSO_CACHE_DISABLE", false))
+      return NULL;
+   char identity[VK_UUID_SIZE * 2 + 1];
+   static const char hex[] = "0123456789abcdef";
+   for (unsigned i = 0; i < VK_UUID_SIZE; ++i) {
+      uint8_t value = dev->vk.physical->properties.pipelineCacheUUID[i];
+      identity[i * 2] = hex[value >> 4];
+      identity[i * 2 + 1] = hex[value & 15];
+   }
+   identity[VK_UUID_SIZE * 2] = 0;
+   return disk_cache_create_custom(
+      "kosmickrisp-metal", identity, 0, "kosmickrisp_metal_cache",
+      kk_metal_cache_parse_size(
+         debug_get_option("MESA_KK_CACHE_MAX_SIZE", NULL)));
+}
+
 static mtl_compiler *
 kk_acquire_compiler(struct kk_device *dev)
 {
    /* KK_WORKAROUND_11 */
    struct kk_physical_device *pdev = kk_device_physical(dev);
    if (pdev->settings.disabled_workarounds & BITFIELD64_BIT(11)) {
-      return mtl_new_compiler(dev->mtl_handle);
+      mtl_compiler *handle = mtl_new_compiler(dev->mtl_handle);
+      if (!handle)
+         return NULL;
+      dev->metal_disk = kk_create_metal_disk_cache(dev);
+      dev->metal_cache = kk_metal_cache_create(dev->metal_disk, dev->mtl_handle,
+                                               pdev->info.gpu_apple_family,
+                                               handle, kk_metal_blob_budget());
+      return handle;
    }
 
    call_once(&compilers_ht_once, kk_init_compiler_table);
@@ -64,7 +109,7 @@ kk_acquire_compiler(struct kk_device *dev)
 
    struct kk_mtl_compiler *compiler;
    if (ent == NULL) {
-      compiler = ralloc(NULL, struct kk_mtl_compiler);
+      compiler = rzalloc(NULL, struct kk_mtl_compiler);
       if (compiler == NULL) {
          simple_mtx_unlock(&compilers_ht_lock);
          return NULL;
@@ -77,6 +122,11 @@ kk_acquire_compiler(struct kk_device *dev)
          return NULL;
       }
 
+      compiler->disk = kk_create_metal_disk_cache(dev);
+      compiler->cache = kk_metal_cache_create(compiler->disk, dev->mtl_handle,
+                                             pdev->info.gpu_apple_family,
+                                             compiler->handle,
+                                             kk_metal_blob_budget());
       compiler->refcount = 1;
       _mesa_hash_table_insert(&compilers_ht, dev->mtl_handle, compiler);
    } else {
@@ -84,6 +134,16 @@ kk_acquire_compiler(struct kk_device *dev)
       compiler->refcount++;
    }
 
+   if (!dev->vk.disable_internal_cache && !compiler->cache) {
+      if (!compiler->disk)
+         compiler->disk = kk_create_metal_disk_cache(dev);
+      compiler->cache = kk_metal_cache_create(compiler->disk, dev->mtl_handle,
+                                             pdev->info.gpu_apple_family,
+                                             compiler->handle,
+                                             kk_metal_blob_budget());
+   }
+   if (!dev->vk.disable_internal_cache)
+      dev->metal_cache = compiler->cache;
    simple_mtx_unlock(&compilers_ht_lock);
    return compiler->handle;
 }
@@ -94,6 +154,8 @@ kk_release_compiler(struct kk_device *dev)
    /* KK_WORKAROUND_11 */
    struct kk_physical_device *pdev = kk_device_physical(dev);
    if (pdev->settings.disabled_workarounds & BITFIELD64_BIT(11)) {
+      kk_metal_cache_destroy(dev->metal_cache);
+      disk_cache_destroy(dev->metal_disk);
       mtl_release(dev->mtl_compiler_handle);
       return;
    }
@@ -107,6 +169,8 @@ kk_release_compiler(struct kk_device *dev)
       --compiler->refcount;
 
       if (compiler->refcount == 0) {
+         kk_metal_cache_destroy(compiler->cache);
+         disk_cache_destroy(compiler->disk);
          _mesa_hash_table_remove(&compilers_ht, ent);
          mtl_release(compiler->handle);
          ralloc_free(compiler);
@@ -189,12 +253,11 @@ kk_sampler_heap_add_locked(struct kk_device *dev, struct kk_sampler_heap *h,
       return result;
    }
 
-   *rc = (struct kk_rc_sampler){
-      .key = desc,
-      .handle = handle,
-      .refcount = 1,
-      .index = index,
-   };
+   memset(rc, 0, sizeof(*rc));
+   memcpy(&rc->key, &desc, sizeof(desc));
+   rc->handle = handle;
+   rc->refcount = 1;
+   rc->index = index;
 
    _mesa_hash_table_insert(h->ht, &rc->key, rc);
    *out = rc;
@@ -253,6 +316,205 @@ kk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
    return VK_SUCCESS;
 }
 
+__THREAD_INITIAL_EXEC enum kk_compile_origin kk_compile_origin;
+__THREAD_INITIAL_EXEC bool kk_fail_on_compile;
+__THREAD_INITIAL_EXEC bool kk_compile_required;
+
+void
+kk_log_compile(struct kk_device *dev, const char *kind, int64_t start)
+{
+   if (!dev->compile_log)
+      return;
+
+   static const char *const origins[] = {
+      [KK_COMPILE_ORIGIN_DRAW] = "draw",
+      [KK_COMPILE_ORIGIN_PREWARM] = "prewarm",
+      [KK_COMPILE_ORIGIN_CREATE] = "create",
+   };
+   fprintf(dev->compile_log, "%s,%s,%lld,%lld\n", kind,
+           origins[kk_compile_origin], (long long)start,
+           (long long)os_time_get_nano());
+}
+
+__THREAD_INITIAL_EXEC blake3_hash kk_variant_parent_id;
+__THREAD_INITIAL_EXEC bool kk_variant_parent_valid;
+__THREAD_INITIAL_EXEC blake3_hash kk_variant_family_id;
+__THREAD_INITIAL_EXEC bool kk_variant_family_valid;
+
+static const char *const kk_variant_names[KK_VARIANT_COUNT] = {
+   "enqueue", "worker_start", "fs_prepare", "fs_wait", "raster_prepare",
+   "raster_wait", "pso_create", "pso_wait", "archive_lookup", "archive_load",
+   "native_create", "complete", "first_demand", "ready_hit", "failure",
+   "history_load", "ref_missing", "blob_missing", "archive_rejected",
+   "pipeline_absent",
+};
+
+void
+kk_variant_trace(struct kk_device *dev, enum kk_variant_phase phase,
+                 const void *key, size_t key_size, int64_t start, int64_t end)
+{
+   if (!dev->variant_trace_enabled || phase >= KK_VARIANT_COUNT)
+      return;
+   uint64_t duration = end >= start ? end - start : 0;
+   struct kk_variant_counter *counter = &dev->variant_counters[phase];
+   p_atomic_inc(&counter->count);
+   p_atomic_add(&counter->duration_ns, duration);
+   if (kk_compile_origin == KK_COMPILE_ORIGIN_DRAW) {
+      p_atomic_inc(&counter->draw_count);
+      p_atomic_add(&counter->draw_duration_ns, duration);
+   }
+   if (!dev->variant_log || phase == KK_VARIANT_READY_HIT)
+      return;
+   if (!start && !end)
+      start = end = os_time_get_nano();
+   blake3_hash digest;
+   char id[BLAKE3_HEX_LEN], parent[BLAKE3_HEX_LEN] = {0};
+   char family[BLAKE3_HEX_LEN] = {0};
+   _mesa_blake3_compute(key, key_size, digest);
+   _mesa_blake3_format(id, digest);
+   if (kk_variant_parent_valid)
+      _mesa_blake3_format(parent, kk_variant_parent_id);
+   if (kk_variant_family_valid)
+      _mesa_blake3_format(family, kk_variant_family_id);
+   uint64_t thread_id = (uintptr_t)pthread_self();
+#ifdef __APPLE__
+   pthread_threadid_np(NULL, &thread_id);
+#endif
+   static const char *const origins[] = {"draw", "prewarm", "create"};
+   fprintf(dev->variant_log,
+           "{\"event\":\"variant\",\"phase\":\"%s\","
+           "\"request_id\":\"%s\",\"parent_id\":\"%s\","
+           "\"family_id\":\"%s\",\"origin\":\"%s\","
+           "\"thread_id\":%llu,\"start_ns\":%lld,\"end_ns\":%lld}\n",
+           kk_variant_names[phase], id, parent,
+           family, origins[kk_compile_origin],
+           (unsigned long long)thread_id, (long long)start, (long long)end);
+}
+
+void
+kk_variant_metal_event(void *data, const char *phase, const uint8_t *key,
+                       size_t key_size, int64_t start, int64_t end)
+{
+   enum kk_variant_phase variant_phase;
+   if (strcmp(phase, "archive_lookup") == 0)
+      variant_phase = KK_VARIANT_ARCHIVE_LOOKUP;
+   else if (strcmp(phase, "archive_load") == 0)
+      variant_phase = KK_VARIANT_ARCHIVE_LOAD;
+   else if (strcmp(phase, "native_create") == 0)
+      variant_phase = KK_VARIANT_NATIVE_CREATE;
+   else if (strcmp(phase, "ref_missing") == 0)
+      variant_phase = KK_VARIANT_REF_MISSING;
+   else if (strcmp(phase, "blob_missing") == 0)
+      variant_phase = KK_VARIANT_BLOB_MISSING;
+   else if (strcmp(phase, "archive_rejected") == 0)
+      variant_phase = KK_VARIANT_ARCHIVE_REJECTED;
+   else if (strcmp(phase, "pipeline_absent") == 0)
+      variant_phase = KK_VARIANT_PIPELINE_ABSENT;
+   else
+      return;
+   kk_variant_trace(data, variant_phase, key, key_size, start, end);
+}
+
+static void
+kk_variant_trace_finish(struct kk_device *dev)
+{
+   if (dev->variant_stats) {
+      for (unsigned i = 0; i < KK_VARIANT_COUNT; ++i) {
+         const struct kk_variant_counter *counter = &dev->variant_counters[i];
+         fprintf(dev->variant_stats,
+                 "{\"event\":\"variant_summary\",\"phase\":\"%s\","
+                 "\"count\":%llu,\"duration_ns\":%llu,"
+                 "\"draw_count\":%llu,\"draw_duration_ns\":%llu}\n",
+                 kk_variant_names[i], (unsigned long long)counter->count,
+                 (unsigned long long)counter->duration_ns,
+                 (unsigned long long)counter->draw_count,
+                 (unsigned long long)counter->draw_duration_ns);
+      }
+      fclose(dev->variant_stats);
+   }
+   if (dev->variant_log)
+      fclose(dev->variant_log);
+}
+
+static void
+kk_cache_namespace(struct vk_physical_device *physical, char out[33])
+{
+   static const char hex[] = "0123456789abcdef";
+   for (unsigned i = 0; i < VK_UUID_SIZE; ++i) {
+      uint8_t value = physical->properties.pipelineCacheUUID[i];
+      out[i * 2] = hex[value >> 4];
+      out[i * 2 + 1] = hex[value & 15];
+   }
+   out[32] = 0;
+}
+
+void
+kk_log_cache_shader(struct kk_device *dev,
+                     const struct vk_shader_cache_trace *trace,
+                     const char *outcome, int64_t start, int64_t end)
+{
+   if (!dev->cache_log || !trace)
+      return;
+   char ns[33], key[BLAKE3_HEX_LEN], precomp[BLAKE3_HEX_LEN];
+   char flags[BLAKE3_HEX_LEN], partition[BLAKE3_HEX_LEN];
+   char layout[BLAKE3_HEX_LEN], state[BLAKE3_HEX_LEN];
+   kk_cache_namespace(dev->vk.physical, ns);
+   _mesa_blake3_format(key, trace->key);
+   _mesa_blake3_format(precomp, trace->precomp_key);
+   _mesa_blake3_format(flags, trace->flags_hash);
+   _mesa_blake3_format(partition, trace->partition_hash);
+   _mesa_blake3_format(layout, trace->layout_hash);
+   _mesa_blake3_format(state, trace->state_hash);
+   fprintf(dev->cache_log,
+           "{\"event\":\"shader\",\"outcome\":\"%s\",\"stage\":%u,"
+           "\"namespace\":\"%s\",\"key\":\"%s\",\"precomp\":\"%s\","
+           "\"flags\":\"%s\",\"partition\":\"%s\",\"layout\":\"%s\","
+           "\"state\":\"%s\",\"start_ns\":%lld,\"end_ns\":%lld}\n",
+           outcome, trace->stage, ns, key, precomp, flags, partition,
+           layout, state, (long long)start, (long long)end);
+}
+
+void
+kk_log_cache_component(struct kk_physical_device *physical,
+                        VkShaderStageFlags stages, const char *name,
+                        const blake3_hash component, const blake3_hash state)
+{
+   const char *path = debug_get_option("MESA_KK_CACHE_LOG", NULL);
+   if (!path)
+      return;
+   FILE *file = fopen(path, "a");
+   if (!file)
+      return;
+   char ns[33], value[BLAKE3_HEX_LEN], full[BLAKE3_HEX_LEN];
+   kk_cache_namespace(&physical->vk, ns);
+   _mesa_blake3_format(value, component);
+   _mesa_blake3_format(full, state);
+   fprintf(file, "{\"event\":\"state_component\",\"namespace\":\"%s\","
+                 "\"stages\":%u,\"component\":\"%s\",\"hash\":\"%s\","
+                 "\"state\":\"%s\"}\n", ns, stages, name, value, full);
+   fclose(file);
+}
+
+void
+kk_log_cache_pso(struct kk_device *dev, const char *event,
+                  const void *key, size_t key_size)
+{
+   if (!dev->cache_log ||
+       (!dev->cache_log_hits && strcmp(event, "pso_cache_hit") == 0))
+      return;
+   blake3_hash digest;
+   char value[BLAKE3_HEX_LEN], ns[33];
+   _mesa_blake3_compute(key, key_size, digest);
+   _mesa_blake3_format(value, digest);
+   kk_cache_namespace(dev->vk.physical, ns);
+   static const char *const origins[] = {"draw", "prewarm", "create"};
+   fprintf(dev->cache_log, "{\"event\":\"pso\",\"outcome\":\"%s\","
+                           "\"origin\":\"%s\",\"namespace\":\"%s\","
+                           "\"key\":\"%s\",\"time_ns\":%lld}\n",
+           event, origins[kk_compile_origin], ns, value,
+           (long long)os_time_get_nano());
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 kk_CreateDevice(VkPhysicalDevice physicalDevice,
                 const VkDeviceCreateInfo *pCreateInfo,
@@ -300,7 +562,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (dev->mtl_compiler_handle == NULL)
       goto fail_init;
 
-   /* We need to initialize the device residency set before any bo is created. */
+   /* Initialize the device residency set before any bo is created. */
    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
    if (dev->residency_set.handle == NULL)
@@ -313,6 +575,24 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
          goto fail_vab_memory;
       dev->has_queue = true;
    }
+
+   /* Also cache pipelines when applications pass VK_NULL_HANDLE. Weak
+    * references avoid retaining every Metal pipeline for device lifetime. */
+   struct vk_pipeline_cache_create_info cache_info = {
+      .weak_ref = true,
+      .skip_disk_cache = dev->vk.disable_internal_cache,
+   };
+   dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
+   if (dev->vk.mem_cache == NULL) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_mem_cache;
+   }
+
+   if (!kk_pso_cache_init(&dev->pso_cache)) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_mem_cache;
+   }
+   simple_mtx_init(&dev->empty_fs_lock, mtx_plain);
 
    result = kk_device_init_meta(dev);
    if (result != VK_SUCCESS)
@@ -337,6 +617,38 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       mtl_start_gpu_capture(dev->mtl_handle, capture_directory);
    }
 
+   dev->capture_trigger = debug_get_option("MESA_KK_GPU_CAPTURE_TRIGGER", NULL);
+   dev->capture_directory =
+      debug_get_option("MESA_KK_GPU_CAPTURE_DIRECTORY", NULL);
+   dev->capture_frames =
+      CLAMP(debug_get_num_option("MESA_KK_GPU_CAPTURE_FRAMES", 3), 1, 120);
+   dev->present_log_path = debug_get_option("MESA_KK_PRESENT_LOG", NULL);
+   const char *compile_log_path = debug_get_option("MESA_KK_COMPILE_LOG", NULL);
+   if (compile_log_path) {
+      dev->compile_log = fopen(compile_log_path, "a");
+      if (dev->compile_log)
+         setvbuf(dev->compile_log, NULL, _IOLBF, 0);
+      else
+         fprintf(stderr, "KK cannot open compile log\n");
+   }
+   const char *cache_log_path = debug_get_option("MESA_KK_CACHE_LOG", NULL);
+   if (cache_log_path) {
+      dev->cache_log = fopen(cache_log_path, "a");
+      if (dev->cache_log)
+         setvbuf(dev->cache_log, NULL, _IOLBF, 0);
+   }
+   dev->cache_log_hits = debug_get_bool_option("MESA_KK_CACHE_LOG_HITS", false);
+   const char *variant_log_path = debug_get_option("MESA_KK_VARIANT_LOG", NULL);
+   const char *variant_stats_path =
+      debug_get_option("MESA_KK_VARIANT_STATS", NULL);
+   if (variant_log_path) {
+      dev->variant_log = fopen(variant_log_path, "a");
+      if (dev->variant_log)
+         setvbuf(dev->variant_log, NULL, _IOLBF, 0);
+   }
+   if (variant_stats_path)
+      dev->variant_stats = fopen(variant_stats_path, "a");
+   dev->variant_trace_enabled = dev->variant_log || dev->variant_stats;
    *pDevice = kk_device_to_handle(dev);
 
    return VK_SUCCESS;
@@ -348,6 +660,12 @@ fail_query_table:
 fail_meta:
    kk_device_finish_meta(dev);
 fail_mem_cache:
+   if (dev->pso_cache.table) {
+      kk_pso_cache_finish(&dev->pso_cache);
+      simple_mtx_destroy(&dev->empty_fs_lock);
+   }
+   if (dev->vk.mem_cache)
+      vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
    if (dev->has_queue) {
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;
@@ -379,9 +697,21 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       mtl_stop_gpu_capture();
    }
 
+   mtl_bounded_capture_finish(dev);
+   if (dev->present_log)
+      fclose(dev->present_log);
+
    /* Meta first since it may destroy Vulkan objects */
    kk_device_finish_meta(dev);
    kk_device_finish_lib(dev);
+   kk_pso_cache_finish(&dev->pso_cache);
+   if (dev->compile_log)
+      fclose(dev->compile_log);
+   if (dev->cache_log)
+      fclose(dev->cache_log);
+   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+   kk_device_finish_empty_fs(dev);
+   simple_mtx_destroy(&dev->empty_fs_lock);
    kk_query_table_finish(dev, &dev->occlusion_queries);
    kk_destroy_sampler_heap(dev, &dev->samplers);
 
@@ -399,6 +729,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    simple_mtx_destroy(&dev->residency_set.mutex);
 
    kk_release_compiler(dev);
+   kk_variant_trace_finish(dev);
 
    vk_device_finish(&dev->vk);
 
@@ -407,11 +738,29 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
 /* We need to implement this ourselves so we give the fake ones for vk_common_*
  * to work when executing actual commands */
+static VkResult VKAPI_CALL
+kk_wait_variant_prewarm(VkDevice device)
+{
+   return kk_pso_prewarm_wait(kk_device_from_handle(device));
+}
+
+static VkBool32 VKAPI_CALL
+kk_variant_prewarm_ready(VkDevice device)
+{
+   return kk_pso_prewarm_ready(kk_device_from_handle(device));
+}
+
 static PFN_vkVoidFunction
 kk_device_get_proc_addr(const struct kk_device *device, const char *name)
 {
    if (device == NULL || name == NULL)
       return NULL;
+   if (debug_get_bool_option("MESA_KK_TEST_PREWARM", false)) {
+      if (strcmp(name, "vkWaitForVariantPrewarmMESA") == 0)
+         return (PFN_vkVoidFunction)kk_wait_variant_prewarm;
+      if (strcmp(name, "vkIsVariantPrewarmReadyMESA") == 0)
+         return (PFN_vkVoidFunction)kk_variant_prewarm_ready;
+   }
 
    struct vk_instance *instance = device->vk.physical->instance;
    return vk_device_dispatch_table_get_if_supported(

@@ -9,6 +9,7 @@
 #define KK_DEVICE_H 1
 
 #include "kk_private.h"
+#include "kk_pso_cache.h"
 
 #include "kk_query_table.h"
 #include "kk_queue.h"
@@ -18,12 +19,16 @@
 #include "kosmickrisp/clc/kk_precompiled_shader.h"
 #include "libkk_shaders.h"
 
+#include "util/os_time.h"
 #include "util/u_dynarray.h"
+#include "util/u_thread.h"
 
 #include "vk_device.h"
 #include "vk_meta.h"
 #include "vk_queue.h"
 
+struct vk_shader_cache_trace;
+struct kk_metal_cache;
 struct kk_bo;
 struct kk_physical_device;
 struct vk_pipeline_cache;
@@ -76,8 +81,53 @@ struct kk_precompiled_cache {
    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
 };
 
+enum kk_variant_phase {
+   KK_VARIANT_ENQUEUE,
+   KK_VARIANT_WORKER_START,
+   KK_VARIANT_FS_PREPARE,
+   KK_VARIANT_FS_WAIT,
+   KK_VARIANT_RASTER_PREPARE,
+   KK_VARIANT_RASTER_WAIT,
+   KK_VARIANT_PSO_CREATE,
+   KK_VARIANT_PSO_WAIT,
+   KK_VARIANT_ARCHIVE_LOOKUP,
+   KK_VARIANT_ARCHIVE_LOAD,
+   KK_VARIANT_NATIVE_CREATE,
+   KK_VARIANT_COMPLETE,
+   KK_VARIANT_FIRST_DEMAND,
+   KK_VARIANT_READY_HIT,
+   KK_VARIANT_FAILURE,
+   KK_VARIANT_HISTORY_LOAD,
+   KK_VARIANT_REF_MISSING,
+   KK_VARIANT_BLOB_MISSING,
+   KK_VARIANT_ARCHIVE_REJECTED,
+   KK_VARIANT_PIPELINE_ABSENT,
+   KK_VARIANT_COUNT,
+};
+
+struct kk_variant_counter {
+   uint64_t count;
+   uint64_t duration_ns;
+   uint64_t draw_count;
+   uint64_t draw_duration_ns;
+};
+
 struct kk_device {
    struct vk_device vk;
+   const char *capture_trigger;
+   const char *capture_directory;
+   unsigned capture_frames;
+   const char *present_log_path;
+   FILE *present_log;
+   FILE *compile_log;
+   FILE *cache_log;
+   bool cache_log_hits;
+   FILE *variant_log;
+   FILE *variant_stats;
+   bool variant_trace_enabled;
+   struct kk_variant_counter variant_counters[KK_VARIANT_COUNT];
+   struct kk_metal_cache *metal_cache;
+   struct disk_cache *metal_disk;
 
    mtl_device *mtl_handle;
    mtl_compiler *mtl_compiler_handle;
@@ -103,6 +153,11 @@ struct kk_device {
    /* Geomtry heap */
    struct kk_bo *heap;
    util_once_flag heap_init_once;
+
+   struct kk_pso_cache pso_cache;
+   simple_mtx_t empty_fs_lock;
+   struct kk_shader *empty_fs;
+   struct kk_fs_variant *discard_fs;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
@@ -133,5 +188,36 @@ VkResult kk_sampler_heap_add(struct kk_device *dev,
                              struct mtl_sampler_packed desc,
                              struct kk_rc_sampler **out);
 void kk_sampler_heap_remove(struct kk_device *dev, struct kk_rc_sampler *rc);
+
+enum kk_compile_origin {
+   KK_COMPILE_ORIGIN_DRAW,
+   KK_COMPILE_ORIGIN_PREWARM,
+   KK_COMPILE_ORIGIN_CREATE,
+};
+
+extern __THREAD_INITIAL_EXEC enum kk_compile_origin kk_compile_origin;
+extern __THREAD_INITIAL_EXEC bool kk_fail_on_compile;
+extern __THREAD_INITIAL_EXEC bool kk_compile_required;
+extern __THREAD_INITIAL_EXEC blake3_hash kk_variant_parent_id;
+extern __THREAD_INITIAL_EXEC bool kk_variant_parent_valid;
+extern __THREAD_INITIAL_EXEC blake3_hash kk_variant_family_id;
+extern __THREAD_INITIAL_EXEC bool kk_variant_family_valid;
+
+void kk_variant_metal_event(void *data, const char *phase, const uint8_t *key,
+                            size_t key_size, int64_t start, int64_t end);
+void kk_variant_trace(struct kk_device *dev, enum kk_variant_phase phase,
+                      const void *key, size_t key_size,
+                      int64_t start, int64_t end);
+
+void kk_log_compile(struct kk_device *dev, const char *kind, int64_t start);
+void kk_log_cache_shader(struct kk_device *dev,
+                         const struct vk_shader_cache_trace *trace,
+                         const char *outcome, int64_t start, int64_t end);
+void kk_log_cache_component(struct kk_physical_device *physical,
+                            VkShaderStageFlags stages, const char *name,
+                            const blake3_hash component,
+                            const blake3_hash state);
+void kk_log_cache_pso(struct kk_device *dev, const char *event,
+                      const void *key, size_t key_size);
 
 #endif // KK_DEVICE_H
