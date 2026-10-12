@@ -1196,6 +1196,17 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
       .used = kk_get_sysmem_heap_used,
    };
 
+   /* Device-local-only type for optimal/tiled images. KK can only create a
+    * tiled Metal texture from a real MTLHeap, which it allocates for normal
+    * (non-imported) memory. This type has no HOST_VISIBLE bit, so Wine's
+    * winevulkan will not host-import it (it only imports mappable memory) —
+    * keeping optimal images out of host-imported memory, which has no heap. */
+   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      .heapIndex = sysmem_heap_idx,
+   };
+
+   /* Host-visible type for mappable buffers and linear images (buffer-backed). */
    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |

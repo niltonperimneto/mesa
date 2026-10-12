@@ -324,8 +324,11 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    bool no_framebuffer =
       framebuffer_extent.width == 0u && framebuffer_extent.height == 0u;
    if (no_framebuffer) {
-      framebuffer_extent.width = render->area.extent.width;
-      framebuffer_extent.height = render->area.extent.height;
+      /* Targetless rasterization: Metal requires nonzero renderTarget
+       * dimensions. DXVK can begin a pass with no attachments and a degenerate
+       * (0x0) render area, so clamp to at least 1x1 to keep Metal happy. */
+      framebuffer_extent.width = MAX2(render->area.extent.width, 1u);
+      framebuffer_extent.height = MAX2(render->area.extent.height, 1u);
       mtl_render_pass_descriptor_set_render_target_width(
          pass_descriptor, framebuffer_extent.width);
       mtl_render_pass_descriptor_set_render_target_height(

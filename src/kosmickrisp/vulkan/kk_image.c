@@ -666,6 +666,19 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
    struct kk_physical_device *pdev = kk_device_physical(dev);
    uint32_t memory_types = (1 << pdev->mem_type_count) - 1;
 
+   /* Optimal/tiled images can only be backed by a real MTLHeap, which KK
+    * creates for device-local (non host-imported) memory. Exclude host-visible
+    * memory types so these images never land in Wine-host-imported memory
+    * (which is buffer-backed with no heap and cannot back a tiled texture).
+    * Linear images can be backed by a buffer, so they keep all types. */
+   if (image->vk.tiling == VK_IMAGE_TILING_OPTIMAL) {
+      for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+         if (pdev->mem_types[i].propertyFlags &
+             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            memory_types &= ~BITFIELD_BIT(i);
+      }
+   }
+
    /* Remove non host visible heaps from the types for host image copy in case
     * of potential issues. This should be removed when we get ReBAR.
     */

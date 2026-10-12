@@ -426,6 +426,14 @@ kk_GetDeviceProcAddr(VkDevice _device, const char *pName)
    return kk_device_get_proc_addr(device, pName);
 }
 
+/* Plain vkGetDeviceProcAddr export for loaders that dlopen the driver directly
+ * (Wine/CrossOver win32u requires both vkGetInstanceProcAddr and this). */
+PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vkGetDeviceProcAddr(VkDevice device, const char *pName)
+{
+   return kk_GetDeviceProcAddr(device, pName);
+}
+
 void
 kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
 {

@@ -226,6 +226,33 @@ kk_instance_get_proc_addr(const struct vk_instance *instance,
    if (func != NULL)
       return func;
 
+   /* Lenient retry for core-promoted names on low-apiVersion instances.
+    *
+    * CrossOver's win32u creates its host instance with apiVersion 1.0 and
+    * then calls core-1.1 names it never NULL-checks (e.g. its
+    * VK_EXT_map_memory_placed probe calls vkGetPhysicalDeviceProperties2
+    * while using the KHR alias two lines away) — strict per-version lookup
+    * returns NULL there and wine jumps to address 0. MoltenVK resolves
+    * these leniently, which is why the strict behavior only breaks here.
+    * Retry with the version gate lifted; extension gating stays intact. */
+   func = vk_instance_dispatch_table_get_if_supported(
+      &instance->dispatch_table, name, VK_API_VERSION_1_3,
+      &instance->enabled_extensions);
+   if (func != NULL)
+      return func;
+
+   func = vk_physical_device_dispatch_table_get_if_supported(
+      &kk_physical_device_trampolines, name, VK_API_VERSION_1_3,
+      &instance->enabled_extensions);
+   if (func != NULL)
+      return func;
+
+   func = vk_device_dispatch_table_get_if_supported(
+      &kk_device_trampolines, name, VK_API_VERSION_1_3,
+      &instance->enabled_extensions, NULL);
+   if (func != NULL)
+      return func;
+
    return NULL;
 }
 
@@ -241,4 +268,32 @@ PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
 {
    return kk_GetInstanceProcAddr(instance, pName);
+}
+
+/* Plain vkGetInstanceProcAddr export so loaders that dlopen the driver
+ * directly (e.g. Wine/CrossOver's macdrv via CX_LIBVULKAN) can find the
+ * standard entrypoint. Equivalent to the ICD entrypoint for our purposes.
+ */
+PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vkGetInstanceProcAddr(VkInstance instance, const char *pName)
+{
+   return kk_GetInstanceProcAddr(instance, pName);
+}
+
+/* Flat vkCreateMetalSurfaceEXT export. Wine's winemac.drv probes for this
+ * as a dlsym symbol (use_VK_EXT_metal_surface =
+ * !!dlsym(handle, "vkCreateMetalSurfaceEXT")) to decide whether to map
+ * VK_KHR_win32_surface -> VK_EXT_metal_surface. Mesa only exposes it via
+ * dispatch, so without this flat symbol the mapping never happens and
+ * surface-using apps (DXVK) fail. Forwards to the dispatched implementation.
+ */
+PUBLIC VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateMetalSurfaceEXT(VkInstance instance,
+                        const VkMetalSurfaceCreateInfoEXT *pCreateInfo,
+                        const VkAllocationCallbacks *pAllocator,
+                        VkSurfaceKHR *pSurface)
+{
+   PFN_vkCreateMetalSurfaceEXT fn = (PFN_vkCreateMetalSurfaceEXT)
+      kk_GetInstanceProcAddr(instance, "vkCreateMetalSurfaceEXT");
+   return fn(instance, pCreateInfo, pAllocator, pSurface);
 }

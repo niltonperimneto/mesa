@@ -15,6 +15,7 @@
 
 #include "vulkan/vulkan_metal.h"
 
+#include "util/os_misc.h"
 #include "util/u_atomic.h"
 #include "util/u_memory.h"
 
@@ -79,6 +80,13 @@ kk_GetMemoryHostPointerPropertiesEXT(
    default:
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
+   /* Imported host memory is backed by a no-copy MTLBuffer (no MTLHeap), so
+    * strictly only HOST_VISIBLE types make sense here. But CrossOver's wow64
+    * winevulkan host-imports allocations regardless of their memory type and
+    * treats a type excluded from this mask as an allocation failure, so
+    * restricting the mask hangs the guest at swapchain setup. Keep all types
+    * advertised — heap-requiring resources are already kept out of imported
+    * memory by the image-side memoryTypeBits exclusion. */
    pMemoryHostPointerProperties->memoryTypeBits =
       BITFIELD_MASK(pdev->mem_type_count);
 
@@ -97,8 +105,10 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
       pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
 
-   // TODO_KOSMICKRISP Do the actual memory allocation with alignment requirements
-   uint32_t alignment = (1ULL << 12);
+   /* Align to the host page size instead of a hardcoded 4096 so we
+    * match the actual mapping granularity. */
+   uint64_t alignment = 4096;
+   os_get_page_size(&alignment);
 
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
@@ -136,6 +146,18 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
+      }
+
+      /* Metal rejects imports that violate its constraints (no-copy buffers
+       * need page-aligned pointer and page-multiple length) by returning nil.
+       * Fail the allocation instead of propagating a nil buffer into every
+       * later gpu-address/contents query. */
+      if (mem->bo->map == NULL) {
+         FREE(mem->bo);
+         mem->bo = NULL;
+         result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "failed to import external memory into Metal");
+         goto fail_alloc;
       }
 
       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
