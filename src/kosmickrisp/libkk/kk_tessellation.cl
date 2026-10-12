@@ -52,11 +52,11 @@ libkk_tess_setup_indirect(
    p->coord_allocs = (global uint *)(blob + patch_coord_offs);
    p->nr_patches = unrolled_patches;
 
-   vp->output_buffer = (uintptr_t)(blob + vb_offs);
-   vp->outputs = vertex_outputs;
    p->counts = (global uint32_t *)(blob + count_offs);
 
    if (vp) {
+      vp->output_buffer = (uintptr_t)(blob + vb_offs);
+      vp->outputs = vertex_outputs;
       vp->verts_per_instance = count;
    }
 

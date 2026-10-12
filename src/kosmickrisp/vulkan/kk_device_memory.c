@@ -190,7 +190,7 @@ kk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    /* According to spec, memory is implicitly unmapped upon free */
    if (mem->map)
-      kk_bo_unmap(dev, mem->bo, mem->map, false);
+      kk_bo_unmap(dev, mem->bo, mem->map, mem->map_size_B, false);
 
    kk_destroy_bo(dev, mem->bo);
 
@@ -246,13 +246,22 @@ kk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
                        "Memory object already mapped.");
    }
 
+   uint64_t map_size_B = mem->bo->size_B;
+   if (fixed_addr) {
+      struct kk_physical_device *pdev = kk_device_physical(dev);
+      map_size_B =
+         align64(mem->vk.size, pdev->vk.properties.minPlacedMemoryMapAlignment);
+      assert(map_size_B <= mem->bo->size_B);
+   }
+
    void *mapped_addr = fixed_addr;
-   result = kk_bo_map_placed(dev, mem->bo, &mapped_addr);
+   result = kk_bo_map_placed(dev, mem->bo, map_size_B, &mapped_addr);
    if (result != VK_SUCCESS)
       return result;
 
    assert(!fixed_addr || mapped_addr == fixed_addr);
    mem->map = mapped_addr;
+   mem->map_size_B = map_size_B;
    *ppData = mem->map + offset;
 
    return result;
@@ -271,13 +280,15 @@ kk_UnmapMemory2KHR(VkDevice device,
 
    bool reserved = pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT;
 
-   result = kk_bo_unmap(dev, mem->bo, mem->map, reserved);
+   result =
+      kk_bo_unmap(dev, mem->bo, mem->map, mem->map_size_B, reserved);
    if (result != VK_SUCCESS)
       return result;
 
    /* According to spec, memory is not unmapped on failure, so we only clear to
     * NULL on success */
    mem->map = NULL;
+   mem->map_size_B = 0;
 
    return result;
 }

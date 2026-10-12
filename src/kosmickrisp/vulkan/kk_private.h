@@ -43,6 +43,8 @@
 /* Max size of a bound cbuf */
 #define KK_MAX_CBUF_SIZE (1u << 16)
 
+#define KK_SHADER_BINARY_VERSION 7u
+
 /* Metal related macros */
 #define KK_MTL_RESOURCE_OPTIONS                                                \
    MTL_RESOURCE_STORAGE_MODE_SHARED |                                          \

@@ -42,6 +42,7 @@ struct kk_root_descriptor_table {
 
          float blend_constant[4];
          float clip_z_coeff;
+         uint32_t sample_mask;
 
          float viewport_z_range[KK_MAX_VIEWPORTS * 2];
          bool emulate_depth_clamp;
@@ -64,6 +65,9 @@ struct kk_root_descriptor_table {
    /* Start index in dynamic_buffers where each set starts */
    uint8_t set_dynamic_buffer_start[KK_MAX_SETS];
 };
+
+static_assert(sizeof(struct kk_root_descriptor_table) == 2632,
+              "kk_root_descriptor_table layout is shared with shaders");
 
 struct kk_descriptor_state {
    bool root_dirty;
@@ -97,6 +101,9 @@ struct kk_per_draw_data {
    /* Whether the last vertex of a primitive is its provoking vertex */
    uint32_t provoking_last;
 };
+
+static_assert(sizeof(struct kk_per_draw_data) == 64,
+              "kk_per_draw_data layout is shared with shaders");
 
 struct kk_attachment {
    VkRenderingAttachmentFlagsKHR flags;
@@ -144,6 +151,7 @@ struct kk_rendering_state {
 enum kk_dirty {
    KK_DIRTY_VB = BITFIELD_BIT(0),
    KK_DIRTY_OCCLUSION = BITFIELD_BIT(1),
+   KK_DIRTY_PSO = BITFIELD_BIT(2),
 };
 
 struct kk_graphics_state {
@@ -152,6 +160,11 @@ struct kk_graphics_state {
    struct kk_per_draw_data per_draw_data;
 
    mtl_depth_stencil_state *depth_stencil_state;
+   mtl_render_pipeline_state *pso;
+   bool pso_is_stub;
+   mtl_compute_pipeline_state *pre_render[4];
+   uint32_t pre_render_count;
+   bool pre_render_valid;
    mtl_render_pass_descriptor *render_pass_descriptor;
    bool is_depth_stencil_dynamic;
    bool is_cull_front_and_back;
@@ -224,7 +237,8 @@ struct kk_uploader {
 };
 
 /* A pending resolve of one timestamp counter-heap entry into a query pool BO.
- * Recorded by vkCmdWriteTimestamp2 and flushed on the GPU timeline at cs_end. */
+ * Recorded by vkCmdWriteTimestamp2 and flushed on the GPU timeline
+ * at cs_end. */
 struct kk_ts_resolve {
    mtl_counter_heap *heap;
    uint32_t index;
@@ -433,5 +447,7 @@ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
 void kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write);
 
 void kk_cmd_buffer_set_label(struct kk_cmd_buffer *cb, const char *label);
+
+void kk_cmd_prewarm_pipeline(struct kk_cmd_buffer *cmd);
 
 #endif

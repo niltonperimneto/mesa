@@ -11,6 +11,9 @@ const struct debug_named_value debug_flags[] = {
    {"nir", KK_DEBUG_NIR},
    {"msl", KK_DEBUG_MSL},
    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
+   {"dynamic_vi", KK_DEBUG_DYNAMIC_VI},
+   {"partition", KK_DEBUG_PARTITION},
+   {"pso", KK_DEBUG_PSO},
    {NULL, 0},
 };
 

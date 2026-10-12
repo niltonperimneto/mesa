@@ -12,6 +12,9 @@ enum kk_debug {
    KK_DEBUG_MSL = 1ull << 1,
    /* Forces robustness for all shaders */
    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
+   KK_DEBUG_DYNAMIC_VI = 1ull << 3,
+   KK_DEBUG_PARTITION = 1ull << 4,
+   KK_DEBUG_PSO = 1ull << 6,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;

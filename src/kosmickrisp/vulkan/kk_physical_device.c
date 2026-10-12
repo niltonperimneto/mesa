@@ -144,6 +144,8 @@ kk_get_device_extensions(const struct kk_instance *instance,
       /* Optional extensions */
       .KHR_calibrated_timestamps = true,
       .KHR_deferred_host_operations = true,
+      .KHR_pipeline_library = true,
+      .EXT_graphics_pipeline_library = true,
       .KHR_maintenance7 = true,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
@@ -198,6 +200,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_robustness2 = true,
       .EXT_sample_locations = true,
       .EXT_shader_atomic_float = true,
+      .EXT_shader_object = true,
       .EXT_shader_replicated_composites = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
@@ -328,11 +331,12 @@ kk_get_device_features(
       .dynamicRendering = true,
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,
-      .extendedDynamicState2LogicOp = false,
+      .extendedDynamicState2LogicOp = true,
       .extendedDynamicState2PatchControlPoints = true,
       .inlineUniformBlock = true,
       .maintenance4 = true,
       .pipelineCreationCacheControl = true,
+      .graphicsPipelineLibrary = true,
       .privateData = true,
       .robustImageAccess = true,
       .shaderDemoteToHelperInvocation = true,
@@ -465,6 +469,16 @@ kk_get_device_features(
 
       /* VK_EXT_extended_dynamic_state3 */
       .extendedDynamicState3DepthClampEnable = true,
+      .extendedDynamicState3PolygonMode = true,
+      .extendedDynamicState3RasterizationSamples = true,
+      .extendedDynamicState3SampleMask = true,
+      .extendedDynamicState3AlphaToCoverageEnable = true,
+      .extendedDynamicState3AlphaToOneEnable = true,
+      .extendedDynamicState3LogicOpEnable = true,
+      .extendedDynamicState3ColorBlendEnable = true,
+      .extendedDynamicState3ColorBlendEquation = true,
+      .extendedDynamicState3ColorWriteMask = true,
+      .extendedDynamicState3ColorBlendAdvanced = true,
       .extendedDynamicState3DepthClipEnable = true,
       .extendedDynamicState3DepthClipNegativeOneToOne = true,
       .extendedDynamicState3LineRasterizationMode = true,
@@ -520,6 +534,9 @@ kk_get_device_features(
 
       /* VK_EXT_vertex_input_dynamic_state */
       .vertexInputDynamicState = true,
+
+      /* VK_EXT_shader_object */
+      .shaderObject = true,
 
       /* EXT_ycbcr_2plane_444_formats */
       .ycbcr2plane444Formats = true,
@@ -883,7 +900,7 @@ kk_get_device_properties(
       .variableSampleLocations = true,
 
       /* VK_EXT_shader_object */
-      .shaderBinaryVersion = 0,
+      .shaderBinaryVersion = KK_SHADER_BINARY_VERSION,
 
       /* VK_EXT_transform_feedback */
       .maxTransformFeedbackStreams = 4,
@@ -981,12 +998,34 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
                        sizeof(instance->driver_build_sha));
 
+   /* MSL lowering depends on the GPU, language and workaround settings. */
+   _mesa_blake3_update(&blake3_ctx, &pdev->info.gpu_apple_family,
+                      sizeof(pdev->info.gpu_apple_family));
+   _mesa_blake3_update(&blake3_ctx, &pdev->info.msl_version,
+                      sizeof(pdev->info.msl_version));
+   _mesa_blake3_update(&blake3_ctx, &pdev->settings.disabled_workarounds,
+                      sizeof(pdev->settings.disabled_workarounds));
+   _mesa_blake3_update(&blake3_ctx, &pdev->settings.experimental_enabled,
+                      sizeof(pdev->settings.experimental_enabled));
+
+   const uint64_t compile_flags =
+      kk_mesa_debug_flags & (KK_DEBUG_FORCE_ROBUSTNESS | KK_DEBUG_DYNAMIC_VI |
+                             KK_DEBUG_PARTITION);
+   const uint32_t binary_version = KK_SHADER_BINARY_VERSION;
+   _mesa_blake3_update(&blake3_ctx, &binary_version, sizeof(binary_version));
+   _mesa_blake3_update(&blake3_ctx, &compile_flags, sizeof(compile_flags));
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
 
    STATIC_ASSERT(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
    memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
    memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
+
+#ifdef ENABLE_SHADER_CACHE
+   char cache_id[BLAKE3_HEX_LEN];
+   _mesa_blake3_format(cache_id, blake3);
+   pdev->vk.disk_cache = disk_cache_create("kosmickrisp", cache_id, 0);
+#endif
 }
 
 static void
@@ -1206,7 +1245,7 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
       .heapIndex = sysmem_heap_idx,
    };
 
-   /* Host-visible type for mappable buffers and linear images (buffer-backed). */
+   /* Host-visible type for mappable buffers and linear images. */
    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
@@ -1242,6 +1281,7 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    return VK_SUCCESS;
 
 fail_disk_cache:
+   kk_physical_device_free_disk_cache(pdev);
    vk_physical_device_finish(&pdev->vk);
 fail_mtl_dev:
    mtl_release(pdev->mtl_dev_handle);

@@ -194,11 +194,10 @@ write_buffer_desc(struct kk_descriptor_set *set,
 
    const struct kk_addr_range addr_range =
       kk_buffer_addr_range(buffer, info->offset, info->range);
-   assert(addr_range.range <= UINT32_MAX);
 
    const struct kk_buffer_address desc = {
       .base_addr = addr_range.addr,
-      .size = addr_range.range,
+      .size = MIN2(addr_range.range, UINT32_MAX),
    };
    write_desc(set, binding, elem, &desc, sizeof(desc));
 }
@@ -214,13 +213,12 @@ write_dynamic_buffer_desc(struct kk_descriptor_set *set,
 
    const struct kk_addr_range addr_range =
       kk_buffer_addr_range(buffer, info->offset, info->range);
-   assert(addr_range.range <= UINT32_MAX);
 
    struct kk_buffer_address *desc =
       &set->dynamic_buffers[binding_layout->dynamic_buffer_index + elem];
    *desc = (struct kk_buffer_address){
       .base_addr = addr_range.addr,
-      .size = addr_range.range,
+      .size = MIN2(addr_range.range, UINT32_MAX),
    };
 }
 

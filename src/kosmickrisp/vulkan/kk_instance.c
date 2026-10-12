@@ -127,7 +127,7 @@ kk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    if (build_id_len != VK_UUID_SIZE) {
       result = vk_errorf(
          NULL, VK_ERROR_INITIALIZATION_FAILED,
-         "build-id size does not match expected size (VK_UUID_SIZE which is 16 bytes)");
+         "build-id size does not match expected size (VK_UUID_SIZE 16 bytes)");
       goto fail_init;
    }
 
@@ -164,7 +164,8 @@ kk_DestroyInstance(VkInstance _instance,
 /* We need this to return our own trampoline functions */
 static PFN_vkVoidFunction
 kk_instance_get_proc_addr(const struct vk_instance *instance,
-                          const struct vk_instance_entrypoint_table *entrypoints,
+                          const struct vk_instance_entrypoint_table *
+                             entrypoints,
                           const char *name)
 {
    PFN_vkVoidFunction func;

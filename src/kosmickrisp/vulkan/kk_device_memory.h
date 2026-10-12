@@ -20,6 +20,7 @@ struct kk_device_memory {
    struct vk_device_memory vk;
    struct kk_bo *bo;
    void *map;
+   uint64_t map_size_B;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_device_memory, vk.base, VkDeviceMemory,

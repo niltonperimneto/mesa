@@ -10,6 +10,7 @@
 
 #include "kk_device_memory.h"
 #include "kk_private.h"
+#include "kk_pso_cache.h"
 
 #include "kosmickrisp/bridge/mtl_format.h"
 
@@ -17,7 +18,11 @@
 
 #include "vk_pipeline_cache.h"
 
+#include "vk_graphics_state.h"
 #include "vk_shader.h"
+
+#include "util/mesa-blake3.h"
+#include "util/simple_mtx.h"
 
 struct kk_cmd_buffer;
 
@@ -50,9 +55,18 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
 struct kk_shader_info {
    mesa_shader_stage stage;
    bool uses_per_draw_data;
+   bool partial;
+   bool shader_object;
+   bool so_hw;
+   bool so_emu;
 
    /* Required for fragment shader cull distance discards. */
    uint8_t num_cull_distances;
+
+   uint8_t rast_num_cull_distances;
+   uint8_t rast_primitive_id_slot;
+   bool rast_point_variant;
+   uint64_t rast_outputs_written;
 
    union {
       /* Vertex shader is the pipeline, store all relevant data here. */
@@ -107,6 +121,14 @@ struct kk_shader_info {
 
       struct {
          bool uses_flat_varyings;
+         bool ms_static;
+         bool writes_depth;
+         bool writes_stencil;
+         bool dual_source_blend;
+         bool reads_primitive_id;
+         uint8_t color_outputs;
+         uint8_t output_base_type[MAX_DRAW_BUFFERS];
+         uint64_t inputs_read;
       } fs;
 
       struct {
@@ -115,6 +137,8 @@ struct kk_shader_info {
    };
 };
 
+static_assert(sizeof(struct kk_shader_info) == 128,
+              "kk_shader_info is serialized");
 /* Threadgroup size the VS, TES and GS compute passes are compiled for and
  * dispatched with */
 #define KK_POLY_WG_SIZE 64u
@@ -139,6 +163,24 @@ struct msl_compile_data {
    char *entrypoint_name;
 };
 
+struct kk_fs_variant {
+   blake3_hash hash;
+   mtl_library *lib;
+   mtl_function_descriptor *fn;
+   bool shader_blend;
+};
+
+struct kk_render_pending {
+   cnd_t ready;
+   bool compiling;
+   bool queued;
+   struct kk_pso_key key;
+   mtl_library *vertex_library;
+   mtl_function_descriptor *vertex_function;
+   mtl_library *fragment_library;
+   mtl_function_descriptor *fragment_function;
+};
+
 struct kk_shader {
    struct vk_shader vk;
 
@@ -148,7 +190,44 @@ struct kk_shader {
    /* Compute pass of a GS. Its rasterization VS is in
     * msl_data[MESA_SHADER_GEOMETRY]. */
    struct msl_compile_data gs_main;
+
+   struct kk_fs_variant fast;
+   struct kk_fs_variant fast_points;
+   struct msl_compile_data msl_points;
+
+   mtl_compute_pipeline_state *so_cs;
+   struct msl_compile_data msl_emu;
+
+   void *nir_blob;
+   size_t nir_blob_size;
+   blake3_hash variant_identity;
+   int variant_identity_ready;
+   mtx_t variants_lock;
+   struct hash_table *variants;
+   struct kk_render_pending *pending;
 };
+
+struct kk_fs_link_key {
+   VkFormat rt_formats[MAX_DRAW_BUFFERS];
+   uint64_t missing_inputs;
+   uint32_t advanced_blend_mask;
+   uint8_t logic_op;
+   uint8_t num_cull_distances;
+   uint8_t primitive_id_slot;
+   bool logic_op_enable;
+   bool shader_blend;
+   bool remove_depth;
+   bool alpha_to_coverage;
+   bool alpha_to_one;
+   bool sample_mask;
+   uint8_t pad[3];
+   struct vk_color_blend_attachment_state blend[MAX_DRAW_BUFFERS];
+};
+
+static_assert(sizeof(struct kk_fs_link_key) == 280,
+              "kk_fs_link_key is hashed and serialized");
+
+void kk_shader_variant_identity(struct kk_shader *shader, blake3_hash output);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
                                VK_OBJECT_TYPE_SHADER_EXT);
@@ -198,5 +277,23 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
 
 void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
                                 struct kk_shader *shader);
+
+const struct kk_fs_variant *kk_shader_get_rast(struct kk_device *dev,
+                                               struct kk_shader *vs,
+                                               bool points);
+
+struct kk_pso_request;
+
+VkResult kk_shader_get_fs_variant(struct kk_device *dev, struct kk_shader *fs,
+                                  const struct kk_fs_link_key *key,
+                                  const struct kk_fs_variant **variant_out,
+                                  const struct kk_pso_request *request);
+
+bool kk_shader_rast_ready(struct kk_shader *vs, bool points);
+
+struct kk_shader *kk_device_get_empty_fs(struct kk_device *dev);
+const struct kk_fs_variant *kk_device_get_discard_fs(struct kk_device *dev,
+                                                     bool create);
+void kk_device_finish_empty_fs(struct kk_device *dev);
 
 #endif /* KK_SHADER_H */

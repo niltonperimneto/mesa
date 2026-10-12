@@ -39,9 +39,10 @@ VkResult kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
 
 void kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo);
 
-VkResult kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr);
+VkResult kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo,
+                          uint64_t size_B, void **addr);
 VkResult kk_bo_unmap(struct kk_device *dev, struct kk_bo *bo, void *addr,
-                     bool reserved);
+                     uint64_t size_B, bool reserved);
 
 void kk_bo_set_label(struct kk_bo *bo, const char *label);
 

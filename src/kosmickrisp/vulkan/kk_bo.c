@@ -97,7 +97,8 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
 }
 
 VkResult
-kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr)
+kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, uint64_t size_B,
+                 void **addr)
 {
 #if DETECT_OS_APPLE
    mach_vm_address_t src_addr = (mach_vm_address_t)bo->cpu;
@@ -114,7 +115,7 @@ kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr)
     * allows us to create a second mapping pointing to that same memory, placed
     * wherever the caller requests. Note that this is used even without a fixed
     * address, since we need a unique mapping to support reserved unmap. */
-   kern_return_t ret = mach_vm_remap(mach_task_self(), &dst_addr, bo->size_B, 0,
+   kern_return_t ret = mach_vm_remap(mach_task_self(), &dst_addr, size_B, 0,
                                      flags, mach_task_self(), src_addr, false,
                                      &cur_prot, &max_prot, VM_INHERIT_DEFAULT);
    if (ret != KERN_SUCCESS)
@@ -128,14 +129,15 @@ kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr)
 }
 
 VkResult
-kk_bo_unmap(struct kk_device *dev, struct kk_bo *bo, void *addr, bool reserved)
+kk_bo_unmap(struct kk_device *dev, struct kk_bo *bo, void *addr,
+            uint64_t size_B, bool reserved)
 {
 #if DETECT_OS_APPLE
    mach_vm_address_t unmap_addr = (mach_vm_address_t)addr;
    if (reserved) {
       /* Replace with a reserved mapping using mach_vm_map */
       kern_return_t ret = mach_vm_map(
-         mach_task_self(), &unmap_addr, bo->size_B, 0,
+         mach_task_self(), &unmap_addr, size_B, 0,
          VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, MEMORY_OBJECT_NULL, 0, false,
          VM_PROT_NONE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
       if (ret != KERN_SUCCESS)
@@ -144,7 +146,7 @@ kk_bo_unmap(struct kk_device *dev, struct kk_bo *bo, void *addr, bool reserved)
    } else {
       /* According to spec, we can only return a fail code here if the reserve
        * flag is set, so ignore the result */
-      mach_vm_deallocate(mach_task_self(), unmap_addr, bo->size_B);
+      mach_vm_deallocate(mach_task_self(), unmap_addr, size_B);
    }
 #endif /* DETECT_OS_APPLE */
 

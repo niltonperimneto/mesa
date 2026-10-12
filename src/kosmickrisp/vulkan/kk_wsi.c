@@ -13,6 +13,7 @@
 #include "kk_image.h"
 #include "kk_instance.h"
 #include "wsi_common.h"
+#include "util/os_time.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
@@ -142,4 +143,36 @@ kk_finish_wsi(struct kk_physical_device *pdev)
 {
    pdev->vk.wsi_device = NULL;
    wsi_device_finish(&pdev->wsi_device, &pdev->vk.instance->alloc);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *info)
+{
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
+   struct kk_device *dev = kk_queue_device(queue);
+   int64_t start = dev->present_log_path ? os_time_get_nano() : 0;
+   VkResult result = wsi_common_queue_present(dev->vk.physical->wsi_device,
+                                              &queue->vk, info);
+   if (dev->present_log_path) {
+      int64_t end = os_time_get_nano();
+      if (!dev->present_log) {
+         dev->present_log = fopen(dev->present_log_path, "a");
+         if (!dev->present_log) {
+            fprintf(stderr, "KK cannot open presentation log\n");
+            dev->present_log_path = NULL;
+         } else {
+            setvbuf(dev->present_log, NULL, _IOLBF, 0);
+         }
+      }
+      if (dev->present_log)
+         fprintf(dev->present_log, "%lld,%lld,%d,%u\n",
+                 (long long)start, (long long)end, result,
+                 info->swapchainCount);
+   }
+   if (dev->capture_trigger)
+      mtl_bounded_capture_present(dev, dev->mtl_handle, dev->capture_trigger,
+         dev->capture_directory, dev->capture_frames,
+         result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR);
+   return result;
 }

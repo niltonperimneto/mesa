@@ -83,26 +83,29 @@ pack_sampler_info(const struct VkSamplerCreateInfo *sampler_info,
       reduction_mode = vk_sampler_reduction_mode_to_mtl_sampler_reduction_mode(
          reduction_info->reductionMode);
 
-   return (struct mtl_sampler_packed){
-      .mode_u = vk_sampler_address_mode_to_mtl_sampler_address_mode(
-         sampler_info->addressModeU),
-      .mode_v = vk_sampler_address_mode_to_mtl_sampler_address_mode(
-         sampler_info->addressModeV),
-      .mode_w =
-         vk_sampler_address_mode_to_mtl_sampler_address_mode(address_mode_w),
-      .border_color = border_color,
-      .min_filter =
-         vk_filter_to_mtl_sampler_min_mag_filter(sampler_info->minFilter),
-      .mag_filter =
-         vk_filter_to_mtl_sampler_min_mag_filter(sampler_info->magFilter),
-      .mip_filter = mip_filter,
-      .reduction_mode = reduction_mode,
-      .compare_func = compare,
-      .min_lod = sampler_info->minLod,
-      .max_lod = sampler_info->maxLod,
-      .max_anisotropy = max_anisotropy,
-      .normalized_coordinates = !sampler_info->unnormalizedCoordinates,
-   };
+   struct mtl_sampler_packed packed;
+   memset(&packed, 0, sizeof(packed));
+   packed.mode_u =
+      vk_sampler_address_mode_to_mtl_sampler_address_mode(
+         sampler_info->addressModeU);
+   packed.mode_v =
+      vk_sampler_address_mode_to_mtl_sampler_address_mode(
+         sampler_info->addressModeV);
+   packed.mode_w =
+      vk_sampler_address_mode_to_mtl_sampler_address_mode(address_mode_w);
+   packed.border_color = border_color;
+   packed.min_filter =
+      vk_filter_to_mtl_sampler_min_mag_filter(sampler_info->minFilter);
+   packed.mag_filter =
+      vk_filter_to_mtl_sampler_min_mag_filter(sampler_info->magFilter);
+   packed.mip_filter = mip_filter;
+   packed.reduction_mode = reduction_mode;
+   packed.compare_func = compare;
+   packed.min_lod = sampler_info->minLod;
+   packed.max_lod = sampler_info->maxLod;
+   packed.max_anisotropy = max_anisotropy;
+   packed.normalized_coordinates = !sampler_info->unnormalizedCoordinates;
+   return packed;
 }
 
 static mtl_sampler_descriptor *

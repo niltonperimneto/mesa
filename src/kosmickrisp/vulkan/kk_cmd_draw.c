@@ -15,6 +15,7 @@
 #include "kk_image_view.h"
 #include "kk_physical_device.h"
 #include "kk_query_pool.h"
+#include "vk_common_entrypoints.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
@@ -26,6 +27,185 @@
 
 #include "vulkan/runtime/vk_render_pass.h"
 #include "vulkan/util/vk_format.h"
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBindPipeline(VkCommandBuffer commandBuffer,
+   VkPipelineBindPoint pipelineBindPoint,
+   VkPipeline _pipeline)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdBindPipeline(
+      commandBuffer, pipelineBindPoint, _pipeline);
+   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBindShadersEXT(VkCommandBuffer commandBuffer,
+   uint32_t stageCount,
+   const VkShaderStageFlagBits *pStages,
+   const VkShaderEXT *pShaders)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdBindShadersEXT(
+      commandBuffer, stageCount, pStages, pShaders);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer,
+   VkPrimitiveTopology primitiveTopology)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetPrimitiveTopology(
+      commandBuffer, primitiveTopology);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetRasterizationSamplesEXT(VkCommandBuffer commandBuffer,
+   VkSampleCountFlagBits rasterizationSamples)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetRasterizationSamplesEXT(
+      commandBuffer, rasterizationSamples);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetSampleMaskEXT(VkCommandBuffer commandBuffer,
+   VkSampleCountFlagBits samples,
+   const VkSampleMask *pSampleMask)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetSampleMaskEXT(
+      commandBuffer, samples, pSampleMask);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetAlphaToCoverageEnableEXT(VkCommandBuffer commandBuffer,
+   VkBool32 alphaToCoverageEnable)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetAlphaToCoverageEnableEXT(
+      commandBuffer, alphaToCoverageEnable);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetAlphaToOneEnableEXT(VkCommandBuffer commandBuffer,
+   VkBool32 alphaToOneEnable)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetAlphaToOneEnableEXT(
+      commandBuffer, alphaToOneEnable);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetLogicOpEnableEXT(VkCommandBuffer commandBuffer,
+   VkBool32 logicOpEnable)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetLogicOpEnableEXT(
+      commandBuffer, logicOpEnable);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetLogicOpEXT(VkCommandBuffer commandBuffer,
+   VkLogicOp logicOp)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetLogicOpEXT(
+      commandBuffer, logicOp);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetColorWriteEnableEXT(VkCommandBuffer commandBuffer,
+   uint32_t attachmentCount,
+   const VkBool32 *pColorWriteEnables)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetColorWriteEnableEXT(
+      commandBuffer, attachmentCount, pColorWriteEnables);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetColorBlendEnableEXT(VkCommandBuffer commandBuffer,
+   uint32_t firstAttachment,
+   uint32_t attachmentCount,
+   const VkBool32 *pColorBlendEnables)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetColorBlendEnableEXT(
+      commandBuffer, firstAttachment, attachmentCount, pColorBlendEnables);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetColorBlendEquationEXT(VkCommandBuffer commandBuffer,
+   uint32_t firstAttachment,
+   uint32_t attachmentCount,
+   const VkColorBlendEquationEXT *pColorBlendEquations)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetColorBlendEquationEXT(
+      commandBuffer, firstAttachment, attachmentCount, pColorBlendEquations);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetColorWriteMaskEXT(VkCommandBuffer commandBuffer,
+   uint32_t firstAttachment,
+   uint32_t attachmentCount,
+   const VkColorComponentFlags *pColorWriteMasks)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetColorWriteMaskEXT(
+      commandBuffer, firstAttachment, attachmentCount, pColorWriteMasks);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetColorBlendAdvancedEXT(VkCommandBuffer commandBuffer,
+   uint32_t firstAttachment,
+   uint32_t attachmentCount,
+   const VkColorBlendAdvancedEXT * pColorBlendAdvanced)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetColorBlendAdvancedEXT(
+      commandBuffer, firstAttachment, attachmentCount, pColorBlendAdvanced);
+   kk_cmd_prewarm_pipeline(cmd);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdSetRenderingAttachmentLocationsKHR(VkCommandBuffer commandBuffer,
+   const VkRenderingAttachmentLocationInfoKHR * pLocationInfo)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   vk_common_CmdSetRenderingAttachmentLocationsKHR(
+      commandBuffer, pLocationInfo);
+   kk_cmd_prewarm_pipeline(cmd);
+}
 
 static void
 kk_cmd_buffer_dirty_render_pass(struct kk_cmd_buffer *cmd)
@@ -471,6 +651,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    cmd->state.gfx.need_to_start_render_pass = no_framebuffer;
 
    kk_cmd_buffer_dirty_all_gfx(cmd);
+   kk_cmd_prewarm_pipeline(cmd);
 
    if (render->flags & VK_RENDERING_RESUMING_BIT)
       return;
@@ -976,6 +1157,44 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
    }
 }
 
+static bool
+kk_update_pre_render(struct kk_cmd_buffer *cmd)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   struct kk_shader *tcs = cmd->state.shaders[MESA_SHADER_TESS_CTRL];
+   struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+
+   if (!vs->info.shader_object) {
+      gfx->pre_render_count = vs->pipeline.gfx.pre_render_count;
+      memcpy(gfx->pre_render, vs->pipeline.gfx.pre_render,
+             sizeof(gfx->pre_render));
+      return true;
+   }
+
+   uint32_t count = 0u;
+   if (tcs || gs)
+      gfx->pre_render[count++] = vs->so_cs;
+   if (tcs)
+      gfx->pre_render[count++] = tcs->so_cs;
+   if (tes && gs)
+      gfx->pre_render[count++] = tes->so_cs;
+   if (gs)
+      gfx->pre_render[count++] = gs->so_cs;
+   gfx->pre_render_count = count;
+
+   if (!tcs != !tes)
+      return false;
+
+   for (uint32_t i = 0u; i < count; ++i) {
+      if (gfx->pre_render[i] == NULL)
+         return false;
+   }
+
+   return true;
+}
+
 static void
 kk_flush_pipeline(struct kk_cmd_buffer *cmd)
 {
@@ -1000,9 +1219,15 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
       mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
 
-   if (IS_SHADER_DIRTY(VERTEX)) {
-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   if (IS_SHADER_DIRTY(VERTEX) || IS_SHADER_DIRTY(TESS_CTRL) ||
+       IS_SHADER_DIRTY(TESS_EVAL) || IS_SHADER_DIRTY(GEOMETRY))
+      gfx->pre_render_valid = kk_update_pre_render(cmd);
+
+   if (!vs->info.partial && (IS_SHADER_DIRTY(VERTEX) || gfx->pso_is_stub)) {
+      gfx->pso = kk_cmd_acquire_render(cmd, vs, &gfx->pso_is_stub);
+      if (gfx->pso)
+         mtl_render_set_pipeline_state(enc, gfx->pso);
       if (gfx->depth_stencil_state)
          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
@@ -1011,7 +1236,8 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
     * gfx->tess.prim
     */
    if ((IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL)) &&
-       cmd->state.shaders[MESA_SHADER_TESS_CTRL]) {
+       cmd->state.shaders[MESA_SHADER_TESS_CTRL] &&
+       cmd->state.shaders[MESA_SHADER_TESS_EVAL]) {
       struct kk_shader *tesc = cmd->state.shaders[MESA_SHADER_TESS_CTRL];
       struct kk_shader *tese = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
 
@@ -1027,6 +1253,23 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
          gfx->tess.prim = MESA_PRIM_TRIANGLES;
       }
    }
+
+   if (vs->info.partial &&
+       ((gfx->dirty & KK_DIRTY_PSO) || IS_DIRTY(CB_LOGIC_OP_ENABLE) ||
+        IS_DIRTY(CB_LOGIC_OP) || IS_DIRTY(CB_ATTACHMENT_COUNT) ||
+        IS_DIRTY(CB_COLOR_WRITE_ENABLES) || IS_DIRTY(CB_BLEND_ENABLES) ||
+        IS_DIRTY(CB_BLEND_EQUATIONS) || IS_DIRTY(CB_WRITE_MASKS) ||
+        IS_DIRTY(MS_RASTERIZATION_SAMPLES) || IS_DIRTY(MS_SAMPLE_MASK) ||
+        IS_DIRTY(MS_ALPHA_TO_COVERAGE_ENABLE) ||
+        IS_DIRTY(MS_ALPHA_TO_ONE_ENABLE) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
+        IS_DIRTY(COLOR_ATTACHMENT_MAP) || IS_DIRTY(RP_ATTACHMENTS))) {
+      gfx->pso = kk_cmd_link_pipeline(cmd, &gfx->pso_is_stub);
+      if (gfx->pso)
+         mtl_render_set_pipeline_state(enc, gfx->pso);
+   }
+
+   if (!gfx->pre_render_valid)
+      gfx->pso = NULL;
 }
 
 static void
@@ -1175,7 +1418,8 @@ kk_upload_vertex_params(struct kk_cmd_buffer *cmd,
        * reads if there aren't. Those reads are undefined but should not
        * fault. Affects:
        *
-       *    dEQP-VK.pipeline.monolithic.no_position.explicit_declarations.basic.single_view.v0_g1
+       *    dEQP-VK.pipeline.monolithic.no_position.explicit_declarations.
+       *    basic.single_view.v0_g1
        */
       if (vb_size)
          params.output_buffer = kk_pool_alloc(cmd, vb_size, 4).gpu;
@@ -1495,8 +1739,15 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
                        sizeof(dyn->cb.blend_constants),
                     "common size");
 
+      mtl_set_blend_color(enc, dyn->cb.blend_constants);
+
       memcpy(desc->root.draw.blend_constant, dyn->cb.blend_constants,
              sizeof(dyn->cb.blend_constants));
+      desc->root_dirty = true;
+   }
+
+   if (IS_DIRTY(MS_SAMPLE_MASK)) {
+      desc->root.draw.sample_mask = dyn->ms.sample_mask;
       desc->root_dirty = true;
    }
 
@@ -1558,6 +1809,10 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    struct kk_descriptor_state *desc = &gfx->descriptors;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   if (cmd->state.shaders[MESA_SHADER_VERTEX]->info.partial)
+      gfx->pipeline_sample_count = MAX2(dyn->ms.rasterization_samples, 1u);
 
    kk_flush_render_pass(cmd);
    kk_flush_pipeline(cmd);
@@ -1568,7 +1823,7 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    kk_flush_dynamic_state(cmd);
 
    cmd->state.dirty_shaders = 0u;
-   cmd->state.gfx.dirty = 0u;
+   cmd->state.gfx.dirty = gfx->pso_is_stub ? KK_DIRTY_PSO : 0u;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
 }
 #undef IS_SHADER_DIRTY
@@ -2160,7 +2415,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
 
    mtl_compute_encoder *enc = cs_get_compute(cmd);
    {
-      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
+      mtl_compute_pipeline_state *pipeline = gfx->pre_render[0];
       struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                        MTL_STAGE_DISPATCH);
@@ -2168,7 +2423,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
       kk_dispatch_compute(enc, grid_vs, local_size);
    }
    {
-      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[1];
+      mtl_compute_pipeline_state *pipeline = gfx->pre_render[1];
       struct mtl_size local_size = {tcs->info.tess.tcs_output_patch_size, 1, 1};
       /* Avoid Metal validation error by trying to launch empty compute. Return
        * empty data. We set restart to true to avoid unroll. */
@@ -2285,22 +2540,22 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
          return (struct kk_draw_data){.grid = kk_grid_1d(0u)};
    }
 
-   /* The stage feeding the GS and its compute pass are the last two pre-render
-    * pipelines */
-   uint32_t pre_render_count = vs->pipeline.gfx.pre_render_count;
+   /* The stage feeding the geometry shader and its compute pass are the last
+    * two pre-render pipelines */
+   uint32_t pre_render_count = gfx->pre_render_count;
    struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
    mtl_compute_encoder *enc = cs_get_compute(cmd);
 
    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
    mtl_compute_set_pipeline_state(
-      enc, vs->pipeline.gfx.pre_render[pre_render_count - 2u]);
+      enc, gfx->pre_render[pre_render_count - 2u]);
    kk_dispatch_compute(enc, grid_vs, local_size);
 
    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
    mtl_compute_set_pipeline_state(
-      enc, vs->pipeline.gfx.pre_render[pre_render_count - 1u]);
+      enc, gfx->pre_render[pre_render_count - 1u]);
    kk_dispatch_compute(enc, grid_gs, local_size);
 
    struct kk_draw_data rast = {
@@ -2322,6 +2577,54 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    }
 
    return rast;
+}
+
+static struct kk_draw_data
+kk_unroll_gs_outputs(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+{
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   struct kk_draw_command data = {
+      .prim = gs->info.gs.mode,
+      .index_buffer = draw.index.gpu,
+      .index_buffer_el_size_B = draw.index.el_size_B,
+      .indirect = kk_grid_is_indirect(draw.grid),
+      .indexed = draw.index.el_size_B != 0u,
+      .restart = poly_gs_indexed(gs->info.gs.shape),
+      .restart_index = draw.index.el_size_B == 2u ? UINT16_MAX : UINT32_MAX,
+      .flatshade_first = false,
+      .draw_count = 1u,
+   };
+
+   if (data.indirect) {
+      data.indirect_command.addr = draw.grid.addr;
+      data.indirect_command.stride = data.indexed
+                                       ? sizeof(VkDrawIndexedIndirectCommand)
+                                       : sizeof(VkDrawIndirectCommand);
+   } else if (data.indexed) {
+      data.indexed_draws[0] = (VkDrawIndexedIndirectCommand){
+         .indexCount = draw.grid.size.x,
+         .instanceCount = draw.grid.size.y,
+         .vertexOffset = draw.vertex_offset,
+         .firstInstance = draw.grid.size.z,
+      };
+   } else {
+      data.draws[0] = (VkDrawIndirectCommand){
+         .vertexCount = draw.grid.size.x,
+         .instanceCount = draw.grid.size.y,
+         .firstVertex = draw.vertex_offset,
+         .firstInstance = draw.grid.size.z,
+      };
+   }
+
+   if (!kk_unroll_geometry(cmd, &data))
+      return (struct kk_draw_data){.grid = kk_grid_1d(0u)};
+
+   draw.grid = kk_grid_indirect(data.indirect_command.addr);
+   draw.index.gpu = data.index_buffer;
+   draw.index.el_size_B = data.index_buffer_el_size_B;
+   draw.primitive_type = mesa_prim_to_mtl_primitive_type(data.prim);
+   draw.vertex_offset = 0u;
+   return draw;
 }
 
 /* Get modifiable per draw data. */
@@ -2372,6 +2675,9 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
    kk_flush_gfx_state(cmd);
 
+   if (cmd->state.gfx.pso == NULL)
+      return;
+
    data->restart = dyn->ia.primitive_restart_enable;
    data->restart_index = dyn->ia.primitive_restart_index;
    data->flatshade_first =
@@ -2409,6 +2715,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
          draw_data = kk_launch_tess(cmd, draw_data);
       if (geom)
          draw_data = kk_launch_gs_prerast(cmd, data, draw_data, gs_restart);
+      if (geom && requires_unroll_flatshade(cmd, data))
+         draw_data = kk_unroll_gs_outputs(cmd, draw_data);
 
       /* TODO_KOSMICKRISP Remove this once unroll, tess and any compute does not
        * split render pass */
