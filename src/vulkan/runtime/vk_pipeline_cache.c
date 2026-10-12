@@ -22,6 +22,7 @@
  */
 
 #include "vk_pipeline_cache.h"
+#include "vk_shader.h"
 
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -332,6 +333,20 @@ vk_pipeline_cache_insert_object(struct vk_pipeline_cache *cache,
    return result;
 }
 
+static void
+vk_pipeline_cache_trace_rejection(struct vk_pipeline_cache *cache,
+                                  const void *key_data, size_t key_size)
+{
+   struct vk_device *device = cache->base.device;
+   if (!device->shader_ops || !device->shader_ops->shader_cache_trace ||
+       key_size != sizeof(blake3_hash))
+      return;
+   struct vk_shader_cache_trace trace = {.stage = MESA_SHADER_STAGES};
+   memcpy(trace.key, key_data, sizeof(trace.key));
+   device->shader_ops->shader_cache_trace(device, &trace,
+                                          "cache_deserialize_rejected");
+}
+
 struct vk_pipeline_cache_object *
 vk_pipeline_cache_lookup_object(struct vk_pipeline_cache *cache,
                                 const void *key_data, size_t key_size,
@@ -385,6 +400,7 @@ vk_pipeline_cache_lookup_object(struct vk_pipeline_cache *cache,
             /* Deserialization failed, there is likely an issue with the disk
              * cache entry, just remove it.
              */
+            vk_pipeline_cache_trace_rejection(cache, key_data, key_size);
             disk_cache_remove(disk_cache, cache_key);
          }
       }
@@ -408,6 +424,7 @@ vk_pipeline_cache_lookup_object(struct vk_pipeline_cache *cache,
                                               data_obj->data,
                                               data_obj->data_size, ops);
       if (real_object == NULL) {
+         vk_pipeline_cache_trace_rejection(cache, key_data, key_size);
          vk_pipeline_cache_log(cache,
                                "Deserializing pipeline cache object failed");
 

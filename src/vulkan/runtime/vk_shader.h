@@ -75,7 +75,18 @@ int vk_shader_cmp_rt_stages(mesa_shader_stage a, mesa_shader_stage b);
    VK_PIPELINE_CREATE_2_DISALLOW_OPACITY_MICROMAP_BIT_ARM | \
    MESA_VK_PIPELINE_RAY_TRACING_FLAGS_BETA)
 
+struct vk_shader_cache_trace {
+   mesa_shader_stage stage;
+   blake3_hash precomp_key;
+   blake3_hash flags_hash;
+   blake3_hash partition_hash;
+   blake3_hash layout_hash;
+   blake3_hash state_hash;
+   blake3_hash key;
+};
+
 struct vk_shader_compile_info {
+   const struct vk_shader_cache_trace *cache_trace;
    mesa_shader_stage stage;
    VkShaderCreateFlagsEXT flags;
    /* RT flags only includes :
@@ -222,6 +233,10 @@ vk_shader_destroy(struct vk_device *device,
 }
 
 struct vk_device_shader_ops {
+   void (*shader_cache_trace)(struct vk_device *device,
+                              const struct vk_shader_cache_trace *trace,
+                              const char *outcome);
+
    /** Retrieves a NIR compiler options struct
     *
     * NIR compiler options are only allowed to vary based on physical device,
@@ -335,6 +350,12 @@ struct vk_device_shader_ops {
                                   uint32_t shader_count,
                                   struct vk_shader **vk_shaders,
                                   const void *replay_data);
+
+   void (*graphics_pipeline_created)(
+      struct vk_device *device,
+      const struct vk_graphics_pipeline_state *state,
+      uint32_t shader_count,
+      struct vk_shader *const *shaders);
 
    /** Bind a set of shaders
     *

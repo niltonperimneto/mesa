@@ -869,6 +869,7 @@ static const struct vk_pipeline_cache_object_ops pipeline_precomp_shader_cache_o
 };
 
 struct vk_pipeline_stage {
+   struct vk_shader_cache_trace cache_trace;
    mesa_shader_stage stage;
 
    /* Whether the shader was linked with others (RT pipelines only) */
@@ -1583,6 +1584,10 @@ vk_get_graphics_pipeline_compile_info(struct vk_graphics_pipeline_compile_info *
          _mesa_blake3_update(&blake3_ctx, &shader_flags, sizeof(shader_flags));
       }
 
+      struct mesa_blake3 partition_ctx = blake3_ctx;
+      blake3_hash partition_hash;
+      _mesa_blake3_final(&partition_ctx, partition_hash);
+
       blake3_hash state_blake3;
       ops->hash_state(device->physical, info->state,
                       &device->enabled_features, info->part_stages[p],
@@ -1602,6 +1607,21 @@ vk_get_graphics_pipeline_compile_info(struct vk_graphics_pipeline_compile_info *
          _mesa_blake3_update(&blake3_ctx, &stage->stage, sizeof(stage->stage));
          _mesa_blake3_update(&blake3_ctx, linked_blake3, sizeof(linked_blake3));
          _mesa_blake3_final(&blake3_ctx, stage->shader_key);
+         stage->cache_trace.stage = stage->stage;
+         memcpy(stage->cache_trace.precomp_key, stage->precomp_key,
+                sizeof(blake3_hash));
+         VkShaderCreateFlagsEXT shader_flags =
+            vk_pipeline_to_shader_flags(pipeline_flags, stage->stage,
+                                        pipeline_layout);
+         _mesa_blake3_compute(&shader_flags, sizeof(shader_flags),
+                              stage->cache_trace.flags_hash);
+         memcpy(stage->cache_trace.partition_hash, partition_hash,
+                sizeof(blake3_hash));
+         memcpy(stage->cache_trace.layout_hash, layout_blake3,
+                sizeof(blake3_hash));
+         memcpy(stage->cache_trace.state_hash, state_blake3,
+                sizeof(blake3_hash));
+         memcpy(stage->cache_trace.key, stage->shader_key, sizeof(blake3_hash));
       }
    }
 }
@@ -1726,6 +1746,14 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
                                                sizeof(stage->shader_key),
                                                &pipeline_shader_cache_ops,
                                                &cache_hit);
+            if (device->shader_ops->shader_cache_trace) {
+               const char *outcome =
+                  cache_obj ? (cache_hit ? "application_hit" : "disk_hit")
+                            : "miss";
+               device->shader_ops->shader_cache_trace(
+                  device, &stage->cache_trace, outcome);
+            }
+
             if (cache_obj != NULL) {
                assert(stage->shader == NULL);
                stage->shader = vk_shader_from_cache_obj(cache_obj);
@@ -1814,6 +1842,7 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
             get_push_range_for_stage(pipeline_layout, stage->stage);
 
          infos[i] = (struct vk_shader_compile_info) {
+            .cache_trace = &stage->cache_trace,
             .stage = stage->stage,
             .flags = shader_flags,
             .next_stage_mask = next_stage,
@@ -2183,6 +2212,14 @@ vk_create_graphics_pipeline(struct vk_device *device,
       }
    }
 
+   if (!is_library && device->shader_ops->graphics_pipeline_created) {
+      struct vk_shader *shaders[MESA_SHADER_MESH_STAGES];
+      for (uint32_t i = 0; i < compile_info.stage_count; ++i)
+         shaders[i] = compile_info.stages[i].shader;
+      device->shader_ops->graphics_pipeline_created(
+         device, &state_tmp, compile_info.stage_count, shaders);
+   }
+
    const int64_t pipeline_end = os_time_get_nano();
    if (feedback_info != NULL) {
       VkPipelineCreationFeedback pipeline_feedback = {
@@ -2373,7 +2410,8 @@ vk_get_compute_pipeline_compile_info(struct vk_pipeline_stage *stage,
       vk_pipeline_hash_precomp_shader_stage(device, pipeline_flags, pCreateInfo->pNext,
                                             &pCreateInfo->stage, stage);
 
-      struct mesa_blake3 blake3_ctx;
+      struct mesa_blake3 blake3_ctx, layout_ctx;
+      _mesa_blake3_init(&layout_ctx);
       _mesa_blake3_init(&blake3_ctx);
 
       _mesa_blake3_update(&blake3_ctx, &stage->stage, sizeof(stage->stage));
@@ -2383,6 +2421,8 @@ vk_get_compute_pipeline_compile_info(struct vk_pipeline_stage *stage,
 
       _mesa_blake3_update(&blake3_ctx, &shader_flags, sizeof(shader_flags));
 
+      struct mesa_blake3 partition_ctx = blake3_ctx;
+      _mesa_blake3_final(&partition_ctx, stage->cache_trace.partition_hash);
       blake3_hash features_blake3;
       ops->hash_state(device->physical, NULL /* state */,
                       &device->enabled_features, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -2392,16 +2432,30 @@ vk_get_compute_pipeline_compile_info(struct vk_pipeline_stage *stage,
       if (pipeline_layout != NULL) {
          for (uint32_t i = 0; i < pipeline_layout->set_count; i++) {
             if (pipeline_layout->set_layouts[i] != NULL) {
-               _mesa_blake3_update(&blake3_ctx,
-                                   pipeline_layout->set_layouts[i]->blake3,
-                                   sizeof(pipeline_layout->set_layouts[i]->blake3));
+               const void *layout_hash =
+                  pipeline_layout->set_layouts[i]->blake3;
+               size_t layout_size =
+                  sizeof(pipeline_layout->set_layouts[i]->blake3);
+               _mesa_blake3_update(&blake3_ctx, layout_hash, layout_size);
+               _mesa_blake3_update(&layout_ctx, layout_hash, layout_size);
             }
          }
       }
-      if (push_range != NULL)
+      if (push_range != NULL) {
          _mesa_blake3_update(&blake3_ctx, push_range, sizeof(*push_range));
+         _mesa_blake3_update(&layout_ctx, push_range, sizeof(*push_range));
+      }
 
       _mesa_blake3_final(&blake3_ctx, stage->shader_key);
+      stage->cache_trace.stage = stage->stage;
+      memcpy(stage->cache_trace.key, stage->shader_key, sizeof(blake3_hash));
+      memcpy(stage->cache_trace.precomp_key, stage->precomp_key,
+             sizeof(blake3_hash));
+      _mesa_blake3_compute(&shader_flags, sizeof(shader_flags),
+                           stage->cache_trace.flags_hash);
+      memcpy(stage->cache_trace.state_hash, features_blake3,
+             sizeof(blake3_hash));
+      _mesa_blake3_final(&layout_ctx, stage->cache_trace.layout_hash);
    }
 }
 
@@ -2422,6 +2476,12 @@ vk_pipeline_compile_compute_stage(struct vk_device *device,
                                          sizeof(stage->shader_key),
                                          &pipeline_shader_cache_ops,
                                          cache_hit);
+      if (ops->shader_cache_trace) {
+         const char *trace_hit =
+            (cache_hit && *cache_hit) ? "application_hit" : "disk_hit";
+         ops->shader_cache_trace(device, &stage->cache_trace,
+                                 cache_obj ? trace_hit : "miss");
+      }
       if (cache_obj != NULL) {
          stage->shader = vk_shader_from_cache_obj(cache_obj);
          return VK_SUCCESS;
@@ -2453,6 +2513,7 @@ vk_pipeline_compile_compute_stage(struct vk_device *device,
     * returns, we own the shaders but not the NIR in infos.
     */
    struct vk_shader_compile_info compile_info = {
+      .cache_trace = &stage->cache_trace,
       .stage = stage->stage,
       .flags = shader_flags,
       .next_stage_mask = 0,
