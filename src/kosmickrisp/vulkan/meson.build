@@ -107,6 +107,13 @@ kk_files = files(
   'kk_sampler.h',
   'kk_sampler.c',
   'kk_shader.h',
+  'kk_metal_cache.c',
+  'kk_metal_cache.h',
+  'kk_pso_cache.c',
+  'kk_variant_history.c',
+  'kk_variant_history.h',
+  'kk_pso_cache.h',
+  'kk_pso_wait.h',
   'kk_shader.c',
   'kk_sync.h',
   'kk_sync.c',
@@ -202,3 +209,37 @@ kosmickrisp_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', kosmickrisp_icd.full_path())
+
+if with_tests
+  test(
+    'kk-pso-cache',
+    executable(
+      'kk-pso-cache-test',
+      ['tests/pso_cache.c', 'kk_metal_cache.c', 'kk_variant_history.c', 'kk_format.c'],
+      include_directories : [inc_include, inc_src],
+      dependencies : [
+        idep_nir,
+        idep_mesautil,
+        idep_vulkan_util,
+        idep_vulkan_runtime_headers,
+        idep_vulkan_wsi_headers,
+        idep_mtl_bridge,
+        idep_libkk_shaders_h.partial_dependency(includes : true, sources : true),
+      ],
+      link_with : [libvulkan_lite_runtime, libvulkan_runtime, libvulkan_instance],
+      link_args : host_machine.system() == 'darwin' ? ['-Wl,-dead_strip'] : ld_args_gc_sections,
+    ),
+    suite : ['kosmickrisp'],
+    timeout : 30,
+  )
+  test(
+    'kk-metal-trace',
+    prog_python,
+    args : [
+      '-m', 'unittest', 'discover',
+      '-s', join_paths(meson.current_source_dir(), '../bridge/tests'),
+      '-p', 'test_*.py',
+    ],
+    suite : ['kosmickrisp'],
+  )
+endif
