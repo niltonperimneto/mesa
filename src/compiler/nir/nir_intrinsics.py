@@ -3344,4 +3344,5 @@ system_value("is_depth_clamp_emulated_kk", 1, bit_sizes=[1])
 system_value("is_viewport_z_transform_emulated_kk", 1, bit_sizes=[1])
 # Loads the viewport Z range for a given viewport index.
 load("viewport_z_range_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
+load("viewport_inv_size_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
 system_value("api_sample_mask_kk", 1)
