@@ -12,6 +12,7 @@
 #include "kosmickrisp/bridge/mtl_types.h"
 
 #include "util/mesa-blake3.h"
+#include "util/rwlock.h"
 #include "util/simple_mtx.h"
 #include "util/u_queue.h"
 
@@ -67,6 +68,7 @@ struct kk_link_state {
 
 struct kk_pso_cache {
    mtx_t lock;
+   struct u_rwlock index_lock;
    struct hash_table *table;
    struct util_queue prewarm_queue;
    struct util_queue exact_queue;

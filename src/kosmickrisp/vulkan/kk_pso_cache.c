@@ -105,7 +105,7 @@ kk_family_equal(const void *a, const void *b)
 }
 
 static struct kk_recipe_entry *
-kk_recipe_insert_locked(struct kk_pso_cache *cache,
+kk_recipe_insert_locked(struct kk_pso_cache *cache, uint32_t hash,
                         const struct kk_variant_recipe *recipe)
 {
    if (!cache->recipes || cache->recipe_count >= cache->recipe_limit)
@@ -119,12 +119,34 @@ kk_recipe_insert_locked(struct kk_pso_cache *cache,
       ralloc_free(entry);
       return NULL;
    }
-   if (!_mesa_hash_table_insert(cache->recipes, &entry->recipe, entry)) {
+   if (!_mesa_hash_table_insert_pre_hashed(cache->recipes, hash,
+                                           &entry->recipe, entry)) {
       cnd_destroy(&entry->ready);
       ralloc_free(entry);
       return NULL;
    }
    cache->recipe_count++;
+   return entry;
+}
+
+static struct kk_recipe_entry *
+kk_recipe_lookup(struct kk_pso_cache *cache,
+                 const struct kk_variant_recipe *recipe, bool insert)
+{
+   if (!cache->recipes)
+      return NULL;
+   uint32_t hash = kk_recipe_hash(recipe);
+   u_rwlock_rdlock(&cache->index_lock);
+   struct hash_entry *he =
+      _mesa_hash_table_search_pre_hashed(cache->recipes, hash, recipe);
+   struct kk_recipe_entry *entry = he ? he->data : NULL;
+   u_rwlock_rdunlock(&cache->index_lock);
+   if (entry || !insert)
+      return entry;
+   u_rwlock_wrlock(&cache->index_lock);
+   he = _mesa_hash_table_search_pre_hashed(cache->recipes, hash, recipe);
+   entry = he ? he->data : kk_recipe_insert_locked(cache, hash, recipe);
+   u_rwlock_wrunlock(&cache->index_lock);
    return entry;
 }
 
@@ -242,7 +264,12 @@ kk_pso_cache_init(struct kk_pso_cache *cache)
 {
    if (mtx_init(&cache->lock, mtx_plain) != thrd_success)
       return false;
+   if (u_rwlock_init(&cache->index_lock)) {
+      mtx_destroy(&cache->lock);
+      return false;
+   }
    if (cnd_init(&cache->jobs_done) != thrd_success) {
+      u_rwlock_destroy(&cache->index_lock);
       mtx_destroy(&cache->lock);
       return false;
    }
@@ -273,6 +300,7 @@ kk_pso_cache_init(struct kk_pso_cache *cache)
       cache->recipes = NULL;
       cache->families = NULL;
       cnd_destroy(&cache->jobs_done);
+      u_rwlock_destroy(&cache->index_lock);
       mtx_destroy(&cache->lock);
       return false;
    }
@@ -343,6 +371,7 @@ kk_pso_cache_finish(struct kk_pso_cache *cache)
       _mesa_hash_table_destroy(cache->table, NULL);
       cache->table = NULL;
    }
+   u_rwlock_destroy(&cache->index_lock);
    mtx_destroy(&cache->lock);
    cnd_destroy(&cache->jobs_done);
 }
@@ -371,41 +400,49 @@ kk_pso_prewarm_ready(struct kk_device *dev)
 }
 
 static struct kk_pso_result
-kk_pso_entry_get_locked(struct kk_device *dev, struct kk_pso_entry *entry,
-                        const struct kk_pso_key *key,
-                        const struct kk_pso_request *request)
+kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
+                 const struct kk_pso_key *key,
+                 const struct kk_pso_request *request)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
-   bool first_draw = kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
-                     !entry->drawn;
-   entry->prewarmed |= kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM;
-   if (entry->compiling) {
-      kk_log_cache_pso(dev, "pso_wait", key, sizeof(*key));
-      int64_t start = os_time_get_nano();
-      struct mtl_compile_phase phase =
-         kk_pso_phase_begin(dev, "pso_wait", key, sizeof(*key));
-      VkResult status = kk_pso_wait(&entry->ready, &cache->lock,
-                                    &entry->compiling, request);
-      mtl_compile_phase_end(phase, status == VK_SUCCESS);
-      if (status != VK_SUCCESS) {
-         mtx_unlock(&cache->lock);
-         return (struct kk_pso_result){ .status = status };
+   if (kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM &&
+       !p_atomic_read(&entry->prewarmed))
+      p_atomic_set(&entry->prewarmed, true);
+   mtl_render_pipeline_state *pso = p_atomic_read(&entry->pso);
+   if (!pso) {
+      VkResult status = VK_SUCCESS;
+      int64_t start = 0;
+      mtx_lock(&cache->lock);
+      bool waited = entry->compiling;
+      if (waited) {
+         kk_log_cache_pso(dev, "pso_wait", key, sizeof(*key));
+         start = os_time_get_nano();
+         struct mtl_compile_phase phase =
+            kk_pso_phase_begin(dev, "pso_wait", key, sizeof(*key));
+         status = kk_pso_wait(&entry->ready, &cache->lock,
+                              &entry->compiling, request);
+         mtl_compile_phase_end(phase, status == VK_SUCCESS);
       }
-      kk_log_compile(dev, "pso_wait", start);
-      kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, key, sizeof(*key),
-                       start, os_time_get_nano());
+      pso = entry->pso;
+      mtx_unlock(&cache->lock);
+      if (status != VK_SUCCESS)
+         return (struct kk_pso_result){ .status = status };
+      if (waited) {
+         kk_log_compile(dev, "pso_wait", start);
+         kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, key, sizeof(*key),
+                          start, os_time_get_nano());
+      }
    }
    if (KK_DEBUG(PSO))
       mesa_logi("PSO cache hit");
-   mtl_render_pipeline_state *pso = entry->pso;
-   entry->drawn |= pso && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW;
-   if (pso && entry->prewarmed && first_draw)
+   if (pso && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
+       !p_atomic_read(&entry->drawn) && !p_atomic_xchg(&entry->drawn, true) &&
+       p_atomic_read(&entry->prewarmed))
       kk_log_cache_pso(dev, "prewarm_match", key, sizeof(*key));
    kk_log_cache_pso(dev, pso ? "pso_cache_hit" : "pso_cache_failed",
                      key, sizeof(*key));
    if (pso)
       kk_variant_trace(dev, KK_VARIANT_READY_HIT, key, sizeof(*key), 0, 0);
-   mtx_unlock(&cache->lock);
    return (struct kk_pso_result){ pso, pso ? VK_SUCCESS : VK_ERROR_UNKNOWN };
 }
 
@@ -443,41 +480,47 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
    struct kk_pso_cache *cache = &dev->pso_cache;
    uint32_t hash = kk_pso_key_hash(key);
 
-   mtx_lock(&cache->lock);
+   u_rwlock_rdlock(&cache->index_lock);
    struct hash_entry *he =
       _mesa_hash_table_search_pre_hashed(cache->table, hash, key);
-   if (he)
-      return kk_pso_entry_get_locked(dev, he->data, key, request);
+   struct kk_pso_entry *found = he ? he->data : NULL;
+   u_rwlock_rdunlock(&cache->index_lock);
+   if (found)
+      return kk_pso_entry_get(dev, found, key, request);
 
    if (request && request->lookup_only) {
-      mtx_unlock(&cache->lock);
       mtl_render_pipeline_state *pso =
          kk_new_render_pipeline(dev, vs, fs, key, true);
       if (!pso)
          return (struct kk_pso_result){ .status = VK_NOT_READY };
-      mtx_lock(&cache->lock);
+      u_rwlock_wrlock(&cache->index_lock);
       he = _mesa_hash_table_search_pre_hashed(cache->table, hash, key);
-      if (he) {
+      found = he ? he->data : NULL;
+      struct kk_pso_entry *entry =
+         found ? NULL : kk_pso_entry_insert_locked(cache, hash, key, pso);
+      u_rwlock_wrunlock(&cache->index_lock);
+      if (found) {
          mtl_release(pso);
-         return kk_pso_entry_get_locked(dev, he->data, key, request);
+         return kk_pso_entry_get(dev, found, key, request);
       }
-      if (!kk_pso_entry_insert_locked(cache, hash, key, pso)) {
-         mtx_unlock(&cache->lock);
+      if (!entry) {
          mtl_release(pso);
          return (struct kk_pso_result){ .status = VK_ERROR_OUT_OF_HOST_MEMORY };
       }
-      mtx_unlock(&cache->lock);
       kk_variant_trace(dev, KK_VARIANT_COMPLETE, key, sizeof(*key), 0, 0);
       return (struct kk_pso_result){ pso, VK_SUCCESS };
    }
 
+   u_rwlock_wrlock(&cache->index_lock);
+   he = _mesa_hash_table_search_pre_hashed(cache->table, hash, key);
+   found = he ? he->data : NULL;
    struct kk_pso_entry *entry =
-      kk_pso_entry_insert_locked(cache, hash, key, NULL);
-   if (entry == NULL) {
-      mtx_unlock(&cache->lock);
+      found ? NULL : kk_pso_entry_insert_locked(cache, hash, key, NULL);
+   u_rwlock_wrunlock(&cache->index_lock);
+   if (found)
+      return kk_pso_entry_get(dev, found, key, request);
+   if (entry == NULL)
       return (struct kk_pso_result){ .status = VK_ERROR_OUT_OF_HOST_MEMORY };
-   }
-   mtx_unlock(&cache->lock);
 
    kk_log_cache_pso(dev, kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM ?
                           "prewarm_miss" : "pso_cache_miss",
@@ -487,7 +530,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
    mtl_render_pipeline_state *pso =
       kk_new_render_pipeline(dev, vs, fs, key, false);
    mtx_lock(&cache->lock);
-   entry->pso = pso;
+   p_atomic_set(&entry->pso, pso);
    entry->compiling = false;
    cnd_broadcast(&entry->ready);
    mtx_unlock(&cache->lock);
@@ -919,9 +962,9 @@ kk_recipe_job_execute(struct kk_prewarm_job *job)
       dev, job->vs, job->fs, &entry->recipe, &native_key, NULL);
    mtl_compile_phase_end(phase, result.status == VK_SUCCESS);
    mtx_lock(&cache->lock);
-   entry->pso = result.pso;
    if (result.pso)
       entry->native_key = native_key;
+   p_atomic_set(&entry->pso, result.pso);
    entry->compiling = false;
    entry->complete = true;
    cnd_broadcast(&entry->ready);
@@ -968,12 +1011,13 @@ kk_stub_get(struct kk_device *dev, const struct kk_pso_key *source,
       return kk_pso_cache_get(dev, &key, rast_fn, discard->fn, NULL).pso;
 
    struct kk_pso_cache *cache = &dev->pso_cache;
-   mtx_lock(&cache->lock);
-   struct hash_entry *he = _mesa_hash_table_search(cache->table, &key);
+   uint32_t hash = kk_pso_key_hash(&key);
+   u_rwlock_rdlock(&cache->index_lock);
+   struct hash_entry *he =
+      _mesa_hash_table_search_pre_hashed(cache->table, hash, &key);
    struct kk_pso_entry *entry = he ? he->data : NULL;
-   mtl_render_pipeline_state *pso =
-      entry && !entry->compiling ? entry->pso : NULL;
-   mtx_unlock(&cache->lock);
+   u_rwlock_rdunlock(&cache->index_lock);
+   mtl_render_pipeline_state *pso = entry ? p_atomic_read(&entry->pso) : NULL;
    kk_log_cache_pso(dev, pso ? "stub_hit" : "stub_miss", &key, sizeof(key));
    return pso;
 }
@@ -985,20 +1029,21 @@ kk_schedule_stub(struct kk_device *dev, struct kk_shader *vs,
    struct kk_pso_cache *cache = &dev->pso_cache;
    if (!kk_stub_enabled(dev) || !kk_job_shaders_allowed(dev, vs, NULL))
       return;
-   struct kk_prewarm_job *job = calloc(1, sizeof(*job));
-   if (!job)
+   struct kk_recipe_entry *entry = kk_recipe_lookup(cache, recipe, true);
+   if (!entry || p_atomic_read(&entry->pso))
       return;
    mtx_lock(&cache->lock);
-   struct hash_entry *he =
-      cache->recipes ? _mesa_hash_table_search(cache->recipes, recipe) : NULL;
-   struct kk_recipe_entry *entry =
-      he ? he->data : kk_recipe_insert_locked(cache, recipe);
-   bool schedule = entry && !entry->complete && !entry->stub_queued;
+   bool schedule = !entry->complete && !entry->stub_queued;
    if (schedule)
       entry->stub_queued = true;
    mtx_unlock(&cache->lock);
-   if (!schedule) {
-      free(job);
+   if (!schedule)
+      return;
+   struct kk_prewarm_job *job = calloc(1, sizeof(*job));
+   if (!job) {
+      mtx_lock(&cache->lock);
+      entry->stub_queued = false;
+      mtx_unlock(&cache->lock);
       return;
    }
    job->dev = dev;
@@ -1176,13 +1221,9 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
              sizeof(kk_variant_family_id));
       kk_variant_family_valid = true;
    }
-   mtx_lock(&cache->lock);
-   struct hash_entry *he = cache->recipes ?
-      _mesa_hash_table_search(cache->recipes, recipe) : NULL;
-   struct kk_recipe_entry *entry = he ? he->data : NULL;
-   if (!entry)
-      entry = kk_recipe_insert_locked(cache, recipe);
+   struct kk_recipe_entry *entry = kk_recipe_lookup(cache, recipe, true);
    if (!entry && kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM) {
+      mtx_lock(&cache->lock);
       cache->limited = true;
       mtx_unlock(&cache->lock);
       kk_variant_trace(dev, KK_VARIANT_FAILURE, recipe, sizeof(*recipe), 0, 0);
@@ -1195,38 +1236,43 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
       return (struct kk_pso_result){ .status = VK_ERROR_UNKNOWN };
    }
    if (entry && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
-       !entry->demanded) {
-      entry->demanded = true;
+       !p_atomic_read(&entry->demanded) &&
+       !p_atomic_xchg(&entry->demanded, true))
       kk_variant_trace(dev, KK_VARIANT_FIRST_DEMAND, recipe,
                        sizeof(*recipe), 0, 0);
-   }
    struct kk_pso_result result = { .status = VK_ERROR_UNKNOWN };
-   if (entry && entry->compiling) {
-      int64_t start = os_time_get_nano();
-      struct mtl_compile_phase phase =
-         kk_pso_phase_begin(dev, "recipe_wait", recipe, sizeof(*recipe));
-      VkResult status = kk_pso_wait(&entry->ready, &cache->lock,
-                                    &entry->compiling, request);
-      mtl_compile_phase_end(phase, status == VK_SUCCESS);
-      if (status != VK_SUCCESS) {
-         result.status = status;
-         mtx_unlock(&cache->lock);
-         goto restore_trace;
+   mtl_render_pipeline_state *pso = entry ? p_atomic_read(&entry->pso) : NULL;
+   bool compile = false;
+   if (entry && !pso) {
+      mtx_lock(&cache->lock);
+      if (entry->compiling) {
+         int64_t start = os_time_get_nano();
+         struct mtl_compile_phase phase =
+            kk_pso_phase_begin(dev, "recipe_wait", recipe, sizeof(*recipe));
+         VkResult status = kk_pso_wait(&entry->ready, &cache->lock,
+                                       &entry->compiling, request);
+         mtl_compile_phase_end(phase, status == VK_SUCCESS);
+         if (status != VK_SUCCESS) {
+            result.status = status;
+            mtx_unlock(&cache->lock);
+            goto restore_trace;
+         }
+         kk_log_compile(dev, "variant_wait", start);
+         kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, recipe, sizeof(*recipe),
+                          start, os_time_get_nano());
       }
-      kk_log_compile(dev, "variant_wait", start);
-      kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, recipe, sizeof(*recipe),
-                       start, os_time_get_nano());
+      compile = !entry->complete && !entry->compiling;
+      if (compile) {
+         if (entry->queued && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW)
+            kk_log_cache_pso(dev, "recipe_takeover", recipe, sizeof(*recipe));
+         entry->queued = false;
+         entry->compiling = true;
+         if (kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM)
+            p_atomic_set(&entry->prewarmed, true);
+      }
+      pso = compile ? NULL : entry->pso;
+      mtx_unlock(&cache->lock);
    }
-   bool compile = entry && !entry->complete && !entry->compiling;
-   if (compile) {
-      if (entry->queued && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW)
-         kk_log_cache_pso(dev, "recipe_takeover", recipe, sizeof(*recipe));
-      entry->queued = false;
-      entry->compiling = true;
-      entry->prewarmed |= kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM;
-   }
-   mtl_render_pipeline_state *pso = entry && !compile ? entry->pso : NULL;
-   mtx_unlock(&cache->lock);
    bool handed_off = false;
    if (!entry || compile) {
       struct kk_pso_key native_key;
@@ -1261,9 +1307,9 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
          result.status = status == VK_SUCCESS ? VK_ERROR_UNKNOWN : status;
       } else if (entry) {
          mtx_lock(&cache->lock);
-         entry->pso = pso;
          if (pso)
             entry->native_key = native_key;
+         p_atomic_set(&entry->pso, pso);
          entry->compiling = false;
          entry->complete = result.status != VK_TIMEOUT;
          cnd_broadcast(&entry->ready);
@@ -1279,21 +1325,20 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
    result.pso = pso;
    if (pso)
       result.status = VK_SUCCESS;
-   if (pso && entry && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW) {
-      mtx_lock(&cache->lock);
-      bool first = !entry->drawn;
-      entry->drawn = true;
-      struct hash_entry *native =
-         _mesa_hash_table_search(cache->table, &entry->native_key);
-      if (native)
-         ((struct kk_pso_entry *)native->data)->drawn = true;
-      mtx_unlock(&cache->lock);
-      if (first) {
-         if (entry->prewarmed)
-            kk_log_cache_pso(dev, "prewarm_match", &entry->native_key,
-                             sizeof(entry->native_key));
-         kk_variant_history_record(cache->history, recipe->family, recipe);
-      }
+   if (pso && entry && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
+       !p_atomic_read(&entry->drawn) && !p_atomic_xchg(&entry->drawn, true)) {
+      uint32_t hash = kk_pso_key_hash(&entry->native_key);
+      u_rwlock_rdlock(&cache->index_lock);
+      struct hash_entry *native = _mesa_hash_table_search_pre_hashed(
+         cache->table, hash, &entry->native_key);
+      struct kk_pso_entry *native_entry = native ? native->data : NULL;
+      u_rwlock_rdunlock(&cache->index_lock);
+      if (native_entry)
+         p_atomic_set(&native_entry->drawn, true);
+      if (p_atomic_read(&entry->prewarmed))
+         kk_log_cache_pso(dev, "prewarm_match", &entry->native_key,
+                          sizeof(entry->native_key));
+      kk_variant_history_record(cache->history, recipe->family, recipe);
    }
 restore_trace:
    if (trace_enabled) {
@@ -1697,64 +1742,86 @@ kk_schedule_recipe(struct kk_device *dev,
        vs->info.shader_object || !fs || !fs->info.partial ||
        fs->info.shader_object)
       return;
-   struct kk_prewarm_job *job = calloc(1, sizeof(*job));
-   if (!job) {
-      mtx_lock(&cache->lock);
-      cache->limited = true;
-      mtx_unlock(&cache->lock);
-      return;
-   }
-   job->dev = dev;
-   job->exact = exact;
-   if (dynamic)
-      memcpy(job->dynamic, dynamic, sizeof(job->dynamic));
-   kk_fill_recipe(ls, vs, fs, false, &job->raw);
-   memcpy(&job->recipe, &job->raw, sizeof(job->recipe));
-   kk_normalize_recipe(&job->recipe);
+   struct kk_variant_recipe raw, recipe;
+   kk_fill_recipe(ls, vs, fs, false, &raw);
+   memcpy(&recipe, &raw, sizeof(recipe));
+   kk_normalize_recipe(&recipe);
    if (exact)
-      kk_schedule_stub(dev, vs, &job->recipe);
-   struct mesa_blake3 hash;
+      kk_schedule_stub(dev, vs, &recipe);
+   BITSET_DECLARE(dynamic_set, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX) = {0};
+   if (dynamic)
+      memcpy(dynamic_set, dynamic, sizeof(dynamic_set));
    blake3_hash load_key;
-   _mesa_blake3_init(&hash);
-   _mesa_blake3_update(&hash, &job->recipe, sizeof(job->recipe));
-   _mesa_blake3_update(&hash, job->dynamic, sizeof(job->dynamic));
-   _mesa_blake3_final(&hash, load_key);
-   mtx_lock(&cache->lock);
+   if (!exact) {
+      struct mesa_blake3 hash;
+      _mesa_blake3_init(&hash);
+      _mesa_blake3_update(&hash, &recipe, sizeof(recipe));
+      _mesa_blake3_update(&hash, dynamic_set, sizeof(dynamic_set));
+      _mesa_blake3_final(&hash, load_key);
+   }
+   uint32_t recipe_hash = kk_recipe_hash(&recipe);
+   uint32_t family_hash = exact ? 0 : kk_family_hash(load_key);
+   u_rwlock_rdlock(&cache->index_lock);
    struct hash_entry *he = cache->recipes ?
-      _mesa_hash_table_search(cache->recipes, &job->recipe) : NULL;
-   bool needs_history = !exact && cache->history && cache->families &&
-      !_mesa_hash_table_search(cache->families, load_key);
+      _mesa_hash_table_search_pre_hashed(cache->recipes, recipe_hash,
+                                         &recipe) : NULL;
    struct kk_recipe_entry *known = he ? he->data : NULL;
+   bool needs_history = !exact && cache->history && cache->families &&
+      !_mesa_hash_table_search_pre_hashed(cache->families, family_hash,
+                                          load_key);
+   u_rwlock_rdunlock(&cache->index_lock);
+   if (known && !needs_history) {
+      if (p_atomic_read(&known->pso))
+         return;
+      mtx_lock(&cache->lock);
+      bool idle = !known->queued && !known->compiling && !known->complete;
+      mtx_unlock(&cache->lock);
+      if (!idle)
+         return;
+   }
+
+   u_rwlock_wrlock(&cache->index_lock);
+   mtx_lock(&cache->lock);
+   he = cache->recipes ?
+      _mesa_hash_table_search_pre_hashed(cache->recipes, recipe_hash,
+                                         &recipe) : NULL;
+   needs_history = !exact && cache->history && cache->families &&
+      !_mesa_hash_table_search_pre_hashed(cache->families, family_hash,
+                                          load_key);
+   known = he ? he->data : NULL;
    bool idle = known && !known->queued && !known->compiling && !known->complete;
    if (he && !needs_history && !idle) {
       mtx_unlock(&cache->lock);
-      free(job);
+      u_rwlock_wrunlock(&cache->index_lock);
       return;
    }
    if (cache->pending_jobs >= 64 || (exact && cache->exact_jobs >= 16) ||
        (needs_history && cache->family_count >= cache->recipe_limit)) {
       cache->limited = true;
       mtx_unlock(&cache->lock);
-      free(job);
+      u_rwlock_wrunlock(&cache->index_lock);
       return;
    }
-   struct kk_recipe_entry *entry =
-      he ? he->data : kk_recipe_insert_locked(cache, &job->recipe);
+   struct kk_prewarm_job *job = calloc(1, sizeof(*job));
+   struct kk_recipe_entry *entry = !job ? NULL :
+      he ? he->data : kk_recipe_insert_locked(cache, recipe_hash, &recipe);
    if (!entry) {
       cache->limited = true;
       mtx_unlock(&cache->lock);
+      u_rwlock_wrunlock(&cache->index_lock);
       free(job);
       return;
    }
    if (!he || idle) {
       entry->queued = true;
-      entry->prewarmed = true;
+      p_atomic_set(&entry->prewarmed, true);
    }
    if (needs_history) {
       uint8_t *family = ralloc_size(cache->families, sizeof(blake3_hash));
       if (family) {
          memcpy(family, load_key, sizeof(blake3_hash));
-         if (_mesa_hash_table_insert(cache->families, family, family)) {
+         if (_mesa_hash_table_insert_pre_hashed(cache->families, family_hash,
+                                                family, family)) {
             job->load_history = true;
             cache->family_count++;
          } else {
@@ -1768,6 +1835,12 @@ kk_schedule_recipe(struct kk_device *dev,
    cache->pending_jobs++;
    cache->exact_jobs += exact;
    mtx_unlock(&cache->lock);
+   u_rwlock_wrunlock(&cache->index_lock);
+   job->dev = dev;
+   job->exact = exact;
+   memcpy(job->dynamic, dynamic_set, sizeof(job->dynamic));
+   job->raw = raw;
+   job->recipe = recipe;
    job->shaders[MESA_SHADER_VERTEX] = vs;
    job->shaders[MESA_SHADER_FRAGMENT] = fs;
    for (unsigned i = 0; i < MESA_SHADER_COMPUTE; ++i)

@@ -252,10 +252,13 @@ test_recipe(bool fail)
    struct demand d = { .dev = &dev, .vs = &vs, .fs = &fs,
                        .origin = KK_COMPILE_ORIGIN_DRAW };
    kk_pso_key_init(&d.recipe.pso);
-   mtx_lock(&dev.pso_cache.lock);
+   u_rwlock_wrlock(&dev.pso_cache.index_lock);
    struct kk_recipe_entry *entry =
-      kk_recipe_insert_locked(&dev.pso_cache, &d.recipe);
+      kk_recipe_insert_locked(&dev.pso_cache, kk_recipe_hash(&d.recipe),
+                              &d.recipe);
+   u_rwlock_wrunlock(&dev.pso_cache.index_lock);
    CHECK(entry);
+   mtx_lock(&dev.pso_cache.lock);
    entry->queued = true;
    mtx_unlock(&dev.pso_cache.lock);
    producer.entered = producer.release = false;
@@ -287,9 +290,10 @@ test_recipe(bool fail)
    request = kk_pso_request_create(20);
    timed = kk_recipe_get(&dev, &vs, &fs, &other, &request);
    CHECK(timed.status == VK_TIMEOUT && !timed.pso);
-   mtx_lock(&dev.pso_cache.lock);
    struct kk_recipe_entry *retry =
-      _mesa_hash_table_search(dev.pso_cache.recipes, &other)->data;
+      kk_recipe_lookup(&dev.pso_cache, &other, false);
+   CHECK(retry);
+   mtx_lock(&dev.pso_cache.lock);
    CHECK(!retry->compiling && !retry->queued && !retry->complete &&
          !retry->drawn);
    mtx_unlock(&dev.pso_cache.lock);
@@ -646,11 +650,12 @@ test_stub_allocation_retry(void)
    release_producer();
    struct kk_variant_recipe recipe;
    fixture_recipe(&f, &recipe);
-   mtx_lock(&f.dev.pso_cache.lock);
+   u_rwlock_wrlock(&f.dev.pso_cache.index_lock);
    struct kk_recipe_entry *entry =
-      kk_recipe_insert_locked(&f.dev.pso_cache, &recipe);
+      kk_recipe_insert_locked(&f.dev.pso_cache, kk_recipe_hash(&recipe),
+                              &recipe);
+   u_rwlock_wrunlock(&f.dev.pso_cache.index_lock);
    CHECK(entry);
-   mtx_unlock(&f.dev.pso_cache.lock);
 
    p_atomic_set(&fail_next_allocation, 1);
    kk_schedule_stub(&f.dev, &f.vs, &recipe);
@@ -940,6 +945,74 @@ test_normalized_recipes(void)
    CHECK(memcmp(&ra, &rb, sizeof(ra)));
 }
 
+struct concurrent_hits {
+   struct kk_device *dev;
+   struct kk_pso_key key;
+   mtl_render_pipeline_state *pso;
+   unsigned inserts;
+};
+
+static int
+run_hits(void *data)
+{
+   struct concurrent_hits *c = data;
+   kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
+   for (unsigned i = 0; i < 20000; ++i) {
+      struct kk_pso_result result =
+         kk_pso_cache_get(c->dev, &c->key, NULL, NULL, NULL);
+      CHECK(result.status == VK_SUCCESS && result.pso == c->pso);
+   }
+   return 0;
+}
+
+static int
+run_inserts(void *data)
+{
+   struct concurrent_hits *c = data;
+   kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
+   for (unsigned i = 0; i < c->inserts; ++i) {
+      struct kk_pso_key key;
+      kk_pso_key_init(&key);
+      key.rast[0] = 1;
+      key.rast[1] = i & 0xff;
+      key.rast[2] = i >> 8;
+      CHECK(kk_pso_cache_get(c->dev, &key, NULL, NULL, NULL).pso);
+   }
+   return 0;
+}
+
+static void
+test_concurrent_hits(void)
+{
+   struct kk_device dev = {0};
+   struct kk_physical_device pdev = {0};
+   dev.vk.physical = &pdev.vk;
+   dev.vk.disable_internal_cache = true;
+   CHECK(kk_pso_cache_init(&dev.pso_cache));
+   reset_producer(0);
+   release_producer();
+   struct concurrent_hits c = { .dev = &dev, .inserts = 300 };
+   kk_pso_key_init(&c.key);
+   kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
+   c.pso = kk_pso_cache_get(&dev, &c.key, NULL, NULL, NULL).pso;
+   CHECK(c.pso);
+
+   thrd_t readers[4], writer;
+   for (unsigned i = 0; i < ARRAY_SIZE(readers); ++i)
+      CHECK(thrd_create(&readers[i], run_hits, &c) == thrd_success);
+   CHECK(thrd_create(&writer, run_inserts, &c) == thrd_success);
+   for (unsigned i = 0; i < ARRAY_SIZE(readers); ++i)
+      CHECK(thrd_join(readers[i], NULL) == thrd_success);
+   CHECK(thrd_join(writer, NULL) == thrd_success);
+
+   CHECK(producer_calls() == c.inserts + 1);
+   CHECK(_mesa_hash_table_num_entries(dev.pso_cache.table) == c.inserts + 1);
+   struct hash_entry *he = _mesa_hash_table_search(dev.pso_cache.table, &c.key);
+   struct kk_pso_entry *entry = he->data;
+   CHECK(entry->drawn && entry->prewarmed);
+   kk_pso_cache_finish(&dev.pso_cache);
+}
+
 int
 main(void)
 {
@@ -951,6 +1024,7 @@ main(void)
    test_recipe(true);
    test_queued_job();
    test_lookup_only_miss();
+   test_concurrent_hits();
    test_normalized_recipes();
    test_strict_policy(false);
    test_strict_policy(true);
