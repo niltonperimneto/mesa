@@ -62,7 +62,6 @@ struct kk_recipe_entry {
    bool queued;
    bool complete;
    bool prewarmed;
-   bool stub_queued;
 };
 
 struct mtl_compile_phase
@@ -181,10 +180,9 @@ kk_pso_key_init(struct kk_pso_key *key)
    }
 }
 
-mtl_render_pipeline_state *
-kk_new_render_pipeline(struct kk_device *dev, mtl_function_descriptor *vs,
-                       mtl_function_descriptor *fs,
-                       const struct kk_pso_key *key, bool lookup_only)
+static mtl_render_pipeline_descriptor *
+kk_pso_descriptor(mtl_function_descriptor *vs, mtl_function_descriptor *fs,
+                  const struct kk_pso_key *key)
 {
    mtl_render_pipeline_descriptor *desc = mtl_new_render_pipeline_descriptor();
    mtl_render_pipeline_descriptor_set_vertex_shader(desc, vs);
@@ -197,6 +195,12 @@ kk_new_render_pipeline(struct kk_device *dev, mtl_function_descriptor *vs,
    for (uint8_t i = 0u; i < MAX_DRAW_BUFFERS; ++i) {
       if (key->rt_formats[i] == MTL_PIXEL_FORMAT_INVALID)
          continue;
+
+      if (key->rt_formats[i] == MTL_PIXEL_FORMAT_UNSPECIALIZED) {
+         mtl_render_pipeline_descriptor_set_color_attachment_unspecialized(
+            desc, i);
+         continue;
+      }
 
       const struct kk_pso_blend *blend = &key->blend[i];
       mtl_render_pipeline_descriptor_set_color_attachment_format(
@@ -217,6 +221,72 @@ kk_new_render_pipeline(struct kk_device *dev, mtl_function_descriptor *vs,
 
    mtl_render_pipeline_descriptor_set_multisample_alpha(
       desc, key->alpha_to_coverage, key->alpha_to_one);
+
+   return desc;
+}
+
+static bool
+kk_pso_key_specializable(const struct kk_pso_key *key)
+{
+   for (unsigned i = 0; i < MAX_DRAW_BUFFERS; ++i)
+      if (key->rt_formats[i] != MTL_PIXEL_FORMAT_INVALID &&
+          key->rt_formats[i] != MTL_PIXEL_FORMAT_UNSPECIALIZED)
+         return true;
+   return false;
+}
+
+static void
+kk_pso_base_key(const struct kk_pso_key *key, struct kk_pso_key *base)
+{
+   *base = *key;
+   for (unsigned i = 0; i < MAX_DRAW_BUFFERS; ++i) {
+      base->rt_formats[i] = MTL_PIXEL_FORMAT_UNSPECIALIZED;
+      memset(&base->blend[i], 0, sizeof(base->blend[i]));
+   }
+}
+
+static mtl_render_pipeline_state *
+kk_specialize_render_pipeline(struct kk_device *dev,
+                              mtl_function_descriptor *vs,
+                              mtl_function_descriptor *fs,
+                              const struct kk_pso_key *key,
+                              mtl_render_pipeline_state *base)
+{
+   mtl_render_pipeline_descriptor *desc = kk_pso_descriptor(vs, fs, key);
+   int64_t start = os_time_get_nano();
+   struct mtl_compile_phase phase =
+      kk_pso_phase_begin(dev, "native_specialize", key, sizeof(*key));
+   blake3_hash digest;
+   _mesa_blake3_compute(key, sizeof(*key), digest);
+   struct kk_metal_trace previous_trace =
+      kk_metal_cache_set_trace((struct kk_metal_trace){
+         .callback = dev->variant_trace_enabled
+                        ? kk_variant_metal_event : NULL,
+         .data = dev,
+   });
+   mtl_render_pipeline_state *pso = dev->metal_cache ?
+      kk_metal_cache_specialize_render_pipeline(dev->metal_cache, digest,
+                                                 desc, base) :
+      mtl_specialize_render_pipeline(dev->mtl_compiler_handle, desc, base);
+   kk_metal_cache_set_trace(previous_trace);
+   mtl_compile_phase_end(phase, pso != NULL);
+   mtl_release(desc);
+   if (pso) {
+      kk_variant_trace(dev, KK_VARIANT_PSO_CREATE, key, sizeof(*key),
+                       start, os_time_get_nano());
+      kk_log_compile(dev, "pso_specialize", start);
+   }
+   kk_log_cache_pso(dev, pso ? "specialized" : "specialize_failed",
+                    key, sizeof(*key));
+   return pso;
+}
+
+mtl_render_pipeline_state *
+kk_new_render_pipeline(struct kk_device *dev, mtl_function_descriptor *vs,
+                       mtl_function_descriptor *fs,
+                       const struct kk_pso_key *key, bool lookup_only)
+{
+   mtl_render_pipeline_descriptor *desc = kk_pso_descriptor(vs, fs, key);
 
    blake3_hash digest;
    _mesa_blake3_compute(key, sizeof(*key), digest);
@@ -273,16 +343,12 @@ kk_pso_cache_init(struct kk_pso_cache *cache)
       mtx_destroy(&cache->lock);
       return false;
    }
-   cache->wait_timeout_ms =
-      CLAMP(debug_get_num_option("MESA_KK_PSO_WAIT_TIMEOUT_MS", 0), 0, INT_MAX);
-   const char *policy =
-      debug_get_option("MESA_KK_WAIT_TIMEOUT_POLICY", "stub");
-   if (!strcasecmp(policy, "block"))
-      cache->timeout_policy = KK_WAIT_TIMEOUT_BLOCK;
-   else if (!strcasecmp(policy, "strict"))
-      cache->timeout_policy = KK_WAIT_TIMEOUT_STRICT;
-   else
-      cache->timeout_policy = KK_WAIT_TIMEOUT_STUB;
+   if (cnd_init(&cache->draw_idle) != thrd_success) {
+      cnd_destroy(&cache->jobs_done);
+      u_rwlock_destroy(&cache->index_lock);
+      mtx_destroy(&cache->lock);
+      return false;
+   }
    cache->recipe_limit =
       CLAMP(debug_get_num_option("MESA_KK_VARIANT_RECIPE_LIMIT", 4096),
             1, 8192);
@@ -299,6 +365,7 @@ kk_pso_cache_init(struct kk_pso_cache *cache)
       cache->table = NULL;
       cache->recipes = NULL;
       cache->families = NULL;
+      cnd_destroy(&cache->draw_idle);
       cnd_destroy(&cache->jobs_done);
       u_rwlock_destroy(&cache->index_lock);
       mtx_destroy(&cache->lock);
@@ -316,27 +383,13 @@ kk_pso_cache_init(struct kk_pso_cache *cache)
                                     UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL);
    bool exact = util_queue_init(&cache->exact_queue, "kk-exact", 32, 1,
                                UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL);
-   bool draw = util_queue_init(&cache->draw_queue, "kk-draw", 32, 2,
-                              UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL);
-   bool stub = util_queue_init(&cache->stub_queue, "kk-stub", 32, 1,
-                              UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL);
-   cache->limited |= !background || !exact || !draw || !stub;
-   if (!stub && cache->timeout_policy == KK_WAIT_TIMEOUT_STUB)
-      cache->timeout_policy = KK_WAIT_TIMEOUT_STRICT;
+   cache->limited |= !background || !exact;
    return true;
 }
 
 void
 kk_pso_cache_finish(struct kk_pso_cache *cache)
 {
-   if (util_queue_is_initialized(&cache->stub_queue)) {
-      util_queue_finish(&cache->stub_queue);
-      util_queue_destroy(&cache->stub_queue);
-   }
-   if (util_queue_is_initialized(&cache->draw_queue)) {
-      util_queue_finish(&cache->draw_queue);
-      util_queue_destroy(&cache->draw_queue);
-   }
    if (util_queue_is_initialized(&cache->exact_queue)) {
       util_queue_finish(&cache->exact_queue);
       util_queue_destroy(&cache->exact_queue);
@@ -374,6 +427,7 @@ kk_pso_cache_finish(struct kk_pso_cache *cache)
    u_rwlock_destroy(&cache->index_lock);
    mtx_destroy(&cache->lock);
    cnd_destroy(&cache->jobs_done);
+   cnd_destroy(&cache->draw_idle);
 }
 
 VkResult
@@ -401,8 +455,7 @@ kk_pso_prewarm_ready(struct kk_device *dev)
 
 static struct kk_pso_result
 kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
-                 const struct kk_pso_key *key,
-                 const struct kk_pso_request *request)
+                 const struct kk_pso_key *key)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    if (kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM &&
@@ -410,7 +463,6 @@ kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
       p_atomic_set(&entry->prewarmed, true);
    mtl_render_pipeline_state *pso = p_atomic_read(&entry->pso);
    if (!pso) {
-      VkResult status = VK_SUCCESS;
       int64_t start = 0;
       mtx_lock(&cache->lock);
       bool waited = entry->compiling;
@@ -419,14 +471,12 @@ kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
          start = os_time_get_nano();
          struct mtl_compile_phase phase =
             kk_pso_phase_begin(dev, "pso_wait", key, sizeof(*key));
-         status = kk_pso_wait(&entry->ready, &cache->lock,
-                              &entry->compiling, request);
-         mtl_compile_phase_end(phase, status == VK_SUCCESS);
+         while (entry->compiling)
+            cnd_wait(&entry->ready, &cache->lock);
+         mtl_compile_phase_end(phase, true);
       }
       pso = entry->pso;
       mtx_unlock(&cache->lock);
-      if (status != VK_SUCCESS)
-         return (struct kk_pso_result){ .status = status };
       if (waited) {
          kk_log_compile(dev, "pso_wait", start);
          kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, key, sizeof(*key),
@@ -472,6 +522,30 @@ kk_pso_entry_insert_locked(struct kk_pso_cache *cache, uint32_t hash,
    return entry;
 }
 
+static mtl_render_pipeline_state *
+kk_pso_build(struct kk_device *dev, const struct kk_pso_key *key,
+             mtl_function_descriptor *vs, mtl_function_descriptor *fs,
+             bool lookup_only)
+{
+   if (!kk_pso_key_specializable(key))
+      return kk_new_render_pipeline(dev, vs, fs, key, lookup_only);
+
+   struct kk_pso_key base_key;
+   kk_pso_base_key(key, &base_key);
+   const struct kk_pso_request lookup = { .lookup_only = true };
+   struct kk_pso_result base =
+      kk_pso_cache_get(dev, &base_key, vs, fs, lookup_only ? &lookup : NULL);
+   if (base.pso) {
+      mtl_render_pipeline_state *pso =
+         kk_specialize_render_pipeline(dev, vs, fs, key, base.pso);
+      if (pso)
+         return pso;
+   }
+   if (lookup_only)
+      return NULL;
+   return kk_new_render_pipeline(dev, vs, fs, key, false);
+}
+
 struct kk_pso_result
 kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
                  mtl_function_descriptor *vs, mtl_function_descriptor *fs,
@@ -486,11 +560,10 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
    struct kk_pso_entry *found = he ? he->data : NULL;
    u_rwlock_rdunlock(&cache->index_lock);
    if (found)
-      return kk_pso_entry_get(dev, found, key, request);
+      return kk_pso_entry_get(dev, found, key);
 
    if (request && request->lookup_only) {
-      mtl_render_pipeline_state *pso =
-         kk_new_render_pipeline(dev, vs, fs, key, true);
+      mtl_render_pipeline_state *pso = kk_pso_build(dev, key, vs, fs, true);
       if (!pso)
          return (struct kk_pso_result){ .status = VK_NOT_READY };
       u_rwlock_wrlock(&cache->index_lock);
@@ -501,7 +574,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
       u_rwlock_wrunlock(&cache->index_lock);
       if (found) {
          mtl_release(pso);
-         return kk_pso_entry_get(dev, found, key, request);
+         return kk_pso_entry_get(dev, found, key);
       }
       if (!entry) {
          mtl_release(pso);
@@ -518,7 +591,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
       found ? NULL : kk_pso_entry_insert_locked(cache, hash, key, NULL);
    u_rwlock_wrunlock(&cache->index_lock);
    if (found)
-      return kk_pso_entry_get(dev, found, key, request);
+      return kk_pso_entry_get(dev, found, key);
    if (entry == NULL)
       return (struct kk_pso_result){ .status = VK_ERROR_OUT_OF_HOST_MEMORY };
 
@@ -527,8 +600,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
                      key, sizeof(*key));
    if (KK_DEBUG(PSO))
       mesa_logi("PSO compile");
-   mtl_render_pipeline_state *pso =
-      kk_new_render_pipeline(dev, vs, fs, key, false);
+   mtl_render_pipeline_state *pso = kk_pso_build(dev, key, vs, fs, false);
    mtx_lock(&cache->lock);
    p_atomic_set(&entry->pso, pso);
    entry->compiling = false;
@@ -537,6 +609,17 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
    kk_variant_trace(dev, pso ? KK_VARIANT_COMPLETE : KK_VARIANT_FAILURE,
                     key, sizeof(*key), 0, 0);
    return (struct kk_pso_result){ pso, pso ? VK_SUCCESS : VK_ERROR_UNKNOWN };
+}
+
+mtl_render_pipeline_state *
+kk_pso_cache_acquire(struct kk_device *dev, const struct kk_pso_key *key,
+                     mtl_function_descriptor *vs, mtl_function_descriptor *fs,
+                     bool lookup_only)
+{
+   const struct kk_pso_request lookup = { .lookup_only = true };
+   struct kk_pso_result result =
+      kk_pso_cache_get(dev, key, vs, fs, lookup_only ? &lookup : NULL);
+   return result.pso ? mtl_retain(result.pso) : NULL;
 }
 
 static nir_alu_type
@@ -845,6 +928,33 @@ kk_make_recipe(const struct kk_link_state *ls, struct kk_shader *vs,
    kk_normalize_recipe(recipe);
 }
 
+static VkFormat
+kk_fs_key_format_class(VkFormat format)
+{
+   if (format == VK_FORMAT_UNDEFINED)
+      return format;
+   enum pipe_format pipe = vk_format_to_pipe_format(format);
+   if (util_format_is_pure_sint(pipe))
+      return VK_FORMAT_R32G32B32A32_SINT;
+   if (util_format_is_pure_uint(pipe))
+      return VK_FORMAT_R32G32B32A32_UINT;
+   if (util_format_is_float(pipe) || util_format_is_unorm(pipe))
+      return VK_FORMAT_R32G32B32A32_SFLOAT;
+   return format;
+}
+
+static void
+kk_normalize_fs_link_key(const struct kk_shader *fs,
+                         struct kk_fs_link_key *key)
+{
+   if (key->shader_blend)
+      return;
+   for (unsigned rt = 0; rt < MAX_DRAW_BUFFERS; ++rt) {
+      key->rt_formats[rt] = fs->info.fs.color_outputs & BITFIELD_BIT(rt) ?
+         kk_fs_key_format_class(key->rt_formats[rt]) : VK_FORMAT_UNDEFINED;
+   }
+}
+
 static struct kk_pso_result
 kk_prepare_recipe(struct kk_device *dev, struct kk_shader *vs,
                    struct kk_shader *fs, const struct kk_variant_recipe *recipe,
@@ -853,7 +963,9 @@ kk_prepare_recipe(struct kk_device *dev, struct kk_shader *vs,
 {
    const struct kk_fs_variant *variant = &fs->fast;
    if (kk_fs_link_key_needed(fs, &recipe->fs)) {
-      VkResult status = kk_shader_get_fs_variant(dev, fs, &recipe->fs,
+      struct kk_fs_link_key fs_key = recipe->fs;
+      kk_normalize_fs_link_key(fs, &fs_key);
+      VkResult status = kk_shader_get_fs_variant(dev, fs, &fs_key,
                                                  &variant, request);
       if (status != VK_SUCCESS)
          return (struct kk_pso_result){ .status = status };
@@ -874,10 +986,7 @@ kk_prepare_recipe(struct kk_device *dev, struct kk_shader *vs,
 
 enum kk_job_type {
    KK_JOB_PREWARM,
-   KK_JOB_RECIPE,
-   KK_JOB_STUB,
    KK_JOB_RENDER,
-   KK_JOB_RENDER_STUB,
 };
 
 struct kk_prewarm_job {
@@ -885,8 +994,6 @@ struct kk_prewarm_job {
    enum kk_job_type type;
    struct kk_shader *shaders[MESA_SHADER_COMPUTE];
    struct kk_shader *vs;
-   struct kk_shader *fs;
-   struct kk_recipe_entry *entry;
    struct kk_variant_recipe recipe;
    struct kk_variant_recipe raw;
    struct util_queue_fence fence;
@@ -899,14 +1006,6 @@ static void kk_prewarm_execute(void *data, void *global_data,
                                int thread_index);
 static void kk_prewarm_cleanup(void *data, void *global_data,
                                int thread_index);
-
-static bool
-kk_job_shaders_allowed(struct kk_device *dev, struct kk_shader *vs,
-                       struct kk_shader *fs)
-{
-   return util_queue_is_initialized(&dev->pso_cache.draw_queue) &&
-          !vs->info.shader_object && (!fs || !fs->info.shader_object);
-}
 
 static void
 kk_job_set_shader(struct kk_prewarm_job *job, struct kk_shader *shader)
@@ -929,150 +1028,14 @@ kk_enqueue_job(struct kk_device *dev, struct util_queue *queue,
                       kk_prewarm_cleanup, sizeof(*job));
 }
 
-static bool
-kk_schedule_recipe_compile(struct kk_device *dev, struct kk_shader *vs,
-                           struct kk_shader *fs, struct kk_recipe_entry *entry)
-{
-   struct kk_prewarm_job *job = calloc(1, sizeof(*job));
-   if (!job)
-      return false;
-   job->dev = dev;
-   job->type = KK_JOB_RECIPE;
-   job->vs = vs;
-   job->fs = fs;
-   job->entry = entry;
-   kk_job_set_shader(job, vs);
-   kk_job_set_shader(job, fs);
-   kk_log_cache_pso(dev, "recipe_handoff", &entry->recipe,
-                    sizeof(entry->recipe));
-   kk_enqueue_job(dev, &dev->pso_cache.draw_queue, job);
-   return true;
-}
-
-static void
-kk_recipe_job_execute(struct kk_prewarm_job *job)
-{
-   struct kk_device *dev = job->dev;
-   struct kk_pso_cache *cache = &dev->pso_cache;
-   struct kk_recipe_entry *entry = job->entry;
-   struct kk_pso_key native_key;
-   struct mtl_compile_phase phase = kk_pso_phase_begin(
-      dev, "recipe_prepare", &entry->recipe, sizeof(entry->recipe));
-   struct kk_pso_result result = kk_prepare_recipe(
-      dev, job->vs, job->fs, &entry->recipe, &native_key, NULL);
-   mtl_compile_phase_end(phase, result.status == VK_SUCCESS);
-   mtx_lock(&cache->lock);
-   if (result.pso)
-      entry->native_key = native_key;
-   p_atomic_set(&entry->pso, result.pso);
-   entry->compiling = false;
-   entry->complete = true;
-   cnd_broadcast(&entry->ready);
-   mtx_unlock(&cache->lock);
-   kk_variant_trace(dev, result.pso ? KK_VARIANT_COMPLETE : KK_VARIANT_FAILURE,
-                    &entry->recipe, sizeof(entry->recipe), 0, 0);
-}
-
-static bool
-kk_stub_enabled(struct kk_device *dev)
-{
-   struct kk_pso_cache *cache = &dev->pso_cache;
-   return cache->wait_timeout_ms &&
-          cache->timeout_policy == KK_WAIT_TIMEOUT_STUB &&
-          util_queue_is_initialized(&cache->stub_queue);
-}
-
-static void
-kk_stub_key(const struct kk_pso_key *source, const blake3_hash rast,
-            const blake3_hash fs, struct kk_pso_key *key)
-{
-   kk_pso_key_init(key);
-   memcpy(key->rast, rast, sizeof(key->rast));
-   memcpy(key->fs, fs, sizeof(key->fs));
-   memcpy(key->rt_formats, source->rt_formats, sizeof(key->rt_formats));
-   for (unsigned i = 0; i < MAX_DRAW_BUFFERS; ++i)
-      key->blend[i].write_mask = 0;
-   key->sample_count = source->sample_count;
-   key->topology_class = source->topology_class;
-   key->amplification = source->amplification;
-}
-
-static mtl_render_pipeline_state *
-kk_stub_get(struct kk_device *dev, const struct kk_pso_key *source,
-            const blake3_hash rast_hash, mtl_function_descriptor *rast_fn,
-            bool compile)
-{
-   const struct kk_fs_variant *discard = kk_device_get_discard_fs(dev, compile);
-   if (!discard)
-      return NULL;
-   struct kk_pso_key key;
-   kk_stub_key(source, rast_hash, discard->hash, &key);
-   if (compile)
-      return kk_pso_cache_get(dev, &key, rast_fn, discard->fn, NULL).pso;
-
-   struct kk_pso_cache *cache = &dev->pso_cache;
-   uint32_t hash = kk_pso_key_hash(&key);
-   u_rwlock_rdlock(&cache->index_lock);
-   struct hash_entry *he =
-      _mesa_hash_table_search_pre_hashed(cache->table, hash, &key);
-   struct kk_pso_entry *entry = he ? he->data : NULL;
-   u_rwlock_rdunlock(&cache->index_lock);
-   mtl_render_pipeline_state *pso = entry ? p_atomic_read(&entry->pso) : NULL;
-   kk_log_cache_pso(dev, pso ? "stub_hit" : "stub_miss", &key, sizeof(key));
-   return pso;
-}
-
-static void
-kk_schedule_stub(struct kk_device *dev, struct kk_shader *vs,
-                 const struct kk_variant_recipe *recipe)
-{
-   struct kk_pso_cache *cache = &dev->pso_cache;
-   if (!kk_stub_enabled(dev) || !kk_job_shaders_allowed(dev, vs, NULL))
-      return;
-   struct kk_recipe_entry *entry = kk_recipe_lookup(cache, recipe, true);
-   if (!entry || p_atomic_read(&entry->pso))
-      return;
-   mtx_lock(&cache->lock);
-   bool schedule = !entry->complete && !entry->stub_queued;
-   if (schedule)
-      entry->stub_queued = true;
-   mtx_unlock(&cache->lock);
-   if (!schedule)
-      return;
-   struct kk_prewarm_job *job = calloc(1, sizeof(*job));
-   if (!job) {
-      mtx_lock(&cache->lock);
-      entry->stub_queued = false;
-      mtx_unlock(&cache->lock);
-      return;
-   }
-   job->dev = dev;
-   job->type = KK_JOB_STUB;
-   job->vs = vs;
-   memcpy(&job->recipe, recipe, sizeof(job->recipe));
-   kk_job_set_shader(job, vs);
-   kk_enqueue_job(dev, &cache->stub_queue, job);
-}
-
-static void
-kk_stub_job_execute(struct kk_prewarm_job *job)
-{
-   bool points = job->recipe.pso.topology_class ==
-                 MTL_PRIMITIVE_TOPOLOGY_CLASS_POINT;
-   const struct kk_fs_variant *rast =
-      kk_shader_get_rast(job->dev, job->vs, points);
-   if (rast)
-      kk_stub_get(job->dev, &job->recipe.pso, rast->hash, rast->fn, true);
-}
-
 static void
 kk_render_compile(struct kk_device *dev, struct kk_shader *vs)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    struct kk_render_pending *pending = vs->pending;
    mtl_render_pipeline_state *pso =
-      kk_new_render_pipeline(dev, pending->vertex_function,
-                             pending->fragment_function, &pending->key, false);
+      kk_pso_cache_acquire(dev, &pending->key, pending->vertex_function,
+                           pending->fragment_function, false);
    mtx_lock(&cache->lock);
    vs->pipeline.gfx.render = pso;
    pending->compiling = false;
@@ -1087,22 +1050,9 @@ kk_job_execute(struct kk_prewarm_job *job)
 {
    enum kk_compile_origin origin = kk_compile_origin;
    switch (job->type) {
-   case KK_JOB_RECIPE:
-      kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
-      kk_recipe_job_execute(job);
-      break;
-   case KK_JOB_STUB:
-      kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
-      kk_stub_job_execute(job);
-      break;
    case KK_JOB_RENDER:
       kk_compile_origin = KK_COMPILE_ORIGIN_CREATE;
       kk_render_compile(job->dev, job->vs);
-      break;
-   case KK_JOB_RENDER_STUB:
-      kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
-      kk_stub_get(job->dev, &job->vs->pending->key, job->vs->pending->key.rast,
-                  job->vs->pending->vertex_function, true);
       break;
    default:
       UNREACHABLE("prewarm jobs are executed by kk_prewarm_execute");
@@ -1130,15 +1080,6 @@ kk_pso_schedule_render(struct kk_device *dev, struct kk_shader *vs)
       kk_render_compile(dev, vs);
       return;
    }
-   struct kk_prewarm_job *stub =
-      kk_stub_enabled(dev) ? calloc(1, sizeof(*stub)) : NULL;
-   if (stub) {
-      stub->dev = dev;
-      stub->type = KK_JOB_RENDER_STUB;
-      stub->vs = vs;
-      kk_job_set_shader(stub, vs);
-      kk_enqueue_job(dev, &cache->stub_queue, stub);
-   }
    job->dev = dev;
    job->type = KK_JOB_RENDER;
    job->vs = vs;
@@ -1157,54 +1098,53 @@ kk_pso_render_pending(struct kk_device *dev, struct kk_shader *vs)
    return pending;
 }
 
-static struct kk_pso_request
-kk_cmd_pso_request(struct kk_cmd_buffer *cmd)
-{
-   struct kk_pso_cache *cache = &kk_cmd_buffer_device(cmd)->pso_cache;
-   unsigned timeout = cache->timeout_policy == KK_WAIT_TIMEOUT_BLOCK ?
-                         0 : cache->wait_timeout_ms;
-   struct kk_pso_request request = kk_pso_request_create(timeout);
-   if (timeout && cmd->state.gfx.pso_is_stub)
-      request.deadline_ns = os_time_get_nano();
-   request.handoff = timeout != 0;
-   return request;
-}
-
 mtl_render_pipeline_state *
-kk_cmd_acquire_render(struct kk_cmd_buffer *cmd, struct kk_shader *vs,
-                      bool *provisional)
+kk_cmd_acquire_render(struct kk_cmd_buffer *cmd, struct kk_shader *vs)
 {
    struct kk_render_pending *pending = vs->pending;
-   if (!pending) {
-      *provisional = false;
+   if (!pending)
       return vs->pipeline.gfx.render;
-   }
 
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    struct kk_pso_cache *cache = &dev->pso_cache;
-   struct kk_pso_request request = kk_cmd_pso_request(cmd);
-   *provisional = false;
    kk_pso_schedule_render(dev, vs);
    mtx_lock(&cache->lock);
-   VkResult status = kk_pso_wait(&pending->ready, &cache->lock,
-                                 &pending->compiling, &request);
-   mtl_render_pipeline_state *pso =
-      status == VK_SUCCESS ? vs->pipeline.gfx.render : NULL;
+   while (pending->compiling)
+      cnd_wait(&pending->ready, &cache->lock);
+   mtl_render_pipeline_state *pso = vs->pipeline.gfx.render;
    mtx_unlock(&cache->lock);
-   if (status != VK_TIMEOUT)
-      return pso;
-   if (cache->timeout_policy == KK_WAIT_TIMEOUT_STRICT) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
-      return NULL;
-   }
-   *provisional = true;
-   return kk_stub_get(dev, &pending->key, pending->key.rast, NULL, false);
+   return pso;
+}
+
+static void
+kk_draw_demand_begin(struct kk_pso_cache *cache)
+{
+   mtx_lock(&cache->lock);
+   cache->draw_demand++;
+   mtx_unlock(&cache->lock);
+}
+
+static void
+kk_draw_demand_end(struct kk_pso_cache *cache)
+{
+   mtx_lock(&cache->lock);
+   if (!--cache->draw_demand)
+      cnd_broadcast(&cache->draw_idle);
+   mtx_unlock(&cache->lock);
+}
+
+static void
+kk_yield_to_draws(struct kk_pso_cache *cache)
+{
+   mtx_lock(&cache->lock);
+   while (cache->draw_demand)
+      cnd_wait(&cache->draw_idle, &cache->lock);
+   mtx_unlock(&cache->lock);
 }
 
 static struct kk_pso_result
 kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
-               struct kk_shader *fs, const struct kk_variant_recipe *recipe,
-               const struct kk_pso_request *request)
+               struct kk_shader *fs, const struct kk_variant_recipe *recipe)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    bool trace_enabled = dev->variant_log != NULL;
@@ -1242,6 +1182,9 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
                        sizeof(*recipe), 0, 0);
    struct kk_pso_result result = { .status = VK_ERROR_UNKNOWN };
    mtl_render_pipeline_state *pso = entry ? p_atomic_read(&entry->pso) : NULL;
+   bool demand = !pso && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW;
+   if (demand)
+      kk_draw_demand_begin(cache);
    bool compile = false;
    if (entry && !pso) {
       mtx_lock(&cache->lock);
@@ -1249,14 +1192,9 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
          int64_t start = os_time_get_nano();
          struct mtl_compile_phase phase =
             kk_pso_phase_begin(dev, "recipe_wait", recipe, sizeof(*recipe));
-         VkResult status = kk_pso_wait(&entry->ready, &cache->lock,
-                                       &entry->compiling, request);
-         mtl_compile_phase_end(phase, status == VK_SUCCESS);
-         if (status != VK_SUCCESS) {
-            result.status = status;
-            mtx_unlock(&cache->lock);
-            goto restore_trace;
-         }
+         while (entry->compiling)
+            cnd_wait(&entry->ready, &cache->lock);
+         mtl_compile_phase_end(phase, true);
          kk_log_compile(dev, "variant_wait", start);
          kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, recipe, sizeof(*recipe),
                           start, os_time_get_nano());
@@ -1273,55 +1211,31 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
       pso = compile ? NULL : entry->pso;
       mtx_unlock(&cache->lock);
    }
-   bool handed_off = false;
    if (!entry || compile) {
       struct kk_pso_key native_key;
-      bool handoff = entry && request && request->handoff &&
-                     kk_job_shaders_allowed(dev, vs, fs);
-      struct kk_pso_request lookup;
-      const struct kk_pso_request *prepare_request = request;
-      if (handoff) {
-         lookup = *request;
-         lookup.lookup_only = true;
-         lookup.handoff = false;
-         prepare_request = &lookup;
-      }
       struct mtl_compile_phase phase =
          kk_pso_phase_begin(dev, "recipe_prepare", recipe, sizeof(*recipe));
-      result = kk_prepare_recipe(dev, vs, fs, recipe, &native_key,
-                                 prepare_request);
+      result = kk_prepare_recipe(dev, vs, fs, recipe, &native_key, NULL);
       mtl_compile_phase_end(phase, result.status == VK_SUCCESS);
-      if (handoff && result.status == VK_NOT_READY) {
-         handed_off = kk_schedule_recipe_compile(dev, vs, fs, entry);
-         if (!handed_off)
-            result = kk_prepare_recipe(dev, vs, fs, recipe, &native_key,
-                                       request);
-      }
       pso = result.pso;
-      if (handed_off) {
-         mtx_lock(&cache->lock);
-         VkResult status = kk_pso_wait(&entry->ready, &cache->lock,
-                                       &entry->compiling, request);
-         pso = status == VK_SUCCESS ? entry->pso : NULL;
-         mtx_unlock(&cache->lock);
-         result.status = status == VK_SUCCESS ? VK_ERROR_UNKNOWN : status;
-      } else if (entry) {
+      if (entry) {
          mtx_lock(&cache->lock);
          if (pso)
             entry->native_key = native_key;
          p_atomic_set(&entry->pso, pso);
          entry->compiling = false;
-         entry->complete = result.status != VK_TIMEOUT;
+         entry->complete = true;
          cnd_broadcast(&entry->ready);
          mtx_unlock(&cache->lock);
       }
-      if (!handed_off)
-         kk_variant_trace(dev, pso ? KK_VARIANT_COMPLETE : KK_VARIANT_FAILURE,
-                          recipe, sizeof(*recipe), 0, 0);
+      kk_variant_trace(dev, pso ? KK_VARIANT_COMPLETE : KK_VARIANT_FAILURE,
+                       recipe, sizeof(*recipe), 0, 0);
    } else if (pso) {
       kk_variant_trace(dev, KK_VARIANT_READY_HIT, recipe,
                        sizeof(*recipe), 0, 0);
    }
+   if (demand)
+      kk_draw_demand_end(cache);
    result.pso = pso;
    if (pso)
       result.status = VK_SUCCESS;
@@ -1340,7 +1254,6 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
                           sizeof(entry->native_key));
       kk_variant_history_record(cache->history, recipe->family, recipe);
    }
-restore_trace:
    if (trace_enabled) {
       memcpy(kk_variant_parent_id, previous, sizeof(previous));
       kk_variant_parent_valid = previous_valid;
@@ -1352,12 +1265,11 @@ restore_trace:
 
 static struct kk_pso_result
 kk_link(struct kk_device *dev, const struct kk_link_state *ls,
-        struct kk_shader *vs, struct kk_shader *fs, bool force_shader_blend,
-        const struct kk_pso_request *request)
+        struct kk_shader *vs, struct kk_shader *fs, bool force_shader_blend)
 {
    struct kk_variant_recipe recipe;
    kk_make_recipe(ls, vs, fs, force_shader_blend, &recipe);
-   return kk_recipe_get(dev, vs, fs, &recipe, request);
+   return kk_recipe_get(dev, vs, fs, &recipe);
 }
 
 static struct kk_shader *
@@ -1370,8 +1282,7 @@ kk_link_fs(struct kk_device *dev, const struct kk_link_state *ls)
 }
 
 struct kk_pso_result
-kk_link_pipeline(struct kk_device *dev, const struct kk_link_state *ls,
-                  const struct kk_pso_request *request)
+kk_link_pipeline(struct kk_device *dev, const struct kk_link_state *ls)
 {
    struct kk_shader *vs = kk_link_rast_shader(ls);
    if (vs == NULL)
@@ -1381,36 +1292,14 @@ kk_link_pipeline(struct kk_device *dev, const struct kk_link_state *ls,
    if (fs == NULL)
       return (struct kk_pso_result){ .status = VK_ERROR_UNKNOWN };
 
-   struct kk_pso_result result = kk_link(dev, ls, vs, fs, false, request);
-   if (!result.pso && result.status != VK_TIMEOUT)
-      result = kk_link(dev, ls, vs, fs, true, request);
+   struct kk_pso_result result = kk_link(dev, ls, vs, fs, false);
+   if (!result.pso)
+      result = kk_link(dev, ls, vs, fs, true);
    return result;
 }
 
-static mtl_render_pipeline_state *
-kk_link_stub(struct kk_device *dev, const struct kk_link_state *ls)
-{
-   struct kk_shader *vs = kk_link_rast_shader(ls);
-   struct kk_shader *fs = kk_link_fs(dev, ls);
-   if (vs == NULL || fs == NULL)
-      return NULL;
-   struct kk_variant_recipe recipe;
-   kk_make_recipe(ls, vs, fs, false, &recipe);
-   bool points =
-      recipe.pso.topology_class == MTL_PRIMITIVE_TOPOLOGY_CLASS_POINT;
-   mtl_render_pipeline_state *pso = NULL;
-   if (kk_shader_rast_ready(vs, points)) {
-      const struct kk_fs_variant *rast = kk_shader_get_rast(dev, vs, points);
-      if (rast)
-         pso = kk_stub_get(dev, &recipe.pso, rast->hash, rast->fn, false);
-   }
-   if (!pso)
-      kk_schedule_stub(dev, vs, &recipe);
-   return pso;
-}
-
 mtl_render_pipeline_state *
-kk_cmd_link_pipeline(struct kk_cmd_buffer *cmd, bool *provisional)
+kk_cmd_link_pipeline(struct kk_cmd_buffer *cmd)
 {
    const struct kk_rendering_state *render = &cmd->state.gfx.render;
    struct kk_link_state ls = {
@@ -1424,18 +1313,7 @@ kk_cmd_link_pipeline(struct kk_cmd_buffer *cmd, bool *provisional)
    for (uint32_t i = 0; i < render->color_att_count; ++i)
       ls.color_formats[i] = render->color_att[i].vk_format;
 
-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   struct kk_pso_request request = kk_cmd_pso_request(cmd);
-   struct kk_pso_result result = kk_link_pipeline(dev, &ls, &request);
-   *provisional = false;
-   if (result.status != VK_TIMEOUT)
-      return result.pso;
-   if (dev->pso_cache.timeout_policy == KK_WAIT_TIMEOUT_STRICT) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
-      return NULL;
-   }
-   *provisional = true;
-   return kk_link_stub(dev, &ls);
+   return kk_link_pipeline(kk_cmd_buffer_device(cmd), &ls).pso;
 }
 
 static bool
@@ -1544,7 +1422,7 @@ static bool
 kk_prewarm_recipe(struct kk_device *dev, struct kk_shader *vs,
                   struct kk_shader *fs, const struct kk_variant_recipe *recipe)
 {
-   if (kk_recipe_get(dev, vs, fs, recipe, NULL).pso)
+   if (kk_recipe_get(dev, vs, fs, recipe).pso)
       return true;
    if (recipe->fs.shader_blend)
       return false;
@@ -1566,7 +1444,7 @@ kk_prewarm_recipe(struct kk_device *dev, struct kk_shader *vs,
                       recipe->write_enables & BITFIELD_BIT(i),
                       &fallback.fs.blend[i]);
    }
-   return kk_recipe_get(dev, vs, fs, &fallback, NULL).pso != NULL;
+   return kk_recipe_get(dev, vs, fs, &fallback).pso != NULL;
 }
 
 static bool
@@ -1685,6 +1563,7 @@ kk_prewarm_execute(void *data, void *global_data, int thread_index)
             }
             if (!kk_history_matches(job, &recipes[i]))
                continue;
+            kk_yield_to_draws(&job->dev->pso_cache);
             kk_log_cache_pso(job->dev, "history_replay",
                              &recipes[i], sizeof(recipes[i]));
             failed |= !kk_prewarm_recipe(job->dev, vs, fs, &recipes[i]);
@@ -1746,8 +1625,6 @@ kk_schedule_recipe(struct kk_device *dev,
    kk_fill_recipe(ls, vs, fs, false, &raw);
    memcpy(&recipe, &raw, sizeof(recipe));
    kk_normalize_recipe(&recipe);
-   if (exact)
-      kk_schedule_stub(dev, vs, &recipe);
    BITSET_DECLARE(dynamic_set, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX) = {0};
    if (dynamic)
       memcpy(dynamic_set, dynamic, sizeof(dynamic_set));
@@ -1953,6 +1830,25 @@ kk_prewarm_pipeline(struct vk_device *vk_dev,
    kk_schedule_recipe(dev, &ls, false, state->dynamic);
 }
 
+static bool
+kk_link_output_types_match(const struct kk_link_state *ls)
+{
+   const struct kk_shader *fs = ls->shaders[MESA_SHADER_FRAGMENT];
+   if (!fs)
+      return true;
+   for (uint32_t i = 0; i < ls->color_att_count; ++i) {
+      uint8_t rt = ls->dyn->cal.color_map[i];
+      VkFormat format = ls->color_formats[i];
+      if (rt >= MAX_DRAW_BUFFERS || format == VK_FORMAT_UNDEFINED ||
+          !(fs->info.fs.color_outputs & BITFIELD_BIT(rt)))
+         continue;
+      if (kk_format_base_type(vk_format_to_pipe_format(format)) !=
+          fs->info.fs.output_base_type[rt])
+         return false;
+   }
+   return true;
+}
+
 void
 kk_cmd_prewarm_pipeline(struct kk_cmd_buffer *cmd)
 {
@@ -2013,5 +1909,7 @@ kk_cmd_prewarm_pipeline(struct kk_cmd_buffer *cmd)
             ? MESA_PRIM_LINES : MESA_PRIM_TRIANGLES;
    for (unsigned i = 0; i < ls.color_att_count; ++i)
       ls.color_formats[i] = render->color_att[i].vk_format;
+   if (!kk_link_output_types_match(&ls))
+      return;
    kk_schedule_recipe(kk_cmd_buffer_device(cmd), &ls, true, NULL);
 }

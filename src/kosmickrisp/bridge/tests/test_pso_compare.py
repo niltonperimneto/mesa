@@ -40,8 +40,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(result['timings'][1]['candidate']['count'], 1)
 
     def test_measurement_environment_and_diagnostic_separation(self):
-        workload = {'env': {'MESA_KK_PSO_WAIT_TIMEOUT_MS': '10',
-                            'MESA_KK_CACHE_LOG': 'inherited.log', 'KK_PROBE_THREADS': '4'}}
+        workload = {'env': {'MESA_KK_CACHE_LOG': 'inherited.log', 'KK_PROBE_THREADS': '4'}}
         with patch.dict(os.environ, {'MESA_KK_METAL_CONCURRENCY_LOG': 'parent.log',
                                      'MESA_SHADER_CACHE_DISABLE': 'true',
                                      'KK_PROBE_SAMPLE_MASK': '5'}):
@@ -49,7 +48,6 @@ class ComparisonTests(unittest.TestCase):
             self.assertFalse(any(key.endswith('_LOG') for key in env if key.startswith('MESA_KK_')))
             self.assertNotIn('MESA_SHADER_CACHE_DISABLE', env)
             self.assertNotIn('KK_PROBE_SAMPLE_MASK', env)
-            self.assertEqual(env['MESA_KK_PSO_WAIT_TIMEOUT_MS'], '0')
             self.assertEqual(env['KK_PROBE_THREADS'], '4')
             self.assertEqual(env['MESA_SHADER_CACHE_DIR'], '/cache/mesa')
             diagnostic = compare.environment(workload, Path('/cache'), Path('/run'), True)

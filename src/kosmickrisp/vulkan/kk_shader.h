@@ -292,8 +292,6 @@ VkResult kk_shader_get_fs_variant(struct kk_device *dev, struct kk_shader *fs,
 bool kk_shader_rast_ready(struct kk_shader *vs, bool points);
 
 struct kk_shader *kk_device_get_empty_fs(struct kk_device *dev);
-const struct kk_fs_variant *kk_device_get_discard_fs(struct kk_device *dev,
-                                                     bool create);
 void kk_device_finish_empty_fs(struct kk_device *dev);
 
 #endif /* KK_SHADER_H */

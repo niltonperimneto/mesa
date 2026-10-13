@@ -200,6 +200,8 @@ enum mtl_pixel_format {
 
    MTL_PIXEL_FORMAT_X32_S8X24_UINT = 261,
    MTL_PIXEL_FORMAT_X24_S8_UINT = 262,
+
+   MTL_PIXEL_FORMAT_UNSPECIALIZED = 263,
 };
 
 #endif /* MTL_FORMAT_H */

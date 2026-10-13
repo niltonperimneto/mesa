@@ -74,6 +74,9 @@ void mtl_render_pipeline_descriptor_set_color_attachment_blend(
    enum mtl_blend_factor dst_alpha, enum mtl_blend_operation op_alpha,
    uint8_t write_mask);
 
+void mtl_render_pipeline_descriptor_set_color_attachment_unspecialized(
+   mtl_render_pipeline_descriptor *descriptor, uint8_t index);
+
 void mtl_render_pipeline_descriptor_set_raster_sample_count(
    mtl_render_pipeline_descriptor *descriptor, uint32_t sample_count);
 
@@ -90,6 +93,10 @@ void mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
 mtl_render_pipeline_state *
 mtl_new_render_pipeline(mtl_compiler *compiler,
                         mtl_render_pass_descriptor *descriptor);
+mtl_render_pipeline_state *
+mtl_specialize_render_pipeline(mtl_compiler *compiler,
+                               mtl_render_pipeline_descriptor *descriptor,
+                               mtl_render_pipeline_state *base);
 
 bool mtl_compiler_has_serializer(mtl_compiler *compiler);
 void *mtl_compiler_serialize(mtl_compiler *compiler, size_t *size);

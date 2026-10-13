@@ -1985,9 +1985,9 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    if (vs->info.vs.has_ms)
       key.sample_count = vs->info.vs.sample_count;
 
-   pipe->gfx.render = kk_new_render_pipeline(device, vertex_function,
-                                             fragment_function, &key,
-                                             kk_fail_on_compile);
+   pipe->gfx.render = kk_pso_cache_acquire(device, &key, vertex_function,
+                                           fragment_function,
+                                           kk_fail_on_compile);
    if (pipe->gfx.render == NULL && kk_fail_on_compile) {
       struct kk_render_pending *pending = calloc(1, sizeof(*pending));
       if (pending && cnd_init(&pending->ready) == thrd_success) {
@@ -2001,8 +2001,8 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
          return VK_SUCCESS;
       }
       free(pending);
-      pipe->gfx.render = kk_new_render_pipeline(
-         device, vertex_function, fragment_function, &key, false);
+      pipe->gfx.render = kk_pso_cache_acquire(
+         device, &key, vertex_function, fragment_function, false);
    }
    if (pipe->gfx.render == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
@@ -3193,13 +3193,9 @@ kk_shader_get_fs_variant(struct kk_device *dev, struct kk_shader *fs,
          int64_t start = os_time_get_nano();
          struct mtl_compile_phase phase =
             kk_pso_phase_begin(dev, "fs_variant_wait", key, sizeof(*key));
-         VkResult status = kk_pso_wait(&entry->ready, &fs->variants_lock,
-                                       &entry->compiling, request);
-         mtl_compile_phase_end(phase, status == VK_SUCCESS);
-         if (status != VK_SUCCESS) {
-            mtx_unlock(&fs->variants_lock);
-            return status;
-         }
+         while (entry->compiling)
+            cnd_wait(&entry->ready, &fs->variants_lock);
+         mtl_compile_phase_end(phase, true);
          kk_log_compile(dev, "fs_variant_wait", start);
          kk_variant_trace(dev, KK_VARIANT_FS_WAIT, identity, sizeof(identity),
                           start, os_time_get_nano());
@@ -3295,53 +3291,12 @@ kk_device_get_empty_fs(struct kk_device *dev)
    return dev->empty_fs;
 }
 
-const struct kk_fs_variant *
-kk_device_get_discard_fs(struct kk_device *dev, bool create)
-{
-   struct kk_fs_variant *discard_fs = p_atomic_read(&dev->discard_fs);
-   if (discard_fs || !create)
-      return discard_fs;
-
-   simple_mtx_lock(&dev->empty_fs_lock);
-   if (dev->discard_fs == NULL) {
-      static const char code[] =
-         "#include <metal_stdlib>\n"
-         "using namespace metal;\n"
-         "fragment void kk_discard_fs()\n"
-         "{\n"
-         "   discard_fragment();\n"
-         "}\n";
-      const struct msl_compile_data data = {
-         .code = (char *)code,
-         .entrypoint_name = (char *)"kk_discard_fs",
-      };
-      discard_fs = calloc(1, sizeof(*discard_fs));
-      if (discard_fs &&
-          kk_new_function(dev, &data, &discard_fs->lib, &discard_fs->fn) ==
-             VK_SUCCESS) {
-         _mesa_blake3_compute(code, strlen(code), discard_fs->hash);
-         p_atomic_set(&dev->discard_fs, discard_fs);
-      } else {
-         free(discard_fs);
-      }
-   }
-   simple_mtx_unlock(&dev->empty_fs_lock);
-
-   return dev->discard_fs;
-}
-
 void
 kk_device_finish_empty_fs(struct kk_device *dev)
 {
    if (dev->empty_fs)
       kk_shader_destroy(&dev->vk, dev->empty_fs, NULL);
    dev->empty_fs = NULL;
-   if (dev->discard_fs) {
-      mtl_release(dev->discard_fs->fn);
-      mtl_release(dev->discard_fs->lib);
-      free(dev->discard_fs);
-   }
-   dev->discard_fs = NULL;
 }
 
 void

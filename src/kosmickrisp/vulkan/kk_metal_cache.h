@@ -29,6 +29,9 @@ mtl_render_pipeline_state *kk_metal_cache_lookup_render_pipeline(
 mtl_render_pipeline_state *kk_metal_cache_new_render_pipeline(
    struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
    mtl_render_pipeline_descriptor *descriptor, bool *archive_hit);
+mtl_render_pipeline_state *kk_metal_cache_specialize_render_pipeline(
+   struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
+   mtl_render_pipeline_descriptor *descriptor, mtl_render_pipeline_state *base);
 mtl_compute_pipeline_state *kk_metal_cache_new_compute_pipeline(
    struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
    mtl_function_descriptor *function, uint64_t max_threads, bool *archive_hit);

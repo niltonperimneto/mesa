@@ -7,7 +7,6 @@
 #define KK_PSO_CACHE_H 1
 
 #include "kk_private.h"
-#include "kk_pso_wait.h"
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
@@ -50,12 +49,6 @@ struct kk_pso_key {
 static_assert(sizeof(struct kk_pso_key) == 180,
               "kk_pso_key is hashed and serialized");
 
-enum kk_wait_timeout_policy {
-   KK_WAIT_TIMEOUT_STUB,
-   KK_WAIT_TIMEOUT_BLOCK,
-   KK_WAIT_TIMEOUT_STRICT,
-};
-
 struct kk_link_state {
    const struct vk_dynamic_graphics_state *dyn;
    struct kk_shader *shaders[MESA_SHADER_COMPUTE];
@@ -72,20 +65,18 @@ struct kk_pso_cache {
    struct hash_table *table;
    struct util_queue prewarm_queue;
    struct util_queue exact_queue;
-   struct util_queue draw_queue;
-   struct util_queue stub_queue;
    struct hash_table *recipes;
    struct hash_table *families;
    struct kk_variant_history *history;
    cnd_t jobs_done;
+   cnd_t draw_idle;
+   unsigned draw_demand;
    unsigned pending_jobs;
    unsigned exact_jobs;
    unsigned failed_jobs;
    unsigned recipe_count;
    unsigned recipe_limit;
    unsigned family_count;
-   unsigned wait_timeout_ms;
-   enum kk_wait_timeout_policy timeout_policy;
    bool limited;
 };
 
@@ -110,6 +101,10 @@ void kk_pso_cache_finish(struct kk_pso_cache *cache);
 VkResult kk_pso_prewarm_wait(struct kk_device *dev);
 VkBool32 kk_pso_prewarm_ready(struct kk_device *dev);
 
+struct kk_pso_request {
+   bool lookup_only;
+};
+
 struct kk_pso_result {
    mtl_render_pipeline_state *pso;
    VkResult status;
@@ -124,17 +119,19 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
                  mtl_function_descriptor *vs, mtl_function_descriptor *fs,
                  const struct kk_pso_request *request);
 
-struct kk_pso_result
-kk_link_pipeline(struct kk_device *dev, const struct kk_link_state *ls,
-                  const struct kk_pso_request *request);
+mtl_render_pipeline_state *
+kk_pso_cache_acquire(struct kk_device *dev, const struct kk_pso_key *key,
+                     mtl_function_descriptor *vs, mtl_function_descriptor *fs,
+                     bool lookup_only);
 
-mtl_render_pipeline_state *kk_cmd_link_pipeline(struct kk_cmd_buffer *cmd,
-                                                bool *provisional);
+struct kk_pso_result
+kk_link_pipeline(struct kk_device *dev, const struct kk_link_state *ls);
+
+mtl_render_pipeline_state *kk_cmd_link_pipeline(struct kk_cmd_buffer *cmd);
 
 void kk_pso_schedule_render(struct kk_device *dev, struct kk_shader *vs);
 bool kk_pso_render_pending(struct kk_device *dev, struct kk_shader *vs);
 mtl_render_pipeline_state *kk_cmd_acquire_render(struct kk_cmd_buffer *cmd,
-                                                 struct kk_shader *vs,
-                                                 bool *provisional);
+                                                 struct kk_shader *vs);
 
 #endif /* KK_PSO_CACHE_H */

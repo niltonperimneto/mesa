@@ -789,16 +789,19 @@ kk_metal_defer_recapture_locked(struct kk_metal_cache *cache,
 
 static mtl_compiler *
 kk_metal_begin_compile(struct kk_metal_cache *cache,
-                       const uint8_t key[CACHE_KEY_SIZE], bool *captured)
+                       const uint8_t key[CACHE_KEY_SIZE], bool *captured,
+                       bool capture)
 {
    mtx_lock(&cache->mutex);
    cache->last_compile_ns = os_time_get_nano();
-   if (cache->serializing && cache->uncaptured) {
-      struct mtl_compile_phase phase =
-         kk_metal_phase_begin(cache, "serialization_bypass", key);
-      mtl_compile_phase_end(phase, true);
+   if (cache->uncaptured && (cache->serializing || !capture)) {
+      if (cache->serializing) {
+         struct mtl_compile_phase phase =
+            kk_metal_phase_begin(cache, "serialization_bypass", key);
+         mtl_compile_phase_end(phase, true);
+         cache->bypassed_compiles++;
+      }
       cache->uncaptured_compiles++;
-      cache->bypassed_compiles++;
       mtl_compiler *compiler = cache->uncaptured;
       mtx_unlock(&cache->mutex);
       *captured = false;
@@ -818,16 +821,16 @@ kk_metal_begin_compile(struct kk_metal_cache *cache,
 static void
 kk_metal_end_compile(struct kk_metal_cache *cache,
                      const uint8_t key[CACHE_KEY_SIZE], bool captured,
-                     bool success, void *descriptor, bool compute,
+                     bool persist, void *descriptor, bool compute,
                      uint64_t max_threads)
 {
    mtx_lock(&cache->mutex);
    if (captured) {
-      if (success)
+      if (persist)
          kk_metal_capture_locked(cache, key);
       cache->captured_compiles--;
    } else {
-      if (success)
+      if (persist)
          kk_metal_defer_recapture_locked(cache, key, descriptor, compute,
                                          max_threads);
       cache->uncaptured_compiles--;
@@ -904,13 +907,33 @@ kk_metal_cache_new_render_pipeline(struct kk_metal_cache *cache,
    *archive_hit = pipeline != NULL;
    if (!pipeline) {
       bool captured;
-      mtl_compiler *compiler = kk_metal_begin_compile(cache, key, &captured);
+      mtl_compiler *compiler =
+         kk_metal_begin_compile(cache, key, &captured, true);
       int64_t start = kk_metal_trace_time();
       pipeline = mtl_new_render_pipeline(compiler, descriptor);
       kk_metal_trace_event("native_create", key, start);
       kk_metal_end_compile(cache, key, captured, pipeline != NULL, descriptor,
                            false, 0);
    }
+   kk_metal_operation_end(cache);
+   return pipeline;
+}
+
+mtl_render_pipeline_state *
+kk_metal_cache_specialize_render_pipeline(
+   struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
+   mtl_render_pipeline_descriptor *descriptor, mtl_render_pipeline_state *base)
+{
+   if (!kk_metal_operation_begin(cache))
+      return NULL;
+   bool captured;
+   mtl_compiler *compiler =
+      kk_metal_begin_compile(cache, key, &captured, false);
+   int64_t start = kk_metal_trace_time();
+   mtl_render_pipeline_state *pipeline =
+      mtl_specialize_render_pipeline(compiler, descriptor, base);
+   kk_metal_trace_event("native_specialize", key, start);
+   kk_metal_end_compile(cache, key, captured, false, descriptor, false, 0);
    kk_metal_operation_end(cache);
    return pipeline;
 }
@@ -941,7 +964,8 @@ kk_metal_cache_new_compute_pipeline(struct kk_metal_cache *cache,
    *archive_hit = pipeline != NULL;
    if (!pipeline) {
       bool captured;
-      mtl_compiler *compiler = kk_metal_begin_compile(cache, key, &captured);
+      mtl_compiler *compiler =
+         kk_metal_begin_compile(cache, key, &captured, true);
       int64_t start = kk_metal_trace_time();
       pipeline =
          mtl_new_compute_pipeline_state(compiler, function, max_threads);

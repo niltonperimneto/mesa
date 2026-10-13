@@ -157,7 +157,6 @@ struct kk_device {
    struct kk_pso_cache pso_cache;
    simple_mtx_t empty_fs_lock;
    struct kk_shader *empty_fs;
-   struct kk_fs_variant *discard_fs;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)

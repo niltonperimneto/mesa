@@ -170,7 +170,6 @@ def environment(workload, cache, directory, diagnostic):
     for key in list(env):
         if key.startswith('MESA_KK_') and (key.endswith('_LOG') or key == 'MESA_KK_VARIANT_STATS'):
             del env[key]
-    env['MESA_KK_PSO_WAIT_TIMEOUT_MS'] = '0'
     env['MESA_SHADER_CACHE_DIR'] = str(cache / 'mesa')
     env['KK_PROBE_CACHE'] = str(cache / 'pipeline.cache')
     if diagnostic:

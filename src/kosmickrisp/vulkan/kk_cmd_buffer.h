@@ -161,7 +161,6 @@ struct kk_graphics_state {
 
    mtl_depth_stencil_state *depth_stencil_state;
    mtl_render_pipeline_state *pso;
-   bool pso_is_stub;
    mtl_compute_pipeline_state *pre_render[4];
    uint32_t pre_render_count;
    bool pre_render_valid;

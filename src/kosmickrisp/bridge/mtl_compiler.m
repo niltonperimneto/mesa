@@ -387,6 +387,27 @@ mtl_render_pipeline_descriptor_set_color_attachment_blend(
 }
 
 void
+mtl_render_pipeline_descriptor_set_color_attachment_unspecialized(
+   mtl_render_pipeline_descriptor *descriptor, uint8_t index)
+{
+   @autoreleasepool {
+      MTL4RenderPipelineDescriptor *desc =
+         (MTL4RenderPipelineDescriptor *)descriptor;
+      MTL4RenderPipelineColorAttachmentDescriptor *att =
+         desc.colorAttachments[index];
+      att.pixelFormat = MTLPixelFormatUnspecialized;
+      att.blendingState = MTL4BlendStateUnspecialized;
+      att.sourceRGBBlendFactor = MTLBlendFactorUnspecialized;
+      att.destinationRGBBlendFactor = MTLBlendFactorUnspecialized;
+      att.rgbBlendOperation = MTLBlendOperationUnspecialized;
+      att.sourceAlphaBlendFactor = MTLBlendFactorUnspecialized;
+      att.destinationAlphaBlendFactor = MTLBlendFactorUnspecialized;
+      att.alphaBlendOperation = MTLBlendOperationUnspecialized;
+      att.writeMask = MTLColorWriteMaskUnspecialized;
+   }
+}
+
+void
 mtl_render_pipeline_descriptor_set_raster_sample_count(mtl_render_pipeline_descriptor *descriptor,
                                                        uint32_t sample_count)
 {
@@ -460,6 +481,47 @@ mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *desc
 
       if (pipeline == nil) {
          mesa_logd("Failed to create MTLRenderPipelineState: %s",
+                   [error.localizedDescription UTF8String]);
+      }
+
+      return pipeline;
+   }
+}
+
+mtl_render_pipeline_state *
+mtl_specialize_render_pipeline(mtl_compiler *compiler,
+                               mtl_render_pipeline_descriptor *descriptor,
+                               mtl_render_pipeline_state *base)
+{
+   @autoreleasepool {
+      id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
+      MTL4RenderPipelineDescriptor *desc =
+         (MTL4RenderPipelineDescriptor *)descriptor;
+      KKCompilerLock *lock = mtl_compiler_lock(compiler);
+
+      NSError *error = nil;
+      if (lock) {
+         struct mtl_compile_phase lock_phase =
+            mtl_compile_phase_begin("compiler_read_lock", compiler, NULL, NULL);
+         pthread_rwlock_rdlock(&lock->rwlock);
+         mtl_compile_phase_end(lock_phase, true);
+      }
+      struct mtl_compile_phase phase =
+         mtl_compile_phase_begin("specialize", compiler, NULL, NULL);
+      uint64_t start = kk_metal_log_time();
+      id<MTLRenderPipelineState> base_pso =
+         (id<MTLRenderPipelineState>)base;
+      id<MTLRenderPipelineState> pipeline =
+         [comp newRenderPipelineStateBySpecializationWithDescriptor:desc
+                                                           pipeline:base_pso
+                                                              error:&error];
+      kk_metal_log_end("specialize", compiler, start, pipeline != nil);
+      mtl_compile_phase_end(phase, pipeline != nil);
+      if (lock)
+         pthread_rwlock_unlock(&lock->rwlock);
+
+      if (pipeline == nil) {
+         mesa_logd("Failed to specialize MTLRenderPipelineState: %s",
                    [error.localizedDescription UTF8String]);
       }
 

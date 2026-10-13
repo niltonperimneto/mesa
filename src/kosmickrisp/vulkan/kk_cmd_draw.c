@@ -1224,8 +1224,8 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
        IS_SHADER_DIRTY(TESS_EVAL) || IS_SHADER_DIRTY(GEOMETRY))
       gfx->pre_render_valid = kk_update_pre_render(cmd);
 
-   if (!vs->info.partial && (IS_SHADER_DIRTY(VERTEX) || gfx->pso_is_stub)) {
-      gfx->pso = kk_cmd_acquire_render(cmd, vs, &gfx->pso_is_stub);
+   if (!vs->info.partial && IS_SHADER_DIRTY(VERTEX)) {
+      gfx->pso = kk_cmd_acquire_render(cmd, vs);
       if (gfx->pso)
          mtl_render_set_pipeline_state(enc, gfx->pso);
       if (gfx->depth_stencil_state)
@@ -1263,7 +1263,7 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
         IS_DIRTY(MS_ALPHA_TO_COVERAGE_ENABLE) ||
         IS_DIRTY(MS_ALPHA_TO_ONE_ENABLE) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
         IS_DIRTY(COLOR_ATTACHMENT_MAP) || IS_DIRTY(RP_ATTACHMENTS))) {
-      gfx->pso = kk_cmd_link_pipeline(cmd, &gfx->pso_is_stub);
+      gfx->pso = kk_cmd_link_pipeline(cmd);
       if (gfx->pso)
          mtl_render_set_pipeline_state(enc, gfx->pso);
    }
@@ -1823,7 +1823,7 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    kk_flush_dynamic_state(cmd);
 
    cmd->state.dirty_shaders = 0u;
-   cmd->state.gfx.dirty = gfx->pso_is_stub ? KK_DIRTY_PSO : 0u;
+   cmd->state.gfx.dirty = 0u;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
 }
 #undef IS_SHADER_DIRTY

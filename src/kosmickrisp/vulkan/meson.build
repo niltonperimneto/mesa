@@ -113,7 +113,6 @@ kk_files = files(
   'kk_variant_history.c',
   'kk_variant_history.h',
   'kk_pso_cache.h',
-  'kk_pso_wait.h',
   'kk_shader.c',
   'kk_sync.h',
   'kk_sync.c',
@@ -211,6 +210,18 @@ kosmickrisp_icd = custom_target(
 devenv.append('VK_DRIVER_FILES', kosmickrisp_icd.full_path())
 
 if with_tests
+  test(
+    'kk-metal-specialization',
+    executable(
+      'kk-metal-specialization-test',
+      'tests/metal_specialization.c',
+      include_directories : [inc_include, inc_src],
+      dependencies : [idep_mesautil, idep_mtl_bridge],
+      link_args : host_machine.system() == 'darwin' ? ['-Wl,-dead_strip'] : ld_args_gc_sections,
+    ),
+    suite : ['kosmickrisp'],
+    timeout : 30,
+  )
   test(
     'kk-pso-cache',
     executable(
