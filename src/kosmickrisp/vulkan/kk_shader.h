@@ -66,6 +66,8 @@ struct kk_shader_info {
    uint8_t rast_num_cull_distances;
    uint8_t rast_primitive_id_slot;
    bool rast_point_variant;
+   bool point_variant;
+   bool gs_needs_main;
    uint64_t rast_outputs_written;
 
    union {
@@ -129,6 +131,7 @@ struct kk_shader_info {
          uint8_t color_outputs;
          uint8_t output_base_type[MAX_DRAW_BUFFERS];
          uint64_t inputs_read;
+         uint64_t flat_inputs;
       } fs;
 
       struct {
@@ -163,6 +166,16 @@ struct msl_compile_data {
    char *entrypoint_name;
 };
 
+struct kk_point_info {
+   struct poly_gs_info gs;
+   uint64_t rast_outputs_written;
+   uint64_t emu_outputs;
+   uint8_t rast_num_cull_distances;
+   uint8_t rast_primitive_id_slot;
+   bool has_emu;
+   bool gs_needs_main;
+};
+
 struct kk_fs_variant {
    blake3_hash hash;
    mtl_library *lib;
@@ -190,6 +203,7 @@ struct kk_shader {
    /* Compute pass of a GS. Its rasterization VS is in
     * msl_data[MESA_SHADER_GEOMETRY]. */
    struct msl_compile_data gs_main;
+   struct kk_bo *gs_indices;
 
    struct kk_fs_variant fast;
    struct kk_fs_variant fast_points;
@@ -197,6 +211,14 @@ struct kk_shader {
 
    mtl_compute_pipeline_state *so_cs;
    struct msl_compile_data msl_emu;
+
+   struct kk_point_info point;
+   struct msl_compile_data point_emu;
+   struct msl_compile_data point_gs_main;
+   struct msl_compile_data point_rast;
+   mtl_compute_pipeline_state *point_cs;
+   struct kk_shader *point_gs;
+   bool point_failed;
 
    void *nir_blob;
    size_t nir_blob_size;
@@ -258,6 +280,7 @@ kk_nir_lower_descriptors(nir_shader *nir,
 bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
 
 bool kk_nir_lower_poly(struct nir_shader *nir);
+bool kk_nir_lower_gs_polygon_point(nir_shader *gs);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
 bool kk_nir_lower_textures(nir_shader *nir);
@@ -290,6 +313,11 @@ VkResult kk_shader_get_fs_variant(struct kk_device *dev, struct kk_shader *fs,
                                   const struct kk_pso_request *request);
 
 bool kk_shader_rast_ready(struct kk_shader *vs, bool points);
+
+struct kk_shader *kk_shader_get_point_gs(struct kk_device *dev,
+                                         struct kk_shader *shader);
+mtl_compute_pipeline_state *kk_shader_get_point_cs(struct kk_device *dev,
+                                                   struct kk_shader *shader);
 
 struct kk_shader *kk_device_get_empty_fs(struct kk_device *dev);
 void kk_device_finish_empty_fs(struct kk_device *dev);

@@ -1345,9 +1345,6 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
                                  nir_metadata_control_flow, nir_imm_int(&b, 0));
    }
 
-   NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_inputs,
-            nir_metadata_control_flow, NULL);
-
    /* Lower geometry shader writes to contain all of the required counts, so we
     * know where in the various buffers we should write vertices.
     */
@@ -1416,6 +1413,9 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
    } else {
       info->shape = POLY_GS_SHAPE_DYNAMIC_INDEXED;
    }
+
+   NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_inputs,
+            nir_metadata_control_flow, NULL);
 
    /* Ensure that outputs_written is still accurate after DCE. */
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));

@@ -6,6 +6,7 @@
  */
 
 #include "kk_shader.h"
+#include "kk_bo.h"
 #include "kk_metal_cache.h"
 
 #include "kk_cmd_buffer.h"
@@ -259,6 +260,9 @@ static bool
 kk_is_possible_both_depth_clip_clamp(
    const struct vk_graphics_pipeline_state *state, bool enabled);
 
+static bool
+kk_state_may_draw_points(const struct vk_graphics_pipeline_state *state);
+
 #define KK_HASH_FIELD(ctx, value) \
    _mesa_blake3_update((ctx), &(value), sizeof(value))
 
@@ -302,15 +306,18 @@ kk_hash_graphics_state(struct vk_physical_device *device,
       const uint32_t view_mask = state->mv ? state->mv->view_mask : 0u;
       const bool emulate_viewport_z =
          kk_is_possible_both_depth_clip_clamp(state, false);
+      const bool may_draw_points = kk_state_may_draw_points(state);
       KK_HASH_FIELD(&components[MV], view_mask);
       KK_HASH_FIELD(&components[PRE_RASTER], emulate_viewport_z);
+      KK_HASH_FIELD(&components[PRE_RASTER], may_draw_points);
    }
 
    if (stages & VK_SHADER_STAGE_FRAGMENT_BIT) {
       struct kk_fs_key key;
       kk_populate_fs_key(&key, state,
                          !(stages & VK_SHADER_STAGE_VERTEX_BIT) ||
-                            KK_DEBUG(PARTITION) || kk_state_needs_link(state));
+                            KK_DEBUG(PARTITION) || kk_state_needs_link(state) ||
+                            kk_state_may_draw_points(state));
       KK_HASH_FIELD(&components[DS], key.ds.depth.test_enable);
       KK_HASH_FIELD(&components[DS], key.ds.depth.write_enable);
       KK_HASH_FIELD(&components[DS], key.ds.depth.compare_op);
@@ -557,7 +564,7 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
 /* Lowering for the stage which ends up as the vertex stage on hardware */
 static void
 kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
-               bool is_point)
+               bool is_point, bool lower_z)
 {
    if (is_point)
       NIR_PASS(_, nir, msl_ensure_vertex_point_size_output);
@@ -566,12 +573,14 @@ kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
                                  nir_metadata_control_flow, NULL);
 
    NIR_PASS(_, nir, msl_ensure_vertex_position_output);
-   NIR_PASS(_, nir, nir_lower_clip_halfz_dynamic);
+   if (lower_z) {
+      NIR_PASS(_, nir, nir_lower_clip_halfz_dynamic);
 
-   /* In any situation where both clip and clamp can be disabled, we need to
-    * add viewport Z transform emulation to the shader */
-   if (kk_is_possible_both_depth_clip_clamp(state, false))
-      NIR_PASS(_, nir, msl_nir_lower_vs_disabled_depth_clamp_clip);
+      /* In any situation where both clip and clamp can be disabled, we need to
+       * add viewport Z transform emulation to the shader */
+      if (kk_is_possible_both_depth_clip_clamp(state, false))
+         NIR_PASS(_, nir, msl_nir_lower_vs_disabled_depth_clamp_clip);
+   }
 
    NIR_PASS(_, nir, msl_nir_vs_io_types);
 }
@@ -990,7 +999,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
       bool is_point = nir->info.stage == MESA_SHADER_TESS_EVAL
                          ? nir->info.tess.point_mode
                          : kk_topology_is_point(state, partition);
-      kk_lower_hw_vs(nir, state, is_point);
+      kk_lower_hw_vs(nir, state, is_point, true);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       kk_lower_fs(dev, nir, state, partition);
    }
@@ -1080,6 +1089,8 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
 
    ralloc_free((void *)shader->gs_main.entrypoint_name);
    ralloc_free((void *)shader->gs_main.code);
+   if (shader->gs_indices)
+      kk_destroy_bo(dev, shader->gs_indices);
 
    if (shader->fast.fn)
       mtl_release(shader->fast.fn);
@@ -1097,6 +1108,17 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
       mtl_release(shader->so_cs);
    ralloc_free((void *)shader->msl_emu.entrypoint_name);
    ralloc_free((void *)shader->msl_emu.code);
+
+   if (shader->point_cs)
+      mtl_release(shader->point_cs);
+   if (shader->point_gs)
+      kk_shader_destroy(vk_dev, shader->point_gs, NULL);
+   ralloc_free((void *)shader->point_emu.entrypoint_name);
+   ralloc_free((void *)shader->point_emu.code);
+   ralloc_free((void *)shader->point_gs_main.entrypoint_name);
+   ralloc_free((void *)shader->point_gs_main.code);
+   ralloc_free((void *)shader->point_rast.entrypoint_name);
+   ralloc_free((void *)shader->point_rast.code);
 
    if (shader->pending) {
       mtl_release(shader->pending->fragment_function);
@@ -1166,6 +1188,9 @@ gather_fs_io(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_io_semantics io = nir_intrinsic_io_semantics(intr);
       if (io.location >= VARYING_SLOT_VAR0 && io.location <= VARYING_SLOT_VAR31)
          info->fs.inputs_read |= BITFIELD64_RANGE(io.location, io.num_slots);
+      if (intr->intrinsic == nir_intrinsic_load_input &&
+          io.location + io.num_slots <= 64)
+         info->fs.flat_inputs |= BITFIELD64_RANGE(io.location, io.num_slots);
       return false;
    }
 
@@ -1339,6 +1364,239 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
    ralloc_free(nir);
 }
 
+static bool
+kk_state_may_draw_points(const struct vk_graphics_pipeline_state *state)
+{
+   if (!state)
+      return false;
+
+   if (state->rs &&
+       !BITSET_TEST(state->dynamic,
+                    MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE) &&
+       state->rs->rasterizer_discard_enable)
+      return false;
+
+   return BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
+          (state->rs && state->rs->polygon_mode == VK_POLYGON_MODE_POINT);
+}
+
+static bool
+kk_wants_point_variant(const nir_shader *nir,
+                       const struct vk_graphics_pipeline_state *state,
+                       bool partition)
+{
+   if (!partition || !kk_state_may_draw_points(state))
+      return false;
+
+   switch (nir->info.stage) {
+   case MESA_SHADER_VERTEX:
+      if (nir->info.next_stage == MESA_SHADER_TESS_CTRL ||
+          nir->info.next_stage == MESA_SHADER_GEOMETRY)
+         return false;
+      if (!state->ia ||
+          BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY))
+         return true;
+      return vk_topology_to_mesa(state->ia->primitive_topology) ==
+                MESA_PRIM_TRIANGLES ||
+             vk_topology_to_mesa(state->ia->primitive_topology) ==
+                MESA_PRIM_TRIANGLE_STRIP ||
+             vk_topology_to_mesa(state->ia->primitive_topology) ==
+                MESA_PRIM_TRIANGLE_FAN;
+   case MESA_SHADER_TESS_EVAL:
+      return nir->info.next_stage != MESA_SHADER_GEOMETRY &&
+             !nir->info.tess.point_mode &&
+             nir->info.tess._primitive_mode != TESS_PRIMITIVE_ISOLINES;
+   case MESA_SHADER_GEOMETRY:
+      return nir->info.gs.output_primitive == MESA_PRIM_TRIANGLE_STRIP &&
+             nir->info.gs.active_stream_mask == 0x1;
+   default:
+      return false;
+   }
+}
+
+static bool
+gather_passthrough_output(nir_builder *b, nir_intrinsic_instr *intr,
+                          void *data)
+{
+   struct poly_passthrough_gs_key *key = data;
+
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       !nir_src_is_const(intr->src[1]))
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   unsigned location = sem.location + nir_src_as_uint(intr->src[1]);
+   if (location >= 64)
+      return false;
+
+   unsigned components =
+      nir_intrinsic_component(intr) + intr->src[0].ssa->num_components;
+   key->outputs |= BITFIELD64_BIT(location);
+   key->output_types[location] = nir_intrinsic_src_type(intr);
+   key->output_components[location] =
+      MAX2(key->output_components[location], components);
+   return false;
+}
+
+static bool
+store_point_primitive_id(nir_builder *b, nir_intrinsic_instr *intr,
+                         UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_emit_vertex)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_store_output(b, nir_load_primitive_id(b), nir_imm_int(b, 0),
+                    .src_type = nir_type_uint32,
+                    .io_semantics.location = VARYING_SLOT_PRIMITIVE_ID,
+                    .io_semantics.num_slots = 1);
+   return true;
+}
+
+static nir_shader *
+kk_point_passthrough_gs(nir_shader *src)
+{
+   size_t key_size = poly_passthrough_gs_key_size(0);
+   struct poly_passthrough_gs_key *key = calloc(1, key_size);
+   if (!key)
+      return NULL;
+
+   key->prim = MESA_PRIM_TRIANGLES;
+   key->clip_distance_array_size = src->info.clip_distance_array_size;
+   key->cull_distance_array_size = src->info.cull_distance_array_size;
+   nir_shader_intrinsics_pass(src, gather_passthrough_output, nir_metadata_all,
+                              key);
+
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY,
+                                                  &kk_nir_options, "kk_point");
+   poly_nir_passthrough_gs(&b, key);
+   free(key);
+
+   nir_shader *gs = b.shader;
+   gs->info.io_lowered = true;
+   if (!(gs->info.outputs_written & VARYING_BIT_PRIMITIVE_ID)) {
+      nir_shader_intrinsics_pass(gs, store_point_primitive_id,
+                                 nir_metadata_control_flow, NULL);
+   }
+   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   return gs;
+}
+
+static uint8_t kk_partition_gs_primitive_id(nir_shader *gs);
+
+/* Consumes nir */
+static nir_shader *
+kk_compile_point_emu(struct kk_physical_device *pdev, struct kk_shader *shader,
+                     nir_shader *nir,
+                     const struct vk_pipeline_robustness_state *robustness,
+                     const struct vk_graphics_pipeline_state *state)
+{
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      kk_lower_vs_vbo(nir, state, robustness);
+      NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL,
+               NULL);
+   } else {
+      NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
+      NIR_PASS(_, nir, poly_nir_lower_tes, false);
+   }
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   nir_shader *gs = kk_point_passthrough_gs(nir);
+   if (!gs) {
+      ralloc_free(nir);
+      return NULL;
+   }
+
+   shader->point.emu_outputs = nir->info.outputs_written;
+   NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
+   if (nir->info.stage == MESA_SHADER_VERTEX)
+      NIR_PASS(_, nir, kk_nir_lower_vertex_id_zero_base);
+   bool vs = nir->info.stage == MESA_SHADER_VERTEX;
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+   nir->xfb_info = NULL;
+   if (vs)
+      NIR_PASS(_, nir, poly_nir_lower_sw_vs);
+
+   kk_compile_msl(pdev, nir, NULL, true, &shader->point_emu, NULL);
+   shader->point.has_emu = true;
+   return gs;
+}
+
+/* Consumes nir */
+static void
+kk_compile_point_variant(struct kk_device *dev, struct kk_shader *shader,
+                         nir_shader *nir,
+                         const struct vk_pipeline_robustness_state *robustness,
+                         const struct vk_graphics_pipeline_state *state)
+{
+   struct kk_physical_device *pdev = kk_device_physical(dev);
+   bool from_gs = nir->info.stage == MESA_SHADER_GEOMETRY;
+
+   nir_shader *gs = from_gs ? nir
+                            : kk_compile_point_emu(pdev, shader, nir,
+                                                   robustness, state);
+   if (!gs || !kk_nir_lower_gs_polygon_point(gs)) {
+      ralloc_free(gs);
+      return;
+   }
+
+   NIR_PASS(_, gs, kk_nir_lower_descriptors, robustness, 0, NULL);
+   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   shader->point.gs_needs_main = gs->info.writes_memory || gs->xfb_info;
+   if (!from_gs)
+      shader->point.rast_primitive_id_slot = kk_partition_gs_primitive_id(gs);
+   shader->point.rast_num_cull_distances = gs->info.cull_distance_array_size;
+
+   nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+   NIR_PASS(_, gs, poly_nir_lower_gs, &count, &rast, &pre_gs,
+            &shader->point.gs, true);
+   ralloc_free(count);
+   ralloc_free(pre_gs);
+
+   NIR_PASS(_, rast, nir_lower_global_vars_to_local);
+   kk_lower_hw_vs(rast, state, false, from_gs);
+   msl_nir_lower_clip_cull_distance(rast, 0);
+   NIR_PASS(_, rast, kk_nir_lower_descriptors, robustness, 0, NULL);
+   kk_compile_msl(pdev, rast, state, true, &shader->point_rast,
+                  &shader->point.rast_outputs_written);
+
+   gs->info.stage = MESA_SHADER_COMPUTE;
+   memset(&gs->info.cs, 0, sizeof(gs->info.cs));
+   gs->xfb_info = NULL;
+   kk_compile_msl(pdev, gs, state, true, &shader->point_gs_main, NULL);
+
+   shader->info.point_variant = true;
+}
+
+static VkResult
+kk_upload_gs_indices(struct kk_device *dev, struct kk_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_GEOMETRY ||
+       shader->info.gs.shape != POLY_GS_SHAPE_STATIC_INDEXED ||
+       shader->gs_indices)
+      return VK_SUCCESS;
+
+   uint32_t count = shader->info.gs.max_indices;
+   if (count == 0 || count > ARRAY_SIZE(shader->info.gs.topology))
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+
+   VkResult result = kk_alloc_bo(dev, &shader->vk.base,
+                                 count * sizeof(uint16_t), 4,
+                                 &shader->gs_indices);
+   if (result != VK_SUCCESS)
+      return result;
+
+   uint16_t *indices = shader->gs_indices->cpu;
+   for (uint32_t i = 0; i < count; ++i) {
+      uint8_t index = shader->info.gs.topology[i];
+      indices[i] = index == UINT8_MAX ? UINT16_MAX : index;
+   }
+
+   return VK_SUCCESS;
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage, bool partition,
@@ -1364,6 +1622,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
    mtx_init(&shader->variants_lock, mtx_plain);
    shader->info.partial = partition;
    gather_shader_info(shader, nir, state);
+
+   nir_shader *point_nir = NULL;
+   if (kk_wants_point_variant(nir, state, partition))
+      point_nir = nir_shader_clone(NULL, nir);
    shader->info.rast_num_cull_distances = shader->info.num_cull_distances;
 
    if (partition && stage == MESA_SHADER_FRAGMENT) {
@@ -1453,6 +1715,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       }
    } else if (stage == MESA_SHADER_GEOMETRY) {
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      shader->info.gs_needs_main = nir->info.writes_memory || nir->xfb_info;
       /* Keeps work that only feeds side effects out of the rasterization VS,
        * where the GPU watchdog resets long vertex work */
       NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
@@ -1467,7 +1731,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
        * localize them so msl_optimize_nir turns them into SSA */
       NIR_PASS(_, rast, nir_lower_global_vars_to_local);
 
-      kk_lower_hw_vs(rast, state, shader->info.gs.mode == MESA_PRIM_POINTS);
+      kk_lower_hw_vs(rast, state, shader->info.gs.mode == MESA_PRIM_POINTS,
+                     true);
       msl_nir_lower_clip_cull_distance(rast, 0);
       /* Descriptors were lowered with the GS, this lowers the system values
        * the hardware vertex lowering added */
@@ -1499,6 +1764,15 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   stage == MESA_SHADER_GEOMETRY ? &shader->gs_main
                                                 : &shader->msl_data[stage],
                   rast ? &shader->info.rast_outputs_written : NULL);
+
+   if (point_nir)
+      kk_compile_point_variant(dev, shader, point_nir, robustness, state);
+
+   result = kk_upload_gs_indices(dev, shader);
+   if (result != VK_SUCCESS) {
+      kk_shader_destroy(&dev->vk, shader, pAllocator);
+      return result;
+   }
 
    *shader_out = shader;
 
@@ -2075,6 +2349,9 @@ kk_shader_variant_identity(struct kk_shader *shader, blake3_hash output)
          kk_identity_msl(&hash, &shader->gs_main);
          kk_identity_msl(&hash, &shader->msl_points);
          kk_identity_msl(&hash, &shader->msl_emu);
+         kk_identity_msl(&hash, &shader->point_emu);
+         kk_identity_msl(&hash, &shader->point_gs_main);
+         kk_identity_msl(&hash, &shader->point_rast);
          const struct kk_shader_info *info = &shader->info;
          kk_identity_scalar(&hash, info->stage);
          kk_identity_scalar(&hash, info->uses_per_draw_data);
@@ -2086,6 +2363,7 @@ kk_shader_variant_identity(struct kk_shader *shader, blake3_hash output)
          kk_identity_scalar(&hash, info->rast_num_cull_distances);
          kk_identity_scalar(&hash, info->rast_primitive_id_slot);
          kk_identity_scalar(&hash, info->rast_point_variant);
+         kk_identity_scalar(&hash, info->point_variant);
          kk_identity_scalar(&hash, info->rast_outputs_written);
          switch (info->stage) {
          case MESA_SHADER_FRAGMENT:
@@ -2097,6 +2375,7 @@ kk_shader_variant_identity(struct kk_shader *shader, blake3_hash output)
             kk_identity_scalar(&hash, info->fs.reads_primitive_id);
             kk_identity_scalar(&hash, info->fs.color_outputs);
             kk_identity_scalar(&hash, info->fs.inputs_read);
+            kk_identity_scalar(&hash, info->fs.flat_inputs);
             for (unsigned i = 0; i < MAX_DRAW_BUFFERS; i++)
                kk_identity_scalar(&hash, info->fs.output_base_type[i]);
             break;
@@ -2152,6 +2431,7 @@ kk_shader_variant_identity(struct kk_shader *shader, blake3_hash output)
             kk_identity_scalar(&hash, info->gs.prefix_sum);
             kk_identity_scalar(&hash, info->gs.multistream);
             kk_identity_scalar(&hash, info->gs.shape);
+            kk_identity_scalar(&hash, info->gs_needs_main);
             break;
          case MESA_SHADER_COMPUTE:
             kk_identity_scalar(&hash, info->cs.local_size.x);
@@ -2469,6 +2749,9 @@ kk_so_init(struct kk_device *dev, struct kk_shader *shader)
       return kk_compile_compute_pipeline(
          dev, data, shader->info.tess.tcs_output_patch_size, &shader->so_cs);
    case MESA_SHADER_GEOMETRY:
+      result = kk_upload_gs_indices(dev, shader);
+      if (result != VK_SUCCESS)
+         return result;
       result = kk_compile_compute_pipeline(dev, &shader->gs_main,
                                            KK_POLY_WG_SIZE, &shader->so_cs);
       if (result != VK_SUCCESS)
@@ -2483,6 +2766,79 @@ kk_so_init(struct kk_device *dev, struct kk_shader *shader)
    default:
       UNREACHABLE("Unsupported shader object stage");
    }
+}
+
+static struct kk_shader *
+kk_create_point_gs(struct kk_device *dev, struct kk_shader *owner)
+{
+   struct kk_shader *gs = vk_shader_zalloc(
+      &dev->vk, &kk_shader_ops, MESA_SHADER_GEOMETRY, NULL, sizeof(*gs));
+   if (gs == NULL)
+      return NULL;
+
+   mtx_init(&gs->variants_lock, mtx_plain);
+   gs->info.stage = MESA_SHADER_GEOMETRY;
+   gs->info.partial = true;
+   gs->info.shader_object = true;
+   gs->info.uses_per_draw_data = true;
+   gs->info.gs = owner->point.gs;
+   gs->info.gs_needs_main = owner->point.gs_needs_main;
+   gs->info.num_cull_distances = owner->point.rast_num_cull_distances;
+   gs->info.rast_num_cull_distances = owner->point.rast_num_cull_distances;
+   gs->info.rast_outputs_written = owner->point.rast_outputs_written;
+   gs->info.rast_primitive_id_slot =
+      owner->info.stage == MESA_SHADER_GEOMETRY
+         ? owner->info.rast_primitive_id_slot
+         : owner->point.rast_primitive_id_slot;
+   kk_msl_copy(&gs->gs_main, &owner->point_gs_main);
+   kk_msl_copy(&gs->msl_data[MESA_SHADER_GEOMETRY], &owner->point_rast);
+
+   int64_t start = os_time_get_nano();
+   VkResult result = kk_so_init(dev, gs);
+   kk_log_compile(dev, "point_gs", start);
+   if (result != VK_SUCCESS) {
+      kk_shader_destroy(&dev->vk, gs, NULL);
+      return NULL;
+   }
+
+   return gs;
+}
+
+struct kk_shader *
+kk_shader_get_point_gs(struct kk_device *dev, struct kk_shader *shader)
+{
+   if (!shader->info.point_variant)
+      return NULL;
+
+   mtx_lock(&shader->variants_lock);
+   if (shader->point_gs == NULL && !shader->point_failed) {
+      shader->point_gs = kk_create_point_gs(dev, shader);
+      shader->point_failed = shader->point_gs == NULL;
+   }
+   struct kk_shader *gs = shader->point_gs;
+   mtx_unlock(&shader->variants_lock);
+
+   return gs;
+}
+
+mtl_compute_pipeline_state *
+kk_shader_get_point_cs(struct kk_device *dev, struct kk_shader *shader)
+{
+   if (!shader->info.point_variant || !shader->point.has_emu)
+      return NULL;
+
+   mtx_lock(&shader->variants_lock);
+   if (shader->point_cs == NULL && !shader->point_failed) {
+      int64_t start = os_time_get_nano();
+      VkResult result = kk_compile_compute_pipeline(
+         dev, &shader->point_emu, KK_POLY_WG_SIZE, &shader->point_cs);
+      kk_log_compile(dev, "point_emu", start);
+      shader->point_failed = result != VK_SUCCESS;
+   }
+   mtl_compute_pipeline_state *cs = shader->point_cs;
+   mtx_unlock(&shader->variants_lock);
+
+   return cs;
 }
 
 static VkResult
@@ -2646,7 +3002,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                              MESA_SHADER_GEOMETRY;
 
    if ((KK_DEBUG(PARTITION) || has_gs_producer ||
-        (state && kk_state_needs_link(state))) &&
+        (state && kk_state_needs_link(state)) ||
+        kk_state_may_draw_points(state)) &&
        state && has_fs && shader_count > 1u) {
       result = kk_compile_shaders(device, shader_count - 1u, infos, state,
                                   enabled_features, pAllocator, shaders_out);
@@ -2835,6 +3192,14 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
    if (shader->info.so_hw && shader->info.so_emu)
       kk_msl_serialize(&shader->msl_emu, blob);
 
+   if (shader->info.point_variant) {
+      blob_write_bytes(blob, &shader->point, sizeof(shader->point));
+      if (shader->point.has_emu)
+         kk_msl_serialize(&shader->point_emu, blob);
+      kk_msl_serialize(&shader->point_gs_main, blob);
+      kk_msl_serialize(&shader->point_rast, blob);
+   }
+
    if (shader->info.partial && shader->info.stage == MESA_SHADER_FRAGMENT) {
       blob_write_uint64(blob, shader->nir_blob_size);
       blob_write_bytes(blob, shader->nir_blob, shader->nir_blob_size);
@@ -2944,6 +3309,29 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
          goto fail;
    }
 
+   if (info.point_variant) {
+      blob_copy_bytes(blob, &shader->point, sizeof(shader->point));
+      if (blob->overrun || !info.partial ||
+          (info.stage != MESA_SHADER_VERTEX &&
+           info.stage != MESA_SHADER_TESS_EVAL &&
+           info.stage != MESA_SHADER_GEOMETRY) ||
+          shader->point.has_emu != (info.stage != MESA_SHADER_GEOMETRY)) {
+         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         goto fail;
+      }
+      if (shader->point.has_emu) {
+         result = kk_msl_deserialize(blob, &shader->point_emu);
+         if (result != VK_SUCCESS)
+            goto fail;
+      }
+      result = kk_msl_deserialize(blob, &shader->point_gs_main);
+      if (result != VK_SUCCESS)
+         goto fail;
+      result = kk_msl_deserialize(blob, &shader->point_rast);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
+
    if (info.partial && info.stage == MESA_SHADER_FRAGMENT) {
       const uint64_t size = blob_read_uint64(blob);
       const size_t remaining = blob->end - blob->current;
@@ -2960,6 +3348,10 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
       shader->nir_blob_size = size;
       blob_copy_bytes(blob, shader->nir_blob, size);
    }
+
+   result = kk_upload_gs_indices(dev, shader);
+   if (result != VK_SUCCESS)
+      goto fail;
 
    if (info.stage == MESA_SHADER_COMPUTE) {
       uint32_t local_size_threads = shader->info.cs.local_size.x *

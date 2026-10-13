@@ -835,10 +835,13 @@ kk_link_rast_shader(const struct kk_link_state *ls)
    struct kk_shader *vs = ls->shaders[MESA_SHADER_VERTEX];
    if (!vs)
       return NULL;
+
+   struct kk_shader *gs = ls->shaders[MESA_SHADER_GEOMETRY];
+   if (gs && gs->info.shader_object)
+      return gs;
    if (!vs->info.shader_object)
       return vs;
 
-   struct kk_shader *gs = ls->shaders[MESA_SHADER_GEOMETRY];
    struct kk_shader *tes = ls->shaders[MESA_SHADER_TESS_EVAL];
    if (gs)
       return gs;

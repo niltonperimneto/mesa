@@ -965,6 +965,7 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
    count = MAX2(dyn->vp.viewport_count, 1);
 
    struct mtl_viewport viewports[KK_MAX_VIEWPORTS] = {0};
+   struct kk_descriptor_state *desc = &cmd->state.gfx.descriptors;
 
    /* NDC in Metal is pointing downwards. Vulkan is pointing upwards. Account
     * for that here */
@@ -975,6 +976,11 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
       viewports[i].originY = vp->y + vp->height;
       viewports[i].width = vp->width;
       viewports[i].height = -vp->height;
+
+      desc->root.draw.viewport_inv_size[i * 2u] =
+         vp->width != 0.0f ? 1.0f / fabsf(vp->width) : 0.0f;
+      desc->root.draw.viewport_inv_size[i * 2u + 1u] =
+         vp->height != 0.0f ? 1.0f / fabsf(vp->height) : 0.0f;
 
       if (dyn->rs.depth_clamp_enable ||
           vk_rasterization_state_depth_clip_enable(&dyn->rs)) {
@@ -990,6 +996,7 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
    }
 
    mtl_set_viewports(encoder, viewports, count);
+   desc->root_dirty = true;
 }
 
 static inline uint32_t
@@ -1158,6 +1165,49 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
 }
 
 static bool
+kk_update_point_pre_render(struct kk_cmd_buffer *cmd)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   struct kk_shader *tcs = cmd->state.shaders[MESA_SHADER_TESS_CTRL];
+   struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+   struct kk_shader *source = gfx->point.source;
+
+   uint32_t count = 0u;
+   if (source == vs) {
+      gfx->pre_render[count++] = kk_shader_get_point_cs(dev, vs);
+   } else if (vs->info.shader_object) {
+      gfx->pre_render[count++] = vs->so_cs;
+      if (tcs)
+         gfx->pre_render[count++] = tcs->so_cs;
+      if (tes)
+         gfx->pre_render[count++] =
+            source == tes ? kk_shader_get_point_cs(dev, tes) : tes->so_cs;
+   } else {
+      uint32_t keep = vs->pipeline.gfx.pre_render_count;
+      if (source != tes)
+         keep--;
+      for (uint32_t i = 0u; i < keep; ++i)
+         gfx->pre_render[count++] = vs->pipeline.gfx.pre_render[i];
+      if (source == tes)
+         gfx->pre_render[count++] = kk_shader_get_point_cs(dev, tes);
+   }
+   gfx->pre_render[count++] = gfx->point.gs->so_cs;
+   gfx->pre_render_count = count;
+
+   if (!tcs != !tes)
+      return false;
+
+   for (uint32_t i = 0u; i < count; ++i) {
+      if (gfx->pre_render[i] == NULL)
+         return false;
+   }
+
+   return true;
+}
+
+static bool
 kk_update_pre_render(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
@@ -1165,6 +1215,9 @@ kk_update_pre_render(struct kk_cmd_buffer *cmd)
    struct kk_shader *tcs = cmd->state.shaders[MESA_SHADER_TESS_CTRL];
    struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
    struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+
+   if (gfx->point.gs)
+      return kk_update_point_pre_render(cmd);
 
    if (!vs->info.shader_object) {
       gfx->pre_render_count = vs->pipeline.gfx.pre_render_count;
@@ -1384,6 +1437,28 @@ struct kk_draw_data {
 };
 
 static uint64_t
+kk_vs_outputs(struct kk_cmd_buffer *cmd)
+{
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   if (cmd->state.gfx.point.source == vs)
+      return vs->point.emu_outputs;
+
+   return vs->info.vs.outputs_written;
+}
+
+static uint64_t
+kk_gs_input_outputs(struct kk_cmd_buffer *cmd)
+{
+   struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+   if (!tes)
+      return kk_vs_outputs(cmd);
+   if (cmd->state.gfx.point.source == tes)
+      return tes->point.emu_outputs;
+
+   return tes->info.tess.tes_outputs;
+}
+
+static uint64_t
 kk_upload_vertex_params(struct kk_cmd_buffer *cmd,
                         const struct kk_draw_data *data)
 {
@@ -1406,13 +1481,11 @@ kk_upload_vertex_params(struct kk_cmd_buffer *cmd,
          data->index.gpu.range / data->index.el_size_B;
    }
 
-   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
-   params.outputs = vs->info.vs.outputs_written;
+   params.outputs = kk_vs_outputs(cmd);
 
    if (!indirect) {
       uint32_t verts = data->grid.size.x, instances = data->grid.size.y;
-      unsigned vb_size =
-         poly_tcs_in_size(verts * instances, vs->info.vs.outputs_written);
+      unsigned vb_size = poly_tcs_in_size(verts * instances, params.outputs);
 
       /* Allocate if there are any outputs, or use the null sink to trap
        * reads if there aren't. Those reads are undefined but should not
@@ -1545,6 +1618,10 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
    struct poly_geometry_params params;
    poly_geometry_params_init(&params, mode, wg_size);
 
+   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   if (gfx->point.gs && fs)
+      params.flat_outputs = fs->info.fs.flat_inputs;
+
    if (indirect) {
       /* The indirect setup kernel writes the draw and allocates from the
        * heap, including the index buffer */
@@ -1566,15 +1643,9 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
    }
 
    if (shape == POLY_GS_SHAPE_STATIC_INDEXED) {
-      /* Metal has no 8-bit indices and restarts 16-bit ones at 0xFFFF */
-      uint16_t indices[ARRAY_SIZE(gs->info.gs.topology)];
-      for (uint32_t i = 0u; i < max_indices; ++i) {
-         uint8_t index = gs->info.gs.topology[i];
-         indices[i] = index == UINT8_MAX ? UINT16_MAX : index;
-      }
-
+      assert(gs->gs_indices != NULL);
       uint32_t size_B = max_indices * sizeof(uint16_t);
-      gfx->gs.index.addr = kk_pool_upload(cmd, indices, size_B, 4).gpu;
+      gfx->gs.index.addr = gs->gs_indices->gpu;
       gfx->gs.index.range = size_B;
    }
 
@@ -1624,14 +1695,15 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
       }
    }
 
-   /* Metal only has filled and wireframe triangles. Point mode has no
-    * equivalent and is drawn as wireframe too, which is why the non-solid
-    * fill modes are a partial implementation. Emulated geometry and
-    * tessellation rasterize already expanded triangles, so the mode applies
-    * to the primitives the rasterizer sees, as Vulkan specifies. */
+   /* Metal only supports filled and wireframe triangles natively. Point
+    * mode is lowered to point primitives via geometry shader emulation and
+    * rasterizes as filled points. Line mode uses wireframe. Emulated
+    * geometry and tessellation stages rasterize already expanded primitives,
+    * so the mode applies to the primitives the rasterizer sees, as Vulkan
+    * specifies. */
    if (IS_DIRTY(RS_POLYGON_MODE)) {
       enum mtl_triangle_fill_mode mode =
-         dyn->rs.polygon_mode == VK_POLYGON_MODE_FILL
+         dyn->rs.polygon_mode == VK_POLYGON_MODE_FILL || gfx->point.gs
             ? MTL_TRIANGLE_FILL_MODE_FILL
             : MTL_TRIANGLE_FILL_MODE_LINES;
       mtl_set_triangle_fill_mode(enc, mode);
@@ -1651,9 +1723,11 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    }
 
    if (IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(TS_DOMAIN_ORIGIN) ||
-       IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL)) {
+       IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL) ||
+       IS_SHADER_DIRTY(GEOMETRY)) {
       bool front_face_ccw = dyn->rs.front_face != VK_FRONT_FACE_CLOCKWISE;
-      if (cmd->state.shaders[MESA_SHADER_TESS_EVAL]) {
+      if (cmd->state.shaders[MESA_SHADER_TESS_EVAL] &&
+          !cmd->state.shaders[MESA_SHADER_GEOMETRY]) {
          front_face_ccw ^= gfx->tess.info.ccw;
          front_face_ccw ^=
             dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
@@ -2512,8 +2586,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
          .vp = vertex_params,
          .p = geometry_params,
          .heap = kk_heap(cmd),
-         .vs_outputs =
-            tes ? tes->info.tess.tes_outputs : vs->info.vs.outputs_written,
+         .vs_outputs = kk_gs_input_outputs(cmd),
          .prim = mode,
          .max_indices = gs->info.gs.max_indices,
          .shape = shape,
@@ -2552,11 +2625,14 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
       enc, gfx->pre_render[pre_render_count - 2u]);
    kk_dispatch_compute(enc, grid_vs, local_size);
 
-   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
-                                    MTL_STAGE_DISPATCH);
-   mtl_compute_set_pipeline_state(
-      enc, gfx->pre_render[pre_render_count - 1u]);
-   kk_dispatch_compute(enc, grid_gs, local_size);
+   if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED ||
+       gs->info.gs_needs_main || gs->info.gs.xfb) {
+      mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                       MTL_STAGE_DISPATCH);
+      mtl_compute_set_pipeline_state(
+         enc, gfx->pre_render[pre_render_count - 1u]);
+      kk_dispatch_compute(enc, grid_gs, local_size);
+   }
 
    struct kk_draw_data rast = {
       .primitive_type = mesa_prim_to_mtl_primitive_type(gs->info.gs.mode),
@@ -2668,8 +2744,90 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    return draw;
 }
 
+static struct kk_shader *
+kk_point_source(struct kk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   struct kk_shader *tcs = cmd->state.shaders[MESA_SHADER_TESS_CTRL];
+   struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+
+   if (dyn->rs.polygon_mode != VK_POLYGON_MODE_POINT ||
+       dyn->rs.rasterizer_discard_enable || !vs)
+      return NULL;
+
+   if (gs)
+      return gs;
+
+   if (tes) {
+      struct kk_tess_info info = tes->info.tess.info;
+      if (tcs)
+         info = kk_tess_info_merge(info, tcs->info.tess.info);
+      if (info.points || info.mode == TESS_PRIMITIVE_ISOLINES)
+         return NULL;
+      return tes;
+   }
+
+   switch (vk_topology_to_mesa(dyn->ia.primitive_topology)) {
+   case MESA_PRIM_TRIANGLES:
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_FAN:
+      return vs;
+   default:
+      return NULL;
+   }
+}
+
+static void
+kk_update_point_state(struct kk_cmd_buffer *cmd)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   struct kk_shader *source = kk_point_source(cmd);
+   struct kk_shader *gs = NULL;
+   if (source && source->info.point_variant &&
+       (!source->point.has_emu || kk_shader_get_point_cs(dev, source)))
+      gs = kk_shader_get_point_gs(dev, source);
+   if (!gs)
+      source = NULL;
+
+   if (gs == gfx->point.gs && source == gfx->point.source)
+      return;
+
+   gfx->point.gs = gs;
+   gfx->point.source = source;
+   cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_GEOMETRY);
+   gfx->dirty |= KK_DIRTY_PSO;
+   BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_POLYGON_MODE);
+}
+
+static void kk_draw_shaders(struct kk_cmd_buffer *cmd,
+                            struct kk_draw_command *data);
+
 static void
 kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+{
+   kk_update_point_state(cmd);
+
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   if (!gfx->point.gs) {
+      kk_draw_shaders(cmd, data);
+      return;
+   }
+
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   cmd->state.shaders[MESA_SHADER_GEOMETRY] = gfx->point.gs;
+   data->upload_mask = build_per_draw_upload_mask(cmd);
+   kk_draw_shaders(cmd, data);
+   cmd->state.shaders[MESA_SHADER_GEOMETRY] = gs;
+}
+
+static void
+kk_draw_shaders(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
@@ -2715,7 +2873,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
          draw_data = kk_launch_tess(cmd, draw_data);
       if (geom)
          draw_data = kk_launch_gs_prerast(cmd, data, draw_data, gs_restart);
-      if (geom && requires_unroll_flatshade(cmd, data))
+      if (geom && !cmd->state.gfx.point.gs &&
+          requires_unroll_flatshade(cmd, data))
          draw_data = kk_unroll_gs_outputs(cmd, draw_data);
 
       /* TODO_KOSMICKRISP Remove this once unroll, tess and any compute does not

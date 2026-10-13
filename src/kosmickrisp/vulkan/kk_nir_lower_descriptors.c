@@ -449,6 +449,18 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
       return true;
    }
 
+   case nir_intrinsic_load_viewport_inv_size_kk: {
+      unsigned offset = kk_root_descriptor_offset(draw.viewport_inv_size);
+      assert((offset & 3) == 0 && "aligned");
+      b->cursor = nir_instr_remove(&intrin->instr);
+      nir_def *vp_offset =
+         nir_imul_imm(b, intrin->src[0].ssa, sizeof(float) * 2u);
+      nir_def *root_offset = nir_iadd_imm(b, vp_offset, offset);
+      nir_def *val = load_root(b, 2, 32, root_offset, 4);
+      nir_def_rewrite_uses(&intrin->def, val);
+      return true;
+   }
+
    case nir_intrinsic_load_push_constant:
       return lower_load_push_constant(b, intrin, ctx);
 

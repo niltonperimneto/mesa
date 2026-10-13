@@ -45,6 +45,7 @@ struct kk_root_descriptor_table {
          uint32_t sample_mask;
 
          float viewport_z_range[KK_MAX_VIEWPORTS * 2];
+         float viewport_inv_size[KK_MAX_VIEWPORTS * 2];
          bool emulate_depth_clamp;
          bool emulate_viewport_z;
       } draw;
@@ -66,7 +67,7 @@ struct kk_root_descriptor_table {
    uint8_t set_dynamic_buffer_start[KK_MAX_SETS];
 };
 
-static_assert(sizeof(struct kk_root_descriptor_table) == 2632,
+static_assert(sizeof(struct kk_root_descriptor_table) == 2760,
               "kk_root_descriptor_table layout is shared with shaders");
 
 struct kk_descriptor_state {
@@ -208,6 +209,11 @@ struct kk_graphics_state {
       uint32_t index_count;
       uint32_t instance_count;
    } gs;
+
+   struct {
+      struct kk_shader *gs;
+      struct kk_shader *source;
+   } point;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;
