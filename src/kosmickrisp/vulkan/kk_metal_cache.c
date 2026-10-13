@@ -296,7 +296,7 @@ kk_metal_flush_due_locked(struct kk_metal_cache *cache, int64_t now)
    return now - cache->oldest_pending_ns >= cache->max_age_ns;
 }
 
-static void kk_metal_recapture_locked(struct kk_metal_cache *cache);
+static void kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain);
 
 static int
 kk_metal_worker(void *arg)
@@ -304,7 +304,8 @@ kk_metal_worker(void *arg)
    struct kk_metal_cache *cache = arg;
    mtx_lock(&cache->mutex);
    while (!cache->stopping) {
-      if (cache->flush_requested == cache->flush_completed) {
+      if (cache->flush_requested == cache->flush_completed &&
+          !cache->recapture) {
          struct timespec deadline;
          clock_gettime(CLOCK_REALTIME, &deadline);
          deadline.tv_nsec += KK_METAL_POLL_NS;
@@ -316,16 +317,17 @@ kk_metal_worker(void *arg)
       }
       if (cache->stopping)
          break;
-      if (!kk_metal_flush_due_locked(cache, os_time_get_nano()))
-         continue;
-      uint64_t requested = cache->flush_requested;
-      kk_metal_flush_locked(cache);
-      cache->flush_completed = requested;
-      cnd_broadcast(&cache->cond);
-      kk_metal_recapture_locked(cache);
+      if (kk_metal_flush_due_locked(cache, os_time_get_nano())) {
+         uint64_t requested = cache->flush_requested;
+         kk_metal_flush_locked(cache);
+         cache->flush_completed = requested;
+         cnd_broadcast(&cache->cond);
+      }
+      kk_metal_recapture_locked(cache, false);
    }
    while (cache->active_operations)
       cnd_wait(&cache->cond, &cache->mutex);
+   kk_metal_recapture_locked(cache, true);
    kk_metal_flush_locked(cache);
    cache->worker_finished = true;
    cnd_broadcast(&cache->cond);
@@ -666,14 +668,16 @@ kk_metal_capture_locked(struct kk_metal_cache *cache,
 }
 
 static void
-kk_metal_recapture_locked(struct kk_metal_cache *cache)
+kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain)
 {
-   while (cache->recapture && !cache->stopping &&
-          cache->flush_requested == cache->flush_completed) {
+   while (cache->recapture &&
+          (drain || (!cache->stopping &&
+                     cache->flush_requested == cache->flush_completed))) {
       struct kk_metal_recapture *entry = cache->recapture;
       cache->recapture = entry->next;
       cache->recapture_count--;
       cache->captured_compiles++;
+      cache->last_compile_ns = os_time_get_nano();
       mtx_unlock(&cache->mutex);
       struct mtl_compile_phase phase =
          kk_metal_phase_begin(cache, "recapture", entry->key);
@@ -703,7 +707,7 @@ kk_metal_defer_recapture_locked(struct kk_metal_cache *cache,
                                 uint64_t max_threads)
 {
    struct kk_metal_recapture *entry =
-      cache->closing || cache->recapture_count >= KK_METAL_RECAPTURE_LIMIT ?
+      cache->recapture_count >= KK_METAL_RECAPTURE_LIMIT ?
          NULL : malloc(sizeof(*entry));
    if (!entry) {
       cache->dropped_recaptures++;
