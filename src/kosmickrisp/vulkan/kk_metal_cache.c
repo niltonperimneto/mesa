@@ -85,6 +85,13 @@ kk_metal_trace_event(const char *phase, const uint8_t key[CACHE_KEY_SIZE],
 #define KK_METAL_MAX_AGE_MS_DEFAULT 60000
 #define KK_METAL_MAX_PENDING_DEFAULT 32
 #define KK_METAL_RECAPTURE_LIMIT 256
+#define KK_METAL_REF_CAPACITY 4096
+
+struct kk_metal_ref {
+   cache_key key;
+   cache_key ref;
+   bool valid;
+};
 
 struct kk_metal_cache_key {
    cache_key key;
@@ -146,7 +153,50 @@ struct kk_metal_cache {
    struct kk_metal_loaded_archive *archive_head;
    struct kk_metal_loaded_archive *archive_tail;
    unsigned archive_count;
+   struct kk_metal_ref refs[KK_METAL_REF_CAPACITY];
 };
+
+static struct kk_metal_ref *
+kk_metal_ref_slot(struct kk_metal_cache *cache,
+                  const uint8_t key[CACHE_KEY_SIZE])
+{
+   uint32_t index;
+   memcpy(&index, key, sizeof(index));
+   return &cache->refs[index % KK_METAL_REF_CAPACITY];
+}
+
+static bool
+kk_metal_ref_get_locked(struct kk_metal_cache *cache,
+                        const uint8_t key[CACHE_KEY_SIZE], cache_key ref)
+{
+   struct kk_metal_ref *slot = kk_metal_ref_slot(cache, key);
+   if (!slot->valid || memcmp(slot->key, key, CACHE_KEY_SIZE))
+      return false;
+   memcpy(ref, slot->ref, CACHE_KEY_SIZE);
+   return true;
+}
+
+static void
+kk_metal_ref_set_locked(struct kk_metal_cache *cache,
+                        const uint8_t key[CACHE_KEY_SIZE],
+                        const uint8_t ref[CACHE_KEY_SIZE])
+{
+   struct kk_metal_ref *slot = kk_metal_ref_slot(cache, key);
+   memcpy(slot->key, key, CACHE_KEY_SIZE);
+   memcpy(slot->ref, ref, CACHE_KEY_SIZE);
+   slot->valid = true;
+}
+
+static void
+kk_metal_ref_drop_locked(struct kk_metal_cache *cache,
+                         const uint8_t key[CACHE_KEY_SIZE],
+                         const uint8_t ref[CACHE_KEY_SIZE])
+{
+   struct kk_metal_ref *slot = kk_metal_ref_slot(cache, key);
+   if (slot->valid && !memcmp(slot->key, key, CACHE_KEY_SIZE) &&
+       !memcmp(slot->ref, ref, CACHE_KEY_SIZE))
+      slot->valid = false;
+}
 
 static void
 kk_metal_reference_key(struct kk_metal_cache *cache,
@@ -269,6 +319,9 @@ kk_metal_flush_locked(struct kk_metal_cache *cache)
          cache_key reference;
          kk_metal_reference_key(cache, entry->key, reference);
          disk_cache_put(cache->disk, reference, blob, sizeof(blob), NULL);
+         mtx_lock(&cache->mutex);
+         kk_metal_ref_set_locked(cache, entry->key, blob);
+         mtx_unlock(&cache->mutex);
       }
       pending = entry->next;
       free(entry);
@@ -580,24 +633,33 @@ static mtl_archive *
 kk_metal_load(struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE])
 {
    int64_t lookup_start = kk_metal_trace_time();
-   cache_key reference;
-   kk_metal_reference_key(cache, key, reference);
-   size_t ref_size = 0;
-   void *ref = disk_cache_get(cache->disk, reference, &ref_size);
-   if (!ref || ref_size != CACHE_KEY_SIZE) {
-      kk_metal_trace_event("archive_lookup", key, lookup_start);
-      kk_metal_log_miss("ref_missing", key, lookup_start);
-      free(ref);
-      return NULL;
-   }
+   cache_key ref;
    mtx_lock(&cache->mutex);
-   mtl_archive *archive = kk_metal_find_archive_locked(cache, ref);
+   bool indexed = kk_metal_ref_get_locked(cache, key, ref);
+   mtl_archive *archive =
+      indexed ? kk_metal_find_archive_locked(cache, ref) : NULL;
    mtx_unlock(&cache->mutex);
-   kk_metal_trace_event("archive_lookup", key, lookup_start);
-   if (archive) {
-      free(ref);
-      return archive;
+   if (!indexed) {
+      cache_key reference;
+      kk_metal_reference_key(cache, key, reference);
+      size_t ref_size = 0;
+      void *stored = disk_cache_get(cache->disk, reference, &ref_size);
+      if (!stored || ref_size != CACHE_KEY_SIZE) {
+         kk_metal_trace_event("archive_lookup", key, lookup_start);
+         kk_metal_log_miss("ref_missing", key, lookup_start);
+         free(stored);
+         return NULL;
+      }
+      memcpy(ref, stored, CACHE_KEY_SIZE);
+      free(stored);
+      mtx_lock(&cache->mutex);
+      kk_metal_ref_set_locked(cache, key, ref);
+      archive = kk_metal_find_archive_locked(cache, ref);
+      mtx_unlock(&cache->mutex);
    }
+   kk_metal_trace_event("archive_lookup", key, lookup_start);
+   if (archive)
+      return archive;
    int64_t load_start = kk_metal_trace_time();
    size_t size = 0;
    void *data = disk_cache_get(cache->disk, ref, &size);
@@ -611,8 +673,12 @@ kk_metal_load(struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE])
       }
    }
    kk_metal_trace_event("archive_load", key, load_start);
-   if (!archive)
+   if (!archive) {
       kk_metal_log_miss(miss, key, load_start);
+      mtx_lock(&cache->mutex);
+      kk_metal_ref_drop_locked(cache, key, ref);
+      mtx_unlock(&cache->mutex);
+   }
    if (archive) {
       mtx_lock(&cache->mutex);
       mtl_archive *existing = kk_metal_find_archive_locked(cache, ref);
@@ -643,7 +709,6 @@ kk_metal_load(struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE])
       }
       mtx_unlock(&cache->mutex);
    }
-   free(ref);
    free(data);
    return archive;
 }
