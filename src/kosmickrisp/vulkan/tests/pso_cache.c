@@ -184,7 +184,7 @@ run_demand(void *data)
 {
    struct demand *d = data;
    kk_compile_origin = d->origin;
-   d->result = kk_recipe_get(d->dev, d->vs, d->fs, &d->recipe);
+   d->result = kk_recipe_get(d->dev, d->vs, d->fs, &d->recipe, NULL);
    return 0;
 }
 
@@ -293,14 +293,15 @@ test_recipe(bool fail)
       CHECK(entry->state == KK_ENTRY_FAILED && entry->failures == 1 &&
             entry->result == VK_ERROR_UNKNOWN && !entry->pso);
       kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
-      struct kk_pso_result skipped = kk_recipe_get(&dev, &vs, &fs, &d.recipe);
+      struct kk_pso_result skipped =
+         kk_recipe_get(&dev, &vs, &fs, &d.recipe, NULL);
       CHECK(skipped.status == VK_ERROR_UNKNOWN && !skipped.pso);
       CHECK(producer_calls() == 1);
       mtx_lock(&producer.lock);
       producer.fail = false;
       mtx_unlock(&producer.lock);
       kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
-      d.result = kk_recipe_get(&dev, &vs, &fs, &d.recipe);
+      d.result = kk_recipe_get(&dev, &vs, &fs, &d.recipe, NULL);
       CHECK(d.result.status == VK_SUCCESS && d.result.pso);
       CHECK(entry->state == KK_ENTRY_READY && entry->failures == 1);
       calls = 2;
@@ -310,7 +311,8 @@ test_recipe(bool fail)
    struct kk_variant_recipe other = d.recipe;
    other.family[0] = 1;
    kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
-   struct kk_pso_result reused = kk_recipe_get(&dev, &vs, &fs, &other);
+   struct kk_pso_result reused =
+      kk_recipe_get(&dev, &vs, &fs, &other, NULL);
    CHECK(reused.status == VK_SUCCESS && reused.pso == d.result.pso);
    struct kk_recipe_entry *retry =
       kk_recipe_lookup(&dev.pso_cache, &other, false);
@@ -358,7 +360,7 @@ test_wait_wakeups(void)
    CHECK(thrd_create(&thread, finish_after_wakes, &test) == thrd_success);
    bool compile = false;
    struct kk_pso_result result =
-      kk_pso_entry_get(&dev, &entry, &entry.key, &compile);
+      kk_pso_entry_get(&dev, &entry, &entry.key, true, &compile);
    CHECK(result.status == VK_SUCCESS && result.pso == (void *)&pipelines[0]);
    CHECK(thrd_join(thread, NULL) == thrd_success);
    CHECK(!compile && entry.state == KK_ENTRY_READY && test.wakes == 10);
@@ -457,6 +459,20 @@ test_queued_job(void)
    mtx_destroy(&queue_gate.lock);
 }
 
+struct child_demand {
+   struct kk_device *dev;
+   struct kk_pso_key key;
+   struct kk_pso_result result;
+};
+
+static int
+run_child(void *data)
+{
+   struct child_demand *d = data;
+   d->result = kk_pso_cache_get(d->dev, &d->key, NULL, NULL, NULL);
+   return 0;
+}
+
 static void
 test_lookup_only_miss(void)
 {
@@ -476,6 +492,79 @@ test_lookup_only_miss(void)
    CHECK(result.status == VK_NOT_READY && !result.pso);
    CHECK(producer_calls() == 0);
    CHECK(_mesa_hash_table_num_entries(dev.pso_cache.table) == 0);
+
+   reset_producer(0);
+   struct child_demand owner = { .dev = &dev, .key = key };
+   thrd_t thread;
+   CHECK(thrd_create(&thread, run_child, &owner) == thrd_success);
+   wait_for_producer();
+   start = os_time_get_nano();
+   result = kk_pso_cache_get(&dev, &key, NULL, NULL, &request);
+   CHECK(os_time_get_nano() - start < 10000000);
+   CHECK(result.status == VK_NOT_READY && !result.pso);
+   CHECK(!kk_pso_cache_acquire(&dev, &key, NULL, NULL, true));
+   CHECK(producer_calls() == 1);
+   release_producer();
+   CHECK(thrd_join(thread, NULL) == thrd_success);
+   CHECK(owner.result.status == VK_SUCCESS && owner.result.pso);
+   result = kk_pso_cache_get(&dev, &key, NULL, NULL, &request);
+   CHECK(result.status == VK_SUCCESS && result.pso == owner.result.pso);
+   kk_pso_cache_finish(&dev.pso_cache);
+}
+
+static void
+test_lookup_only_recipe(void)
+{
+   struct kk_device dev = {0};
+   struct kk_physical_device pdev = {0};
+   dev.vk.physical = &pdev.vk;
+   dev.vk.disable_internal_cache = true;
+   CHECK(kk_pso_cache_init(&dev.pso_cache));
+   struct kk_shader vs = {0}, fs = {0};
+   struct demand d = { .dev = &dev, .vs = &vs, .fs = &fs,
+                       .origin = KK_COMPILE_ORIGIN_DRAW };
+   kk_pso_key_init(&d.recipe.pso);
+   d.recipe.family[0] = 7;
+   const struct kk_pso_request lookup = { .lookup_only = true };
+   kk_compile_origin = KK_COMPILE_ORIGIN_CREATE;
+   struct kk_pso_result result =
+      kk_recipe_get(&dev, &vs, &fs, &d.recipe, &lookup);
+   CHECK(result.status == VK_NOT_READY && !result.pso);
+   CHECK(!kk_recipe_lookup(&dev.pso_cache, &d.recipe, false));
+
+   reset_producer(0);
+   thrd_t owner;
+   CHECK(thrd_create(&owner, run_demand, &d) == thrd_success);
+   wait_for_producer();
+   struct kk_recipe_entry *entry =
+      kk_recipe_lookup(&dev.pso_cache, &d.recipe, false);
+   CHECK(entry);
+   int64_t start = os_time_get_nano();
+   result = kk_recipe_get(&dev, &vs, &fs, &d.recipe, &lookup);
+   CHECK(os_time_get_nano() - start < 10000000);
+   CHECK(result.status == VK_NOT_READY && !result.pso);
+   mtx_lock(&dev.pso_cache.lock);
+   CHECK(entry->state == KK_ENTRY_COMPILING &&
+         dev.pso_cache.draw_demand == 1);
+   mtx_unlock(&dev.pso_cache.lock);
+   release_producer();
+   CHECK(thrd_join(owner, NULL) == thrd_success);
+   CHECK(d.result.status == VK_SUCCESS && d.result.pso);
+   result = kk_recipe_get(&dev, &vs, &fs, &d.recipe, &lookup);
+   CHECK(result.status == VK_SUCCESS && result.pso == d.result.pso);
+   CHECK(producer_calls() == 1);
+
+   struct kk_variant_recipe queued = d.recipe;
+   queued.family[0] = 8;
+   u_rwlock_wrlock(&dev.pso_cache.index_lock);
+   entry = kk_recipe_insert_locked(&dev.pso_cache, kk_recipe_hash(&queued),
+                                   &queued);
+   u_rwlock_wrunlock(&dev.pso_cache.index_lock);
+   entry->state = KK_ENTRY_QUEUED;
+   result = kk_recipe_get(&dev, &vs, &fs, &queued, &lookup);
+   CHECK(result.status == VK_NOT_READY && entry->state == KK_ENTRY_QUEUED);
+   CHECK(producer_calls() == 1);
+   kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
    kk_pso_cache_finish(&dev.pso_cache);
 }
 
@@ -858,20 +947,6 @@ test_shared_base(void)
    kk_pso_cache_finish(&dev.pso_cache);
 }
 
-struct child_demand {
-   struct kk_device *dev;
-   struct kk_pso_key key;
-   struct kk_pso_result result;
-};
-
-static int
-run_child(void *data)
-{
-   struct child_demand *d = data;
-   d->result = kk_pso_cache_get(d->dev, &d->key, NULL, NULL, NULL);
-   return 0;
-}
-
 static void
 test_concurrent_specialize(void)
 {
@@ -1169,6 +1244,7 @@ main(void)
    test_recipe(true);
    test_queued_job();
    test_lookup_only_miss();
+   test_lookup_only_recipe();
    test_concurrent_hits();
    test_normalized_recipes();
    test_link_waits_for_completion();

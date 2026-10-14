@@ -2471,6 +2471,11 @@ kk_shader_get_rast(struct kk_device *dev, struct kk_shader *vs, bool points)
    const struct kk_fs_variant *rast = &vs->fast_points;
    blake3_hash identity = {0};
    kk_variant_shader_key(dev, vs, &points, sizeof(points), identity);
+   if (p_atomic_read(&vs->fast_points.fn)) {
+      kk_variant_trace(dev, KK_VARIANT_READY_HIT, identity, sizeof(identity),
+                       0, 0);
+      return rast;
+   }
    if (dev->variant_trace_enabled &&
        mtx_trylock(&vs->variants_lock) != thrd_success) {
       int64_t wait_start = os_time_get_nano();
@@ -2482,9 +2487,9 @@ kk_shader_get_rast(struct kk_device *dev, struct kk_shader *vs, bool points)
    }
    if (vs->fast_points.fn == NULL) {
       int64_t start = os_time_get_nano();
-      VkResult result = kk_new_function(dev, &vs->msl_points,
-                                        &vs->fast_points.lib,
-                                        &vs->fast_points.fn);
+      mtl_library *lib = NULL;
+      mtl_function_descriptor *fn = NULL;
+      VkResult result = kk_new_function(dev, &vs->msl_points, &lib, &fn);
       kk_log_compile(dev, "rast_points", start);
       kk_variant_trace(dev, KK_VARIANT_RASTER_PREPARE, identity,
                        sizeof(identity), start, os_time_get_nano());
@@ -2492,6 +2497,8 @@ kk_shader_get_rast(struct kk_device *dev, struct kk_shader *vs, bool points)
          _mesa_blake3_compute(vs->msl_points.code,
                               strlen(vs->msl_points.code),
                               vs->fast_points.hash);
+         vs->fast_points.lib = lib;
+         p_atomic_set(&vs->fast_points.fn, fn);
       } else {
          rast = NULL;
       }
@@ -2509,10 +2516,7 @@ kk_shader_rast_ready(struct kk_shader *vs, bool points)
 {
    if (!points || !vs->info.rast_point_variant)
       return true;
-   mtx_lock(&vs->variants_lock);
-   bool ready = vs->fast_points.fn != NULL;
-   mtx_unlock(&vs->variants_lock);
-   return ready;
+   return p_atomic_read(&vs->fast_points.fn) != NULL;
 }
 
 static uint32_t

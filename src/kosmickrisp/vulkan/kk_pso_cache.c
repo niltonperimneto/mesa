@@ -472,9 +472,21 @@ kk_entry_retryable(enum kk_entry_state state, unsigned failures)
           kk_compile_origin != KK_COMPILE_ORIGIN_PREWARM;
 }
 
+static VkResult
+kk_entry_status(enum kk_entry_state state, unsigned failures, VkResult result,
+                bool lookup_only)
+{
+   if (state == KK_ENTRY_READY)
+      return VK_SUCCESS;
+   if (state == KK_ENTRY_FAILED &&
+       (!lookup_only || !kk_entry_retryable(state, failures)))
+      return result;
+   return VK_NOT_READY;
+}
+
 static struct kk_pso_result
 kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
-                 const struct kk_pso_key *key, bool *compile)
+                 const struct kk_pso_key *key, bool wait, bool *compile)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    if (kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM &&
@@ -486,6 +498,11 @@ kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
       int64_t start = 0;
       mtx_lock(&cache->lock);
       bool waited = entry->state == KK_ENTRY_COMPILING;
+      if (waited && !wait) {
+         mtx_unlock(&cache->lock);
+         kk_log_cache_pso(dev, "pso_in_flight", key, sizeof(*key));
+         return (struct kk_pso_result){ .status = VK_NOT_READY };
+      }
       if (waited) {
          kk_log_cache_pso(dev, "pso_wait", key, sizeof(*key));
          start = os_time_get_nano();
@@ -504,12 +521,8 @@ kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
          return (struct kk_pso_result){ .status = VK_SUCCESS };
       }
       pso = entry->pso;
-      if (entry->state == KK_ENTRY_READY)
-         status = VK_SUCCESS;
-      else if (!compile && kk_entry_retryable(entry->state, entry->failures))
-         status = VK_NOT_READY;
-      else
-         status = entry->result;
+      status = kk_entry_status(entry->state, entry->failures, entry->result,
+                               !wait);
       mtx_unlock(&cache->lock);
       if (waited) {
          kk_log_compile(dev, "pso_wait", start);
@@ -610,8 +623,8 @@ kk_pso_found(struct kk_device *dev, struct kk_pso_entry *entry,
              mtl_function_descriptor *fs, bool lookup_only)
 {
    bool compile = false;
-   struct kk_pso_result result =
-      kk_pso_entry_get(dev, entry, key, lookup_only ? NULL : &compile);
+   struct kk_pso_result result = kk_pso_entry_get(
+      dev, entry, key, !lookup_only, lookup_only ? NULL : &compile);
    if (compile)
       return kk_pso_entry_compile(dev, entry, key, vs, fs);
    return result;
@@ -1209,11 +1222,26 @@ kk_yield_to_draws(struct kk_pso_cache *cache)
    mtx_unlock(&cache->lock);
 }
 
+static void
+kk_recipe_restore_trace(bool trace_enabled, const blake3_hash parent,
+                        bool parent_valid, const blake3_hash family,
+                        bool family_valid)
+{
+   if (!trace_enabled)
+      return;
+   memcpy(kk_variant_parent_id, parent, sizeof(blake3_hash));
+   kk_variant_parent_valid = parent_valid;
+   memcpy(kk_variant_family_id, family, sizeof(blake3_hash));
+   kk_variant_family_valid = family_valid;
+}
+
 static struct kk_pso_result
 kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
-               struct kk_shader *fs, const struct kk_variant_recipe *recipe)
+               struct kk_shader *fs, const struct kk_variant_recipe *recipe,
+               const struct kk_pso_request *request)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
+   bool lookup_only = request && request->lookup_only;
    bool trace_enabled = dev->variant_log != NULL;
    blake3_hash previous, previous_family;
    bool previous_valid = false, previous_family_valid = false;
@@ -1228,34 +1256,37 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
              sizeof(kk_variant_family_id));
       kk_variant_family_valid = true;
    }
-   struct kk_recipe_entry *entry = kk_recipe_lookup(cache, recipe, true);
+   struct kk_recipe_entry *entry =
+      kk_recipe_lookup(cache, recipe, !lookup_only);
+   if (!entry && lookup_only) {
+      kk_recipe_restore_trace(trace_enabled, previous, previous_valid,
+                              previous_family, previous_family_valid);
+      return (struct kk_pso_result){ .status = VK_NOT_READY };
+   }
    if (!entry && kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM) {
       mtx_lock(&cache->lock);
       cache->limited = true;
       mtx_unlock(&cache->lock);
       kk_variant_trace(dev, KK_VARIANT_FAILURE, recipe, sizeof(*recipe), 0, 0);
-      if (trace_enabled) {
-         memcpy(kk_variant_parent_id, previous, sizeof(previous));
-         kk_variant_parent_valid = previous_valid;
-         memcpy(kk_variant_family_id, previous_family, sizeof(previous_family));
-         kk_variant_family_valid = previous_family_valid;
-      }
+      kk_recipe_restore_trace(trace_enabled, previous, previous_valid,
+                              previous_family, previous_family_valid);
       return (struct kk_pso_result){ .status = VK_ERROR_UNKNOWN };
    }
-   if (entry && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
+   if (entry && !lookup_only && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
        !p_atomic_read(&entry->demanded) &&
        !p_atomic_xchg(&entry->demanded, true))
       kk_variant_trace(dev, KK_VARIANT_FIRST_DEMAND, recipe,
                        sizeof(*recipe), 0, 0);
    struct kk_pso_result result = { .status = VK_ERROR_UNKNOWN };
    mtl_render_pipeline_state *pso = entry ? p_atomic_read(&entry->pso) : NULL;
-   bool demand = !pso && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW;
+   bool demand = !pso && !lookup_only &&
+                 kk_compile_origin == KK_COMPILE_ORIGIN_DRAW;
    if (demand)
       kk_draw_demand_begin(cache);
    bool compile = false;
    if (entry && !pso) {
       mtx_lock(&cache->lock);
-      bool waited = entry->state == KK_ENTRY_COMPILING;
+      bool waited = !lookup_only && entry->state == KK_ENTRY_COMPILING;
       if (waited) {
          int64_t start = os_time_get_nano();
          struct mtl_compile_phase phase =
@@ -1267,9 +1298,11 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
          kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, recipe, sizeof(*recipe),
                           start, os_time_get_nano());
       }
-      compile = entry->state == KK_ENTRY_IDLE ||
-                entry->state == KK_ENTRY_QUEUED ||
-                (!waited && kk_entry_retryable(entry->state, entry->failures));
+      compile = !lookup_only &&
+                (entry->state == KK_ENTRY_IDLE ||
+                 entry->state == KK_ENTRY_QUEUED ||
+                 (!waited &&
+                  kk_entry_retryable(entry->state, entry->failures)));
       if (compile) {
          if (entry->state == KK_ENTRY_QUEUED &&
              kk_compile_origin == KK_COMPILE_ORIGIN_DRAW)
@@ -1281,8 +1314,8 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
             p_atomic_set(&entry->prewarmed, true);
       } else {
          pso = entry->pso;
-         result.status = entry->state == KK_ENTRY_READY ? VK_SUCCESS :
-                                                          entry->result;
+         result.status = kk_entry_status(entry->state, entry->failures,
+                                         entry->result, lookup_only);
       }
       mtx_unlock(&cache->lock);
    }
@@ -1320,7 +1353,8 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
    result.pso = pso;
    if (pso)
       result.status = VK_SUCCESS;
-   if (pso && entry && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
+   if (pso && entry && !lookup_only &&
+       kk_compile_origin == KK_COMPILE_ORIGIN_DRAW &&
        !p_atomic_read(&entry->drawn) && !p_atomic_xchg(&entry->drawn, true)) {
       uint32_t hash = kk_pso_key_hash(&entry->native_key);
       u_rwlock_rdlock(&cache->index_lock);
@@ -1335,12 +1369,8 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
                           sizeof(entry->native_key));
       kk_variant_history_record(cache->history, recipe->family, recipe);
    }
-   if (trace_enabled) {
-      memcpy(kk_variant_parent_id, previous, sizeof(previous));
-      kk_variant_parent_valid = previous_valid;
-      memcpy(kk_variant_family_id, previous_family, sizeof(previous_family));
-      kk_variant_family_valid = previous_family_valid;
-   }
+   kk_recipe_restore_trace(trace_enabled, previous, previous_valid,
+                           previous_family, previous_family_valid);
    return result;
 }
 
@@ -1350,7 +1380,7 @@ kk_link(struct kk_device *dev, const struct kk_link_state *ls,
 {
    struct kk_variant_recipe recipe;
    kk_make_recipe(ls, vs, fs, force_shader_blend, &recipe);
-   return kk_recipe_get(dev, vs, fs, &recipe);
+   return kk_recipe_get(dev, vs, fs, &recipe, NULL);
 }
 
 static struct kk_shader *
@@ -1503,7 +1533,7 @@ static bool
 kk_prewarm_recipe(struct kk_device *dev, struct kk_shader *vs,
                   struct kk_shader *fs, const struct kk_variant_recipe *recipe)
 {
-   if (kk_recipe_get(dev, vs, fs, recipe).pso)
+   if (kk_recipe_get(dev, vs, fs, recipe, NULL).pso)
       return true;
    if (recipe->fs.shader_blend)
       return false;
@@ -1525,7 +1555,7 @@ kk_prewarm_recipe(struct kk_device *dev, struct kk_shader *vs,
                       recipe->write_enables & BITFIELD_BIT(i),
                       &fallback.fs.blend[i]);
    }
-   return kk_recipe_get(dev, vs, fs, &fallback).pso != NULL;
+   return kk_recipe_get(dev, vs, fs, &fallback, NULL).pso != NULL;
 }
 
 static bool
