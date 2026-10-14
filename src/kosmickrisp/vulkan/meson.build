@@ -265,6 +265,18 @@ if with_tests
     timeout : 30,
   )
   test(
+    'kk-metal-cache',
+    executable(
+      'kk-metal-cache-test',
+      'tests/metal_cache.c',
+      include_directories : [inc_include, inc_src],
+      dependencies : [idep_mesautil],
+      link_args : host_machine.system() == 'darwin' ? ['-Wl,-dead_strip'] : ld_args_gc_sections,
+    ),
+    suite : ['kosmickrisp'],
+    timeout : 30,
+  )
+  test(
     'kk-metal-trace',
     prog_python,
     args : [

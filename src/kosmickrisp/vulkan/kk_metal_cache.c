@@ -85,6 +85,8 @@ kk_metal_trace_event(const char *phase, const uint8_t key[CACHE_KEY_SIZE],
 #define KK_METAL_MAX_AGE_MS_DEFAULT 60000
 #define KK_METAL_MAX_PENDING_DEFAULT 32
 #define KK_METAL_RECAPTURE_LIMIT 256
+#define KK_METAL_RECAPTURE_BATCH 8
+#define KK_METAL_RECAPTURE_ATTEMPTS 2
 #define KK_METAL_REF_CAPACITY 4096
 
 struct kk_metal_ref {
@@ -103,6 +105,7 @@ struct kk_metal_recapture {
    void *descriptor;
    uint64_t max_threads;
    bool compute;
+   unsigned attempts;
    struct kk_metal_recapture *next;
 };
 
@@ -124,9 +127,13 @@ struct kk_metal_cache {
    unsigned uncaptured_compiles;
    unsigned bypassed_compiles;
    unsigned recaptured_compiles;
-   unsigned dropped_recaptures;
+   unsigned dropped_capacity;
+   unsigned dropped_alloc;
+   unsigned dropped_failed;
    unsigned recapture_count;
    struct kk_metal_recapture *recapture;
+   struct kk_metal_recapture *recapture_tail;
+   struct kk_metal_recapture *recapturing;
    unsigned active_operations;
    unsigned exit_pins;
    bool closing;
@@ -242,16 +249,48 @@ kk_metal_log_miss(const char *outcome, const uint8_t key[CACHE_KEY_SIZE],
    kk_metal_log_event(outcome, fields);
 }
 
+struct kk_metal_drops {
+   unsigned capacity;
+   unsigned alloc;
+   unsigned failed;
+};
+
+static struct kk_metal_drops
+kk_metal_take_drops_locked(struct kk_metal_cache *cache)
+{
+   struct kk_metal_drops drops = {
+      .capacity = cache->dropped_capacity,
+      .alloc = cache->dropped_alloc,
+      .failed = cache->dropped_failed,
+   };
+   cache->dropped_capacity = 0;
+   cache->dropped_alloc = 0;
+   cache->dropped_failed = 0;
+   return drops;
+}
+
+static void
+kk_metal_restore_drops_locked(struct kk_metal_cache *cache,
+                              struct kk_metal_drops drops)
+{
+   cache->dropped_capacity += drops.capacity;
+   cache->dropped_alloc += drops.alloc;
+   cache->dropped_failed += drops.failed;
+}
+
 static void
 kk_metal_log_flush(const char *outcome, size_t size, unsigned keys,
                    unsigned limit, unsigned bypassed, unsigned recaptured,
-                   unsigned dropped)
+                   struct kk_metal_drops drops)
 {
-   char fields[160];
+   char fields[256];
    snprintf(fields, sizeof(fields),
             ",\"size\":%zu,\"keys\":%u,\"limit\":%u,\"bypassed\":%u,"
-            "\"recaptured\":%u,\"dropped\":%u",
-            size, keys, limit, bypassed, recaptured, dropped);
+            "\"recaptured\":%u,\"dropped\":%u,\"dropped_capacity\":%u,"
+            "\"dropped_alloc\":%u,\"dropped_failed\":%u",
+            size, keys, limit, bypassed, recaptured,
+            drops.capacity + drops.alloc + drops.failed, drops.capacity,
+            drops.alloc, drops.failed);
    kk_metal_log_event(outcome, fields);
 }
 
@@ -271,11 +310,10 @@ kk_metal_flush_locked(struct kk_metal_cache *cache)
    unsigned count = cache->pending_count;
    unsigned limit = cache->max_pending;
    unsigned recaptured = cache->recaptured_compiles;
-   unsigned dropped = cache->dropped_recaptures;
+   struct kk_metal_drops dropped = kk_metal_take_drops_locked(cache);
    cache->pending = NULL;
    cache->pending_count = 0;
    cache->recaptured_compiles = 0;
-   cache->dropped_recaptures = 0;
    int64_t oldest = cache->oldest_pending_ns;
    mtx_unlock(&cache->mutex);
 
@@ -297,7 +335,7 @@ kk_metal_flush_locked(struct kk_metal_cache *cache)
       cache->pending = pending;
       cache->pending_count += count;
       cache->recaptured_compiles += recaptured;
-      cache->dropped_recaptures += dropped;
+      kk_metal_restore_drops_locked(cache, dropped);
       cache->oldest_pending_ns = oldest;
       cache->retry_seconds = cache->retry_seconds ?
          MIN2(cache->retry_seconds * 2, 60) : 1;
@@ -713,17 +751,28 @@ kk_metal_load(struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE])
    return archive;
 }
 
-static void
-kk_metal_capture_locked(struct kk_metal_cache *cache,
-                         const uint8_t key[CACHE_KEY_SIZE])
+static bool
+kk_metal_pending_locked(struct kk_metal_cache *cache,
+                        const uint8_t key[CACHE_KEY_SIZE])
 {
    for (struct kk_metal_cache_key *entry = cache->pending;
         entry; entry = entry->next)
       if (!memcmp(entry->key, key, CACHE_KEY_SIZE))
-         return;
-   struct kk_metal_cache_key *entry = malloc(sizeof(*entry));
-   if (!entry)
+         return true;
+   return false;
+}
+
+static void
+kk_metal_capture_locked(struct kk_metal_cache *cache,
+                         const uint8_t key[CACHE_KEY_SIZE])
+{
+   if (kk_metal_pending_locked(cache, key))
       return;
+   struct kk_metal_cache_key *entry = malloc(sizeof(*entry));
+   if (!entry) {
+      cache->dropped_alloc++;
+      return;
+   }
    memcpy(entry->key, key, CACHE_KEY_SIZE);
    if (!cache->pending)
       cache->oldest_pending_ns = os_time_get_nano();
@@ -732,15 +781,60 @@ kk_metal_capture_locked(struct kk_metal_cache *cache,
    cache->pending_count++;
 }
 
+static bool
+kk_metal_recapture_known_locked(struct kk_metal_cache *cache,
+                                const uint8_t key[CACHE_KEY_SIZE])
+{
+   if (cache->recapturing &&
+       !memcmp(cache->recapturing->key, key, CACHE_KEY_SIZE))
+      return true;
+   for (struct kk_metal_recapture *entry = cache->recapture;
+        entry; entry = entry->next)
+      if (!memcmp(entry->key, key, CACHE_KEY_SIZE))
+         return true;
+   return kk_metal_pending_locked(cache, key);
+}
+
+static void
+kk_metal_recapture_push_locked(struct kk_metal_cache *cache,
+                               struct kk_metal_recapture *entry)
+{
+   entry->next = NULL;
+   if (cache->recapture_tail)
+      cache->recapture_tail->next = entry;
+   else
+      cache->recapture = entry;
+   cache->recapture_tail = entry;
+   cache->recapture_count++;
+}
+
+static struct kk_metal_recapture *
+kk_metal_recapture_pop_locked(struct kk_metal_cache *cache)
+{
+   struct kk_metal_recapture *entry = cache->recapture;
+   cache->recapture = entry->next;
+   if (!cache->recapture)
+      cache->recapture_tail = NULL;
+   cache->recapture_count--;
+   return entry;
+}
+
 static void
 kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain)
 {
+   unsigned budget = KK_METAL_RECAPTURE_BATCH;
    while (cache->recapture &&
-          (drain || (!cache->stopping &&
+          (drain || (budget && !cache->stopping &&
                      cache->flush_requested == cache->flush_completed))) {
-      struct kk_metal_recapture *entry = cache->recapture;
-      cache->recapture = entry->next;
-      cache->recapture_count--;
+      struct kk_metal_recapture *entry = kk_metal_recapture_pop_locked(cache);
+      if (kk_metal_pending_locked(cache, entry->key)) {
+         mtl_release(entry->descriptor);
+         free(entry);
+         continue;
+      }
+      budget -= !!budget;
+      entry->attempts++;
+      cache->recapturing = entry;
       cache->captured_compiles++;
       cache->last_compile_ns = os_time_get_nano();
       mtx_unlock(&cache->mutex);
@@ -753,14 +847,21 @@ kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain)
          (void *)mtl_new_render_pipeline(cache->compiler, entry->descriptor);
       mtl_compile_phase_end(phase, pipeline != NULL);
       mtl_release(pipeline);
-      mtl_release(entry->descriptor);
       mtx_lock(&cache->mutex);
+      cache->recapturing = NULL;
+      cache->captured_compiles--;
+      cnd_broadcast(&cache->cond);
       if (pipeline) {
          kk_metal_capture_locked(cache, entry->key);
          cache->recaptured_compiles++;
+      } else if (entry->attempts < KK_METAL_RECAPTURE_ATTEMPTS) {
+         kk_metal_recapture_push_locked(cache, entry);
+         continue;
+      } else {
+         cache->dropped_failed++;
+         kk_metal_log_miss("recapture_failed", entry->key, 0);
       }
-      cache->captured_compiles--;
-      cnd_broadcast(&cache->cond);
+      mtl_release(entry->descriptor);
       free(entry);
    }
 }
@@ -771,20 +872,22 @@ kk_metal_defer_recapture_locked(struct kk_metal_cache *cache,
                                 void *descriptor, bool compute,
                                 uint64_t max_threads)
 {
-   struct kk_metal_recapture *entry =
-      cache->recapture_count >= KK_METAL_RECAPTURE_LIMIT ?
-         NULL : malloc(sizeof(*entry));
+   if (kk_metal_recapture_known_locked(cache, key))
+      return;
+   if (cache->recapture_count >= KK_METAL_RECAPTURE_LIMIT) {
+      cache->dropped_capacity++;
+      return;
+   }
+   struct kk_metal_recapture *entry = calloc(1, sizeof(*entry));
    if (!entry) {
-      cache->dropped_recaptures++;
+      cache->dropped_alloc++;
       return;
    }
    memcpy(entry->key, key, CACHE_KEY_SIZE);
    entry->descriptor = mtl_retain(descriptor);
    entry->max_threads = max_threads;
    entry->compute = compute;
-   entry->next = cache->recapture;
-   cache->recapture = entry;
-   cache->recapture_count++;
+   kk_metal_recapture_push_locked(cache, entry);
 }
 
 static mtl_compiler *
