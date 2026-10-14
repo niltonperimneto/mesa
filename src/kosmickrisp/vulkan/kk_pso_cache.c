@@ -28,11 +28,23 @@
 #include "vk_pipeline_cache.h"
 #include "vk_shader.h"
 
+#define KK_PSO_MAX_ATTEMPTS 2
+
+enum kk_entry_state {
+   KK_ENTRY_IDLE,
+   KK_ENTRY_QUEUED,
+   KK_ENTRY_COMPILING,
+   KK_ENTRY_READY,
+   KK_ENTRY_FAILED,
+};
+
 struct kk_pso_entry {
    struct kk_pso_key key;
    mtl_render_pipeline_state *pso;
    cnd_t ready;
-   bool compiling;
+   enum kk_entry_state state;
+   unsigned failures;
+   VkResult result;
    bool prewarmed;
    bool drawn;
 };
@@ -56,11 +68,11 @@ struct kk_recipe_entry {
    struct kk_pso_key native_key;
    mtl_render_pipeline_state *pso;
    cnd_t ready;
-   bool compiling;
+   enum kk_entry_state state;
+   unsigned failures;
+   VkResult result;
    bool drawn;
    bool demanded;
-   bool queued;
-   bool complete;
    bool prewarmed;
 };
 
@@ -453,29 +465,51 @@ kk_pso_prewarm_ready(struct kk_device *dev)
    return ready;
 }
 
+static bool
+kk_entry_retryable(enum kk_entry_state state, unsigned failures)
+{
+   return state == KK_ENTRY_FAILED && failures < KK_PSO_MAX_ATTEMPTS &&
+          kk_compile_origin != KK_COMPILE_ORIGIN_PREWARM;
+}
+
 static struct kk_pso_result
 kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
-                 const struct kk_pso_key *key)
+                 const struct kk_pso_key *key, bool *compile)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    if (kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM &&
        !p_atomic_read(&entry->prewarmed))
       p_atomic_set(&entry->prewarmed, true);
    mtl_render_pipeline_state *pso = p_atomic_read(&entry->pso);
+   VkResult status = VK_SUCCESS;
    if (!pso) {
       int64_t start = 0;
       mtx_lock(&cache->lock);
-      bool waited = entry->compiling;
+      bool waited = entry->state == KK_ENTRY_COMPILING;
       if (waited) {
          kk_log_cache_pso(dev, "pso_wait", key, sizeof(*key));
          start = os_time_get_nano();
          struct mtl_compile_phase phase =
             kk_pso_phase_begin(dev, "pso_wait", key, sizeof(*key));
-         while (entry->compiling)
+         while (entry->state == KK_ENTRY_COMPILING)
             cnd_wait(&entry->ready, &cache->lock);
          mtl_compile_phase_end(phase, true);
       }
+      if (compile && !waited &&
+          kk_entry_retryable(entry->state, entry->failures)) {
+         entry->state = KK_ENTRY_COMPILING;
+         mtx_unlock(&cache->lock);
+         *compile = true;
+         kk_log_cache_pso(dev, "pso_retry", key, sizeof(*key));
+         return (struct kk_pso_result){ .status = VK_SUCCESS };
+      }
       pso = entry->pso;
+      if (entry->state == KK_ENTRY_READY)
+         status = VK_SUCCESS;
+      else if (!compile && kk_entry_retryable(entry->state, entry->failures))
+         status = VK_NOT_READY;
+      else
+         status = entry->result;
       mtx_unlock(&cache->lock);
       if (waited) {
          kk_log_compile(dev, "pso_wait", start);
@@ -493,7 +527,7 @@ kk_pso_entry_get(struct kk_device *dev, struct kk_pso_entry *entry,
                      key, sizeof(*key));
    if (pso)
       kk_variant_trace(dev, KK_VARIANT_READY_HIT, key, sizeof(*key), 0, 0);
-   return (struct kk_pso_result){ pso, pso ? VK_SUCCESS : VK_ERROR_UNKNOWN };
+   return (struct kk_pso_result){ pso, status };
 }
 
 static struct kk_pso_entry *
@@ -506,7 +540,7 @@ kk_pso_entry_insert_locked(struct kk_pso_cache *cache, uint32_t hash,
       return NULL;
    entry->key = *key;
    entry->pso = pso;
-   entry->compiling = pso == NULL;
+   entry->state = pso ? KK_ENTRY_READY : KK_ENTRY_COMPILING;
    entry->prewarmed = kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM;
    entry->drawn = kk_compile_origin == KK_COMPILE_ORIGIN_DRAW;
    if (cnd_init(&entry->ready) != thrd_success) {
@@ -546,6 +580,43 @@ kk_pso_build(struct kk_device *dev, const struct kk_pso_key *key,
    return kk_new_render_pipeline(dev, vs, fs, key, false);
 }
 
+static struct kk_pso_result
+kk_pso_entry_compile(struct kk_device *dev, struct kk_pso_entry *entry,
+                     const struct kk_pso_key *key,
+                     mtl_function_descriptor *vs, mtl_function_descriptor *fs)
+{
+   struct kk_pso_cache *cache = &dev->pso_cache;
+   mtl_render_pipeline_state *pso = kk_pso_build(dev, key, vs, fs, false);
+   VkResult status = pso ? VK_SUCCESS : VK_ERROR_UNKNOWN;
+   mtx_lock(&cache->lock);
+   if (pso) {
+      p_atomic_set(&entry->pso, pso);
+      entry->state = KK_ENTRY_READY;
+   } else {
+      entry->failures++;
+      entry->result = status;
+      entry->state = KK_ENTRY_FAILED;
+   }
+   cnd_broadcast(&entry->ready);
+   mtx_unlock(&cache->lock);
+   kk_variant_trace(dev, pso ? KK_VARIANT_COMPLETE : KK_VARIANT_FAILURE,
+                    key, sizeof(*key), 0, 0);
+   return (struct kk_pso_result){ pso, status };
+}
+
+static struct kk_pso_result
+kk_pso_found(struct kk_device *dev, struct kk_pso_entry *entry,
+             const struct kk_pso_key *key, mtl_function_descriptor *vs,
+             mtl_function_descriptor *fs, bool lookup_only)
+{
+   bool compile = false;
+   struct kk_pso_result result =
+      kk_pso_entry_get(dev, entry, key, lookup_only ? NULL : &compile);
+   if (compile)
+      return kk_pso_entry_compile(dev, entry, key, vs, fs);
+   return result;
+}
+
 struct kk_pso_result
 kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
                  mtl_function_descriptor *vs, mtl_function_descriptor *fs,
@@ -553,6 +624,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    uint32_t hash = kk_pso_key_hash(key);
+   bool lookup_only = request && request->lookup_only;
 
    u_rwlock_rdlock(&cache->index_lock);
    struct hash_entry *he =
@@ -560,9 +632,9 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
    struct kk_pso_entry *found = he ? he->data : NULL;
    u_rwlock_rdunlock(&cache->index_lock);
    if (found)
-      return kk_pso_entry_get(dev, found, key);
+      return kk_pso_found(dev, found, key, vs, fs, lookup_only);
 
-   if (request && request->lookup_only) {
+   if (lookup_only) {
       mtl_render_pipeline_state *pso = kk_pso_build(dev, key, vs, fs, true);
       if (!pso)
          return (struct kk_pso_result){ .status = VK_NOT_READY };
@@ -574,7 +646,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
       u_rwlock_wrunlock(&cache->index_lock);
       if (found) {
          mtl_release(pso);
-         return kk_pso_entry_get(dev, found, key);
+         return kk_pso_found(dev, found, key, vs, fs, true);
       }
       if (!entry) {
          mtl_release(pso);
@@ -591,7 +663,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
       found ? NULL : kk_pso_entry_insert_locked(cache, hash, key, NULL);
    u_rwlock_wrunlock(&cache->index_lock);
    if (found)
-      return kk_pso_entry_get(dev, found, key);
+      return kk_pso_found(dev, found, key, vs, fs, false);
    if (entry == NULL)
       return (struct kk_pso_result){ .status = VK_ERROR_OUT_OF_HOST_MEMORY };
 
@@ -600,15 +672,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
                      key, sizeof(*key));
    if (KK_DEBUG(PSO))
       mesa_logi("PSO compile");
-   mtl_render_pipeline_state *pso = kk_pso_build(dev, key, vs, fs, false);
-   mtx_lock(&cache->lock);
-   p_atomic_set(&entry->pso, pso);
-   entry->compiling = false;
-   cnd_broadcast(&entry->ready);
-   mtx_unlock(&cache->lock);
-   kk_variant_trace(dev, pso ? KK_VARIANT_COMPLETE : KK_VARIANT_FAILURE,
-                    key, sizeof(*key), 0, 0);
-   return (struct kk_pso_result){ pso, pso ? VK_SUCCESS : VK_ERROR_UNKNOWN };
+   return kk_pso_entry_compile(dev, entry, key, vs, fs);
 }
 
 mtl_render_pipeline_state *
@@ -1191,27 +1255,35 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
    bool compile = false;
    if (entry && !pso) {
       mtx_lock(&cache->lock);
-      if (entry->compiling) {
+      bool waited = entry->state == KK_ENTRY_COMPILING;
+      if (waited) {
          int64_t start = os_time_get_nano();
          struct mtl_compile_phase phase =
             kk_pso_phase_begin(dev, "recipe_wait", recipe, sizeof(*recipe));
-         while (entry->compiling)
+         while (entry->state == KK_ENTRY_COMPILING)
             cnd_wait(&entry->ready, &cache->lock);
          mtl_compile_phase_end(phase, true);
          kk_log_compile(dev, "variant_wait", start);
          kk_variant_trace(dev, KK_VARIANT_PSO_WAIT, recipe, sizeof(*recipe),
                           start, os_time_get_nano());
       }
-      compile = !entry->complete && !entry->compiling;
+      compile = entry->state == KK_ENTRY_IDLE ||
+                entry->state == KK_ENTRY_QUEUED ||
+                (!waited && kk_entry_retryable(entry->state, entry->failures));
       if (compile) {
-         if (entry->queued && kk_compile_origin == KK_COMPILE_ORIGIN_DRAW)
+         if (entry->state == KK_ENTRY_QUEUED &&
+             kk_compile_origin == KK_COMPILE_ORIGIN_DRAW)
             kk_log_cache_pso(dev, "recipe_takeover", recipe, sizeof(*recipe));
-         entry->queued = false;
-         entry->compiling = true;
+         else if (entry->state == KK_ENTRY_FAILED)
+            kk_log_cache_pso(dev, "recipe_retry", recipe, sizeof(*recipe));
+         entry->state = KK_ENTRY_COMPILING;
          if (kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM)
             p_atomic_set(&entry->prewarmed, true);
+      } else {
+         pso = entry->pso;
+         result.status = entry->state == KK_ENTRY_READY ? VK_SUCCESS :
+                                                          entry->result;
       }
-      pso = compile ? NULL : entry->pso;
       mtx_unlock(&cache->lock);
    }
    if (!entry || compile) {
@@ -1221,13 +1293,19 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
       result = kk_prepare_recipe(dev, vs, fs, recipe, &native_key, NULL);
       mtl_compile_phase_end(phase, result.status == VK_SUCCESS);
       pso = result.pso;
+      if (!pso && result.status == VK_SUCCESS)
+         result.status = VK_ERROR_UNKNOWN;
       if (entry) {
          mtx_lock(&cache->lock);
-         if (pso)
+         if (pso) {
             entry->native_key = native_key;
-         p_atomic_set(&entry->pso, pso);
-         entry->compiling = false;
-         entry->complete = true;
+            p_atomic_set(&entry->pso, pso);
+            entry->state = KK_ENTRY_READY;
+         } else {
+            entry->failures++;
+            entry->result = result.status;
+            entry->state = KK_ENTRY_FAILED;
+         }
          cnd_broadcast(&entry->ready);
          mtx_unlock(&cache->lock);
       }
@@ -1654,7 +1732,7 @@ kk_schedule_recipe(struct kk_device *dev,
       if (p_atomic_read(&known->pso))
          return;
       mtx_lock(&cache->lock);
-      bool idle = !known->queued && !known->compiling && !known->complete;
+      bool idle = known->state == KK_ENTRY_IDLE;
       mtx_unlock(&cache->lock);
       if (!idle)
          return;
@@ -1669,7 +1747,7 @@ kk_schedule_recipe(struct kk_device *dev,
       !_mesa_hash_table_search_pre_hashed(cache->families, family_hash,
                                           load_key);
    known = he ? he->data : NULL;
-   bool idle = known && !known->queued && !known->compiling && !known->complete;
+   bool idle = known && known->state == KK_ENTRY_IDLE;
    if (he && !needs_history && !idle) {
       mtx_unlock(&cache->lock);
       u_rwlock_wrunlock(&cache->index_lock);
@@ -1693,7 +1771,7 @@ kk_schedule_recipe(struct kk_device *dev,
       return;
    }
    if (!he || idle) {
-      entry->queued = true;
+      entry->state = KK_ENTRY_QUEUED;
       p_atomic_set(&entry->prewarmed, true);
    }
    if (needs_history) {

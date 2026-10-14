@@ -253,7 +253,7 @@ test_recipe(bool fail)
    u_rwlock_wrunlock(&dev.pso_cache.index_lock);
    CHECK(entry);
    mtx_lock(&dev.pso_cache.lock);
-   entry->queued = true;
+   entry->state = KK_ENTRY_QUEUED;
    mtx_unlock(&dev.pso_cache.lock);
    producer.entered = producer.release = false;
    producer.fail = fail;
@@ -263,7 +263,7 @@ test_recipe(bool fail)
    CHECK(thrd_create(&owner, run_demand, &d) == thrd_success);
    wait_for_producer();
    mtx_lock(&dev.pso_cache.lock);
-   CHECK(!entry->queued && entry->compiling);
+   CHECK(entry->state == KK_ENTRY_COMPILING);
    mtx_unlock(&dev.pso_cache.lock);
 
    struct demand late = d;
@@ -273,7 +273,7 @@ test_recipe(bool fail)
    CHECK(thrd_create(&second_draw, run_demand, &second) == thrd_success);
    thrd_sleep(&(struct timespec){ .tv_nsec = 20000000 }, NULL);
    mtx_lock(&dev.pso_cache.lock);
-   CHECK(entry->compiling && !entry->complete && !entry->drawn &&
+   CHECK(entry->state == KK_ENTRY_COMPILING && !entry->drawn &&
          entry->demanded && dev.pso_cache.draw_demand == 2);
    mtx_unlock(&dev.pso_cache.lock);
 
@@ -288,16 +288,35 @@ test_recipe(bool fail)
    CHECK(late.result.status == d.result.status &&
          second.result.status == d.result.status);
 
+   unsigned calls = 1;
+   if (fail) {
+      CHECK(entry->state == KK_ENTRY_FAILED && entry->failures == 1 &&
+            entry->result == VK_ERROR_UNKNOWN && !entry->pso);
+      kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
+      struct kk_pso_result skipped = kk_recipe_get(&dev, &vs, &fs, &d.recipe);
+      CHECK(skipped.status == VK_ERROR_UNKNOWN && !skipped.pso);
+      CHECK(producer_calls() == 1);
+      mtx_lock(&producer.lock);
+      producer.fail = false;
+      mtx_unlock(&producer.lock);
+      kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
+      d.result = kk_recipe_get(&dev, &vs, &fs, &d.recipe);
+      CHECK(d.result.status == VK_SUCCESS && d.result.pso);
+      CHECK(entry->state == KK_ENTRY_READY && entry->failures == 1);
+      calls = 2;
+   }
+   CHECK(producer_calls() == calls);
+
    struct kk_variant_recipe other = d.recipe;
    other.family[0] = 1;
    kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
    struct kk_pso_result reused = kk_recipe_get(&dev, &vs, &fs, &other);
-   CHECK(reused.status == d.result.status && reused.pso == d.result.pso);
+   CHECK(reused.status == VK_SUCCESS && reused.pso == d.result.pso);
    struct kk_recipe_entry *retry =
       kk_recipe_lookup(&dev.pso_cache, &other, false);
-   CHECK(retry && retry->complete && !retry->compiling);
-   CHECK(producer_calls() == 1);
-   CHECK(retry->drawn == !fail);
+   CHECK(retry && retry->state == KK_ENTRY_READY);
+   CHECK(producer_calls() == calls);
+   CHECK(retry->drawn);
    CHECK(!dev.pso_cache.pending_jobs && !dev.pso_cache.exact_jobs);
    kk_pso_cache_finish(&dev.pso_cache);
 }
@@ -321,7 +340,7 @@ finish_after_wakes(void *data)
    }
    mtx_lock(&test->cache->lock);
    p_atomic_set(&test->entry->pso, (void *)&pipelines[0]);
-   test->entry->compiling = false;
+   test->entry->state = KK_ENTRY_READY;
    cnd_broadcast(&test->entry->ready);
    mtx_unlock(&test->cache->lock);
    return 0;
@@ -331,16 +350,18 @@ static void
 test_wait_wakeups(void)
 {
    struct kk_device dev = {0};
-   struct kk_pso_entry entry = { .compiling = true };
+   struct kk_pso_entry entry = { .state = KK_ENTRY_COMPILING };
    struct wait_test test = { .cache = &dev.pso_cache, .entry = &entry };
    CHECK(mtx_init(&dev.pso_cache.lock, mtx_plain) == thrd_success);
    CHECK(cnd_init(&entry.ready) == thrd_success);
    thrd_t thread;
    CHECK(thrd_create(&thread, finish_after_wakes, &test) == thrd_success);
-   struct kk_pso_result result = kk_pso_entry_get(&dev, &entry, &entry.key);
+   bool compile = false;
+   struct kk_pso_result result =
+      kk_pso_entry_get(&dev, &entry, &entry.key, &compile);
    CHECK(result.status == VK_SUCCESS && result.pso == (void *)&pipelines[0]);
    CHECK(thrd_join(thread, NULL) == thrd_success);
-   CHECK(!entry.compiling && test.wakes == 10);
+   CHECK(!compile && entry.state == KK_ENTRY_READY && test.wakes == 10);
    cnd_destroy(&entry.ready);
    mtx_destroy(&dev.pso_cache.lock);
 }
@@ -948,6 +969,118 @@ test_specialize_lookup_only(void)
 }
 
 static void
+set_producer_fail(bool fail)
+{
+   mtx_lock(&producer.lock);
+   producer.fail = fail;
+   mtx_unlock(&producer.lock);
+}
+
+static void
+test_native_retry(void)
+{
+   struct kk_device dev;
+   struct kk_physical_device pdev;
+   specialize_fixture(&dev, &pdev);
+   reset_producer(0);
+   release_producer();
+   set_producer_fail(true);
+   kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
+   const struct kk_pso_request lookup = { .lookup_only = true };
+
+   struct kk_pso_key key;
+   kk_pso_key_init(&key);
+   key.rast[0] = 9;
+   struct kk_pso_result result = kk_pso_cache_get(&dev, &key, NULL, NULL, NULL);
+   CHECK(result.status == VK_ERROR_UNKNOWN && !result.pso);
+   struct kk_pso_entry *entry = table_entry(&dev, &key);
+   CHECK(entry && entry->state == KK_ENTRY_FAILED && entry->failures == 1);
+   CHECK(producer_calls() == 1);
+
+   kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
+   result = kk_pso_cache_get(&dev, &key, NULL, NULL, NULL);
+   CHECK(result.status == VK_ERROR_UNKNOWN && producer_calls() == 1);
+   kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
+   result = kk_pso_cache_get(&dev, &key, NULL, NULL, &lookup);
+   CHECK(result.status == VK_NOT_READY && producer_calls() == 1);
+
+   set_producer_fail(false);
+   result = kk_pso_cache_get(&dev, &key, NULL, NULL, NULL);
+   CHECK(result.status == VK_SUCCESS && result.pso == (void *)&pipelines[1]);
+   CHECK(entry->state == KK_ENTRY_READY && producer_calls() == 2);
+   result = kk_pso_cache_get(&dev, &key, NULL, NULL, &lookup);
+   CHECK(result.status == VK_SUCCESS && result.pso == (void *)&pipelines[1]);
+
+   struct kk_pso_key permanent = key;
+   permanent.rast[0] = 10;
+   set_producer_fail(true);
+   kk_compile_origin = KK_COMPILE_ORIGIN_CREATE;
+   for (unsigned i = 0; i < 5; ++i) {
+      result = kk_pso_cache_get(&dev, &permanent, NULL, NULL, NULL);
+      CHECK(result.status == VK_ERROR_UNKNOWN && !result.pso);
+   }
+   CHECK(producer_calls() == 2 + KK_PSO_MAX_ATTEMPTS);
+   entry = table_entry(&dev, &permanent);
+   CHECK(entry->state == KK_ENTRY_FAILED &&
+         entry->failures == KK_PSO_MAX_ATTEMPTS);
+   result = kk_pso_cache_get(&dev, &permanent, NULL, NULL, &lookup);
+   CHECK(result.status == VK_ERROR_UNKNOWN);
+   CHECK(producer_calls() == 2 + KK_PSO_MAX_ATTEMPTS);
+   kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
+   kk_pso_cache_finish(&dev.pso_cache);
+}
+
+static void
+run_failing_round(struct kk_device *dev, const struct kk_pso_key *key)
+{
+   reset_producer(0);
+   set_producer_fail(true);
+   struct child_demand d[4];
+   thrd_t threads[4];
+   d[0] = (struct child_demand){ .dev = dev, .key = *key };
+   CHECK(thrd_create(&threads[0], run_child, &d[0]) == thrd_success);
+   wait_for_producer();
+   for (unsigned i = 1; i < 4; ++i) {
+      d[i] = (struct child_demand){ .dev = dev, .key = *key };
+      CHECK(thrd_create(&threads[i], run_child, &d[i]) == thrd_success);
+   }
+   thrd_sleep(&(struct timespec){ .tv_nsec = 20000000 }, NULL);
+   struct kk_pso_entry *entry = table_entry(dev, key);
+   mtx_lock(&dev->pso_cache.lock);
+   CHECK(entry->state == KK_ENTRY_COMPILING);
+   mtx_unlock(&dev->pso_cache.lock);
+   release_producer();
+   for (unsigned i = 0; i < 4; ++i) {
+      CHECK(thrd_join(threads[i], NULL) == thrd_success);
+      CHECK(d[i].result.status == VK_ERROR_UNKNOWN && !d[i].result.pso);
+   }
+   CHECK(producer_calls() == 1);
+}
+
+static void
+test_native_waiters(void)
+{
+   struct kk_device dev;
+   struct kk_physical_device pdev;
+   specialize_fixture(&dev, &pdev);
+   struct kk_pso_key key;
+   kk_pso_key_init(&key);
+   key.rast[0] = 11;
+   run_failing_round(&dev, &key);
+   CHECK(table_entry(&dev, &key)->failures == 1);
+   run_failing_round(&dev, &key);
+   CHECK(table_entry(&dev, &key)->failures == 2);
+   reset_producer(0);
+   release_producer();
+   kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
+   CHECK(kk_pso_cache_get(&dev, &key, NULL, NULL, NULL).status ==
+         VK_ERROR_UNKNOWN);
+   CHECK(producer_calls() == 0);
+   kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
+   kk_pso_cache_finish(&dev.pso_cache);
+}
+
+static void
 test_normalized_fs_keys(void)
 {
    struct kk_shader fs = {0};
@@ -1047,6 +1180,8 @@ main(void)
    test_concurrent_specialize();
    test_specialize_fallback();
    test_specialize_lookup_only();
+   test_native_retry();
+   test_native_waiters();
    test_normalized_fs_keys();
    test_history_yields_to_draws();
    cnd_destroy(&specializer.ready);
