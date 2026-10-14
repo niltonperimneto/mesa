@@ -1537,7 +1537,7 @@ kk_compile_point_variant(struct kk_device *dev, struct kk_shader *shader,
    nir_shader *gs = from_gs ? nir
                             : kk_compile_point_emu(pdev, shader, nir,
                                                    robustness, state);
-   if (!gs || !kk_nir_lower_gs_polygon_point(gs)) {
+   if (!gs || !kk_nir_lower_gs_polygon_point(gs, !from_gs)) {
       ralloc_free(gs);
       return;
    }

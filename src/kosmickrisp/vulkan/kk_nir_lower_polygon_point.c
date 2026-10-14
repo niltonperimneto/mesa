@@ -28,6 +28,7 @@ struct kk_point_state {
    struct kk_point_slot slots[NUM_TOTAL_VARYING_SLOTS];
    nir_variable *count;
    bool unsupported;
+   bool z_lowered;
 };
 
 static bool
@@ -134,7 +135,8 @@ point_value(nir_builder *b, const struct kk_point_slot *slot,
 
 static void
 emit_point(nir_builder *b, struct kk_point_state *state, unsigned record,
-           nir_def *ccw, nir_def *flat_mask, nir_def *provoking_last)
+           nir_def *ccw, nir_def *flat_mask, nir_def *provoking_last,
+           nir_def *z_bias)
 {
    const struct kk_point_slot *pos_slot = &state->slots[VARYING_SLOT_POS];
    nir_def *pos = load_record(b, pos_slot, record);
@@ -191,7 +193,7 @@ emit_point(nir_builder *b, struct kk_point_state *state, unsigned record,
       nir_def *corner_pos[4] = {
          nir_ffma(b, signs[corner][0], dx, x),
          nir_ffma(b, signs[corner][1], dy, y),
-         nir_channel(b, pos, 2),
+         nir_ffma(b, z_bias, w, nir_channel(b, pos, 2)),
          w,
       };
       for (unsigned c = 0; c < 4; ++c)
@@ -204,26 +206,95 @@ emit_point(nir_builder *b, struct kk_point_state *state, unsigned record,
 }
 
 static nir_def *
-triangle_ccw(nir_builder *b, struct kk_point_state *state, nir_def *odd)
+det3(nir_builder *b, nir_def *const a[KK_POINT_RECORDS],
+     nir_def *const c[KK_POINT_RECORDS], nir_def *const w[KK_POINT_RECORDS])
+{
+   nir_def *c0 = nir_fsub(b, nir_fmul(b, c[1], w[2]), nir_fmul(b, c[2], w[1]));
+   nir_def *c1 = nir_fsub(b, nir_fmul(b, c[0], w[2]), nir_fmul(b, c[2], w[0]));
+   nir_def *c2 = nir_fsub(b, nir_fmul(b, c[0], w[1]), nir_fmul(b, c[1], w[0]));
+   return nir_fadd(b, nir_fsub(b, nir_fmul(b, a[0], c0), nir_fmul(b, a[1], c1)),
+                   nir_fmul(b, a[2], c2));
+}
+
+static void
+load_positions(nir_builder *b, struct kk_point_state *state,
+               nir_def *pos[4][KK_POINT_RECORDS])
 {
    const struct kk_point_slot *pos_slot = &state->slots[VARYING_SLOT_POS];
-   nir_def *x[KK_POINT_RECORDS], *y[KK_POINT_RECORDS], *w[KK_POINT_RECORDS];
    for (unsigned i = 0; i < KK_POINT_RECORDS; ++i) {
-      nir_def *pos = load_record(b, pos_slot, i);
-      x[i] = nir_channel(b, pos, 0);
-      y[i] = nir_channel(b, pos, 1);
-      w[i] = nir_channel(b, pos, 3);
+      nir_def *record = load_record(b, pos_slot, i);
+      for (unsigned c = 0; c < 4; ++c)
+         pos[c][i] = nir_channel(b, record, c);
+   }
+}
+
+static nir_def *
+depth_bias(nir_builder *b, struct kk_point_state *state,
+           nir_def *pos[4][KK_POINT_RECORDS], nir_def *det,
+           nir_def *provoking_last)
+{
+   nir_def *viewport = nir_imm_int(b, 0);
+   if (BITSET_TEST(state->written, VARYING_SLOT_VIEWPORT)) {
+      const struct kk_point_slot *slot =
+         &state->slots[VARYING_SLOT_VIEWPORT];
+      nir_def *first = nir_channel(b, load_record(b, slot, 0), 0);
+      nir_def *last =
+         nir_channel(b, load_record(b, slot, KK_POINT_RECORDS - 1u), 0);
+      viewport = nir_umin(b, nir_bcsel(b, provoking_last, last, first),
+                          nir_imm_int(b, KK_MAX_VIEWPORTS - 1u));
    }
 
-   nir_def *c0 = nir_fsub(b, nir_fmul(b, y[1], w[2]), nir_fmul(b, y[2], w[1]));
-   nir_def *c1 = nir_fsub(b, nir_fmul(b, y[0], w[2]), nir_fmul(b, y[2], w[0]));
-   nir_def *c2 = nir_fsub(b, nir_fmul(b, y[0], w[1]), nir_fmul(b, y[1], w[0]));
-   nir_def *det = nir_fadd(
-      b, nir_fsub(b, nir_fmul(b, x[0], c0), nir_fmul(b, x[1], c1)),
-      nir_fmul(b, x[2], c2));
-   det = nir_bcsel(b, odd, nir_fneg(b, det), det);
+   nir_def *depth = nir_load_viewport_depth_kk(b, 2, 32, viewport);
+   nir_def *zmin = nir_channel(b, depth, 0);
+   nir_def *zscale = nir_channel(b, depth, 1);
+   nir_def *scale, *base;
+   if (state->z_lowered) {
+      nir_def *emulated = nir_load_is_viewport_z_transform_emulated_kk(b);
+      scale = nir_bcsel(b, emulated, nir_imm_float(b, 1.0f), zscale);
+      base = nir_bcsel(b, emulated, nir_imm_float(b, 0.0f), zmin);
+   } else {
+      nir_def *coeff = nir_load_clip_z_coeff(b);
+      scale = nir_fmul(b, zscale, nir_fsub_imm(b, 1.0f, coeff));
+      base = nir_ffma(b, zscale, coeff, zmin);
+   }
 
-   return nir_fge_imm(b, det, 0.0f);
+   nir_def *a = det3(b, pos[1], pos[2], pos[3]);
+   nir_def *c = det3(b, pos[0], pos[2], pos[3]);
+   nir_def *inv_size = nir_load_viewport_inv_size_kk(b, 2, 32, viewport);
+   nir_def *gradient =
+      nir_fmax(b, nir_fmul(b, nir_fabs(b, a), nir_channel(b, inv_size, 0)),
+               nir_fmul(b, nir_fabs(b, c), nir_channel(b, inv_size, 1)));
+   nir_def *slope = nir_fdiv(b, nir_fmul_imm(b, nir_fmul(b, gradient,
+                                                         nir_fabs(b, scale)),
+                                             2.0f),
+                             nir_fabs(b, det));
+   slope = nir_bcsel(b, nir_fneu_imm(b, det, 0.0f), slope,
+                     nir_imm_float(b, 0.0f));
+
+   nir_def *max_z = nir_imm_float(b, 0.0f);
+   for (unsigned i = 0; i < KK_POINT_RECORDS; ++i) {
+      nir_def *z = nir_ffma(b, scale, nir_fdiv(b, pos[2][i], pos[3][i]), base);
+      z = nir_bcsel(b, nir_fneu_imm(b, pos[3][i], 0.0f), nir_fabs(b, z),
+                    nir_imm_float(b, 0.0f));
+      max_z = nir_fmax(b, max_z, z);
+   }
+   nir_def *exponent = nir_iand_imm(b, max_z, 0x7f800000);
+   nir_def *float_r =
+      nir_imax(b, nir_iadd_imm(b, exponent, -(23 << 23)), nir_imm_int(b, 0));
+
+   nir_def *factors = nir_load_depth_bias_kk(b);
+   nir_def *fixed_r = nir_channel(b, factors, 3);
+   nir_def *r = nir_bcsel(b, nir_fneu_imm(b, fixed_r, 0.0f), fixed_r, float_r);
+   nir_def *offset = nir_ffma(b, nir_channel(b, factors, 1), slope,
+                              nir_fmul(b, nir_channel(b, factors, 0), r));
+   nir_def *clamp = nir_channel(b, factors, 2);
+   offset = nir_bcsel(b, nir_flt(b, nir_imm_float(b, 0.0f), clamp),
+                      nir_fmin(b, offset, clamp),
+                      nir_bcsel(b, nir_flt_imm(b, clamp, 0.0f),
+                                nir_fmax(b, offset, clamp), offset));
+
+   return nir_bcsel(b, nir_fneu_imm(b, scale, 0.0f), nir_fdiv(b, offset, scale),
+                    nir_imm_float(b, 0.0f));
 }
 
 static void
@@ -234,11 +305,16 @@ lower_emit_vertex(nir_builder *b, struct kk_point_state *state)
    nir_push_if(b, nir_uge_imm(b, count, 2));
    {
       nir_def *odd = nir_i2b(b, nir_iand_imm(b, count, 1));
-      nir_def *ccw = triangle_ccw(b, state, odd);
+      nir_def *pos[4][KK_POINT_RECORDS];
+      load_positions(b, state, pos);
+      nir_def *det = det3(b, pos[0], pos[1], pos[3]);
+      nir_def *ccw = nir_fge_imm(b, nir_bcsel(b, odd, nir_fneg(b, det), det),
+                                 0.0f);
       nir_def *flat_mask = nir_load_flat_mask(b);
       nir_def *provoking_last = nir_i2b(b, nir_load_provoking_last(b));
+      nir_def *z_bias = depth_bias(b, state, pos, det, provoking_last);
       for (unsigned i = 0; i < KK_POINT_RECORDS; ++i)
-         emit_point(b, state, i, ccw, flat_mask, provoking_last);
+         emit_point(b, state, i, ccw, flat_mask, provoking_last, z_bias);
    }
    nir_pop_if(b, NULL);
 
@@ -270,7 +346,7 @@ lower_store_output(nir_builder *b, struct kk_point_state *state,
 }
 
 bool
-kk_nir_lower_gs_polygon_point(nir_shader *gs)
+kk_nir_lower_gs_polygon_point(nir_shader *gs, bool z_lowered)
 {
    assert(gs->info.stage == MESA_SHADER_GEOMETRY);
 
@@ -286,6 +362,7 @@ kk_nir_lower_gs_polygon_point(nir_shader *gs)
    if (!state)
       return false;
 
+   state->z_lowered = z_lowered;
    nir_shader_intrinsics_pass(gs, gather_output, nir_metadata_all, state);
    if (state->unsupported || !BITSET_TEST(state->written, VARYING_SLOT_POS) ||
        state->slots[VARYING_SLOT_POS].bit_size != 32 ||

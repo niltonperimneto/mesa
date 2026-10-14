@@ -46,6 +46,8 @@ struct kk_root_descriptor_table {
 
          float viewport_z_range[KK_MAX_VIEWPORTS * 2];
          float viewport_inv_size[KK_MAX_VIEWPORTS * 2];
+         float viewport_depth[KK_MAX_VIEWPORTS * 2];
+         float depth_bias[4];
          bool emulate_depth_clamp;
          bool emulate_viewport_z;
       } draw;
@@ -67,7 +69,7 @@ struct kk_root_descriptor_table {
    uint8_t set_dynamic_buffer_start[KK_MAX_SETS];
 };
 
-static_assert(sizeof(struct kk_root_descriptor_table) == 2760,
+static_assert(sizeof(struct kk_root_descriptor_table) == 2904,
               "kk_root_descriptor_table layout is shared with shaders");
 
 struct kk_descriptor_state {

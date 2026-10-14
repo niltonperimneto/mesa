@@ -66,7 +66,7 @@ test_topology(unsigned control, bool writes_memory)
 {
    bool dynamic = control != 0;
    nir_shader *gs = create_gs(control, writes_memory);
-   CHECK(kk_nir_lower_gs_polygon_point(gs));
+   CHECK(kk_nir_lower_gs_polygon_point(gs, true));
    CHECK(gs->info.writes_memory == writes_memory);
 
    if (!dynamic) {

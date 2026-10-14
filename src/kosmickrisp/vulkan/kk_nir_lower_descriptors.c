@@ -421,6 +421,9 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_load_api_sample_mask_kk:
       return lower_sysval_to_root_table(b, intrin, draw.sample_mask);
 
+   case nir_intrinsic_load_depth_bias_kk:
+      return lower_sysval_to_root_table(b, intrin, draw.depth_bias);
+
    case nir_intrinsic_load_is_depth_clamp_emulated_kk: {
       unsigned offset = kk_root_descriptor_offset(draw.emulate_depth_clamp);
       b->cursor = nir_instr_remove(&intrin->instr);
@@ -449,8 +452,12 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
       return true;
    }
 
-   case nir_intrinsic_load_viewport_inv_size_kk: {
-      unsigned offset = kk_root_descriptor_offset(draw.viewport_inv_size);
+   case nir_intrinsic_load_viewport_inv_size_kk:
+   case nir_intrinsic_load_viewport_depth_kk: {
+      unsigned offset =
+         intrin->intrinsic == nir_intrinsic_load_viewport_inv_size_kk
+            ? kk_root_descriptor_offset(draw.viewport_inv_size)
+            : kk_root_descriptor_offset(draw.viewport_depth);
       assert((offset & 3) == 0 && "aligned");
       b->cursor = nir_instr_remove(&intrin->instr);
       nir_def *vp_offset =

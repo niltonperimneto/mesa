@@ -981,6 +981,8 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
          vp->width != 0.0f ? 1.0f / fabsf(vp->width) : 0.0f;
       desc->root.draw.viewport_inv_size[i * 2u + 1u] =
          vp->height != 0.0f ? 1.0f / fabsf(vp->height) : 0.0f;
+      desc->root.draw.viewport_depth[i * 2u] = vp->minDepth;
+      desc->root.draw.viewport_depth[i * 2u + 1u] = vp->maxDepth - vp->minDepth;
 
       if (dyn->rs.depth_clamp_enable ||
           vk_rasterization_state_depth_clip_enable(&dyn->rs)) {
@@ -1652,6 +1654,21 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
    return kk_pool_upload(cmd, &params, sizeof(params), 8).gpu;
 }
 
+static float
+kk_depth_bias_r(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_D16_UNORM:
+   case VK_FORMAT_D16_UNORM_S8_UINT:
+      return 1.0f / (1u << 16);
+   case VK_FORMAT_X8_D24_UNORM_PACK32:
+   case VK_FORMAT_D24_UNORM_S8_UINT:
+      return 1.0f / (1u << 24);
+   default:
+      return 0.0f;
+   }
+}
+
 static void
 kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
 {
@@ -1738,12 +1755,19 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    }
 
    if (IS_DIRTY(RS_DEPTH_BIAS_FACTORS) || IS_DIRTY(RS_DEPTH_BIAS_ENABLE)) {
-      if (dyn->rs.depth_bias.enable)
-         mtl_set_depth_bias(enc, dyn->rs.depth_bias.constant_factor,
-                            dyn->rs.depth_bias.slope_factor,
-                            dyn->rs.depth_bias.clamp);
-      else
+      float bias[4] = {0.0f, 0.0f, 0.0f,
+                       kk_depth_bias_r(gfx->render.depth_att.vk_format)};
+      if (dyn->rs.depth_bias.enable) {
+         bias[0] = dyn->rs.depth_bias.constant_factor;
+         bias[1] = dyn->rs.depth_bias.slope_factor;
+         bias[2] = dyn->rs.depth_bias.clamp;
+      }
+      if (gfx->point.gs)
          mtl_set_depth_bias(enc, 0.0f, 0.0f, 0.0f);
+      else
+         mtl_set_depth_bias(enc, bias[0], bias[1], bias[2]);
+      memcpy(desc->root.draw.depth_bias, bias, sizeof(bias));
+      desc->root_dirty = true;
    }
 
    if (IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE) ||
@@ -2803,6 +2827,7 @@ kk_update_point_state(struct kk_cmd_buffer *cmd)
    cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_GEOMETRY);
    gfx->dirty |= KK_DIRTY_PSO;
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_POLYGON_MODE);
+   BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_DEPTH_BIAS_FACTORS);
 }
 
 static void kk_draw_shaders(struct kk_cmd_buffer *cmd,
