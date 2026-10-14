@@ -216,6 +216,36 @@ kk_metal_reference_key(struct kk_metal_cache *cache,
 }
 
 static void
+kk_metal_uncacheable_ref(cache_key ref)
+{
+   memset(ref, 0xff, CACHE_KEY_SIZE);
+}
+
+static bool
+kk_metal_ref_is_uncacheable(const uint8_t ref[CACHE_KEY_SIZE])
+{
+   for (unsigned i = 0; i < CACHE_KEY_SIZE; ++i)
+      if (ref[i] != 0xff)
+         return false;
+   return true;
+}
+
+static void
+kk_metal_limit_key(struct kk_metal_cache *cache, cache_key key)
+{
+   struct {
+      char identity[sizeof(cache->identity)];
+      char tag[16];
+      uint64_t budget;
+   } data;
+   memset(&data, 0, sizeof(data));
+   memcpy(data.identity, cache->identity, sizeof(data.identity));
+   memcpy(data.tag, "batch_limit", sizeof("batch_limit"));
+   data.budget = cache->blob_budget;
+   disk_cache_compute_key(cache->disk, &data, sizeof(data), key);
+}
+
+static void
 kk_metal_log_event(const char *outcome, const char *fields)
 {
    const char *path = debug_get_option("MESA_KK_CACHE_LOG", NULL);
@@ -295,6 +325,54 @@ kk_metal_log_flush(const char *outcome, size_t size, unsigned keys,
 }
 
 static void
+kk_metal_log_limit(const char *outcome, unsigned limit)
+{
+   char fields[32];
+   snprintf(fields, sizeof(fields), ",\"limit\":%u", limit);
+   kk_metal_log_event(outcome, fields);
+}
+
+static void
+kk_metal_load_limit(struct kk_metal_cache *cache)
+{
+   if (!cache->blob_budget)
+      return;
+   cache_key key;
+   kk_metal_limit_key(cache, key);
+   size_t size = 0;
+   uint32_t *stored = disk_cache_get(cache->disk, key, &size);
+   if (stored && size == sizeof(*stored) && *stored &&
+       *stored < cache->max_pending) {
+      cache->max_pending = *stored;
+      kk_metal_log_limit("archive_limit_loaded", *stored);
+   }
+   free(stored);
+}
+
+static void
+kk_metal_store_limit(struct kk_metal_cache *cache, uint32_t limit)
+{
+   cache_key key;
+   kk_metal_limit_key(cache, key);
+   disk_cache_put(cache->disk, key, &limit, sizeof(limit), NULL);
+   kk_metal_log_limit("archive_limit_lowered", limit);
+}
+
+static void
+kk_metal_mark_uncacheable(struct kk_metal_cache *cache,
+                          const uint8_t key[CACHE_KEY_SIZE])
+{
+   cache_key reference, sentinel;
+   kk_metal_reference_key(cache, key, reference);
+   kk_metal_uncacheable_ref(sentinel);
+   disk_cache_put(cache->disk, reference, sentinel, sizeof(sentinel), NULL);
+   mtx_lock(&cache->mutex);
+   kk_metal_ref_set_locked(cache, key, sentinel);
+   mtx_unlock(&cache->mutex);
+   kk_metal_log_miss("archive_uncacheable", key, 0);
+}
+
+static void
 kk_metal_flush_locked(struct kk_metal_cache *cache)
 {
    if (!cache->pending)
@@ -344,6 +422,8 @@ kk_metal_flush_locked(struct kk_metal_cache *cache)
       return;
    }
    bool oversized = cache->blob_budget && size > cache->blob_budget;
+   bool uncacheable = oversized && count == 1;
+   unsigned lowered = MAX2(MIN2(limit, count) / 2, 1);
    kk_metal_log_flush(oversized ? "archive_oversized" : "archive_flushed", size,
                       count, limit, bypassed, recaptured, dropped);
    cache_key blob;
@@ -360,14 +440,18 @@ kk_metal_flush_locked(struct kk_metal_cache *cache)
          mtx_lock(&cache->mutex);
          kk_metal_ref_set_locked(cache, entry->key, blob);
          mtx_unlock(&cache->mutex);
+      } else if (uncacheable) {
+         kk_metal_mark_uncacheable(cache, entry->key);
       }
       pending = entry->next;
       free(entry);
    }
    free(data);
+   if (oversized && !uncacheable)
+      kk_metal_store_limit(cache, lowered);
    mtx_lock(&cache->mutex);
-   if (oversized)
-      cache->max_pending = MAX2(cache->max_pending / 2, 1);
+   if (oversized && !uncacheable)
+      cache->max_pending = MIN2(cache->max_pending, lowered);
    cache->retry_seconds = 0;
    cache->retry_after_ns = 0;
 }
@@ -387,6 +471,12 @@ kk_metal_flush_due_locked(struct kk_metal_cache *cache, int64_t now)
    return now - cache->oldest_pending_ns >= cache->max_age_ns;
 }
 
+static bool
+kk_metal_batch_full_locked(struct kk_metal_cache *cache)
+{
+   return cache->pending_count + cache->captured_compiles >= cache->max_pending;
+}
+
 static void kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain);
 
 static int
@@ -395,8 +485,8 @@ kk_metal_worker(void *arg)
    struct kk_metal_cache *cache = arg;
    mtx_lock(&cache->mutex);
    while (!cache->stopping) {
-      if (cache->flush_requested == cache->flush_completed &&
-          !cache->recapture) {
+      bool due = kk_metal_flush_due_locked(cache, os_time_get_nano());
+      if (!due && (!cache->recapture || kk_metal_batch_full_locked(cache))) {
          struct timespec deadline;
          clock_gettime(CLOCK_REALTIME, &deadline);
          deadline.tv_nsec += KK_METAL_POLL_NS;
@@ -405,10 +495,11 @@ kk_metal_worker(void *arg)
             deadline.tv_nsec -= 1000000000;
          }
          cnd_timedwait(&cache->cond, &cache->mutex, &deadline);
+         if (cache->stopping)
+            break;
+         due = kk_metal_flush_due_locked(cache, os_time_get_nano());
       }
-      if (cache->stopping)
-         break;
-      if (kk_metal_flush_due_locked(cache, os_time_get_nano())) {
+      if (due) {
          uint64_t requested = cache->flush_requested;
          kk_metal_flush_locked(cache);
          cache->flush_completed = requested;
@@ -540,6 +631,7 @@ kk_metal_cache_create(struct disk_cache *disk_cache, mtl_device *device,
    cache->last_compile_ns = os_time_get_nano();
    mtl_pipeline_cache_identity(device, gpu_family, cache->identity,
                                sizeof(cache->identity));
+   kk_metal_load_limit(cache);
    if (mtx_init(&cache->mutex, mtx_plain) != thrd_success)
       goto fail;
    if (cnd_init(&cache->cond) != thrd_success)
@@ -668,8 +760,10 @@ kk_metal_find_archive_locked(struct kk_metal_cache *cache, const void *ref)
 }
 
 static mtl_archive *
-kk_metal_load(struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE])
+kk_metal_load(struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
+              bool *uncacheable)
 {
+   *uncacheable = false;
    int64_t lookup_start = kk_metal_trace_time();
    cache_key ref;
    mtx_lock(&cache->mutex);
@@ -694,6 +788,13 @@ kk_metal_load(struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE])
       kk_metal_ref_set_locked(cache, key, ref);
       archive = kk_metal_find_archive_locked(cache, ref);
       mtx_unlock(&cache->mutex);
+   }
+   if (kk_metal_ref_is_uncacheable(ref)) {
+      *uncacheable = true;
+      kk_metal_trace_event("archive_lookup", key, lookup_start);
+      if (!indexed)
+         kk_metal_log_miss("ref_uncacheable", key, lookup_start);
+      return NULL;
    }
    kk_metal_trace_event("archive_lookup", key, lookup_start);
    if (archive)
@@ -825,6 +926,7 @@ kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain)
    unsigned budget = KK_METAL_RECAPTURE_BATCH;
    while (cache->recapture &&
           (drain || (budget && !cache->stopping &&
+                     !kk_metal_batch_full_locked(cache) &&
                      cache->flush_requested == cache->flush_completed))) {
       struct kk_metal_recapture *entry = kk_metal_recapture_pop_locked(cache);
       if (kk_metal_pending_locked(cache, entry->key)) {
@@ -897,7 +999,8 @@ kk_metal_begin_compile(struct kk_metal_cache *cache,
 {
    mtx_lock(&cache->mutex);
    cache->last_compile_ns = os_time_get_nano();
-   if (cache->uncaptured && (cache->serializing || !capture)) {
+   if (cache->uncaptured &&
+       (cache->serializing || !capture || kk_metal_batch_full_locked(cache))) {
       if (cache->serializing) {
          struct mtl_compile_phase phase =
             kk_metal_phase_begin(cache, "serialization_bypass", key);
@@ -965,11 +1068,11 @@ kk_metal_operation_end(struct kk_metal_cache *cache)
 static mtl_render_pipeline_state *
 kk_metal_lookup_render_pipeline(
    struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
-   mtl_render_pipeline_descriptor *descriptor)
+   mtl_render_pipeline_descriptor *descriptor, bool *uncacheable)
 {
    struct mtl_compile_phase phase =
       kk_metal_phase_begin(cache, "archive_load", key);
-   mtl_archive *archive = kk_metal_load(cache, key);
+   mtl_archive *archive = kk_metal_load(cache, key, uncacheable);
    mtl_compile_phase_end(phase, archive != NULL);
    mtl_render_pipeline_state *pipeline = NULL;
    if (archive) {
@@ -990,8 +1093,9 @@ kk_metal_cache_lookup_render_pipeline(
 {
    if (!kk_metal_operation_begin(cache))
       return NULL;
+   bool uncacheable;
    mtl_render_pipeline_state *pipeline =
-      kk_metal_lookup_render_pipeline(cache, key, descriptor);
+      kk_metal_lookup_render_pipeline(cache, key, descriptor, &uncacheable);
    kk_metal_operation_end(cache);
    return pipeline;
 }
@@ -1005,17 +1109,19 @@ kk_metal_cache_new_render_pipeline(struct kk_metal_cache *cache,
    *archive_hit = false;
    if (!kk_metal_operation_begin(cache))
       return NULL;
+   bool uncacheable;
    mtl_render_pipeline_state *pipeline =
-      kk_metal_lookup_render_pipeline(cache, key, descriptor);
+      kk_metal_lookup_render_pipeline(cache, key, descriptor, &uncacheable);
    *archive_hit = pipeline != NULL;
    if (!pipeline) {
       bool captured;
       mtl_compiler *compiler =
-         kk_metal_begin_compile(cache, key, &captured, true);
+         kk_metal_begin_compile(cache, key, &captured, !uncacheable);
       int64_t start = kk_metal_trace_time();
       pipeline = mtl_new_render_pipeline(compiler, descriptor);
       kk_metal_trace_event("native_create", key, start);
-      kk_metal_end_compile(cache, key, captured, pipeline != NULL, descriptor,
+      kk_metal_end_compile(cache, key, captured,
+                           pipeline != NULL && !uncacheable, descriptor,
                            false, 0);
    }
    kk_metal_operation_end(cache);
@@ -1052,7 +1158,8 @@ kk_metal_cache_new_compute_pipeline(struct kk_metal_cache *cache,
       return NULL;
    struct mtl_compile_phase phase =
       kk_metal_phase_begin(cache, "archive_load", key);
-   mtl_archive *archive = kk_metal_load(cache, key);
+   bool uncacheable;
+   mtl_archive *archive = kk_metal_load(cache, key, &uncacheable);
    mtl_compile_phase_end(phase, archive != NULL);
    mtl_compute_pipeline_state *pipeline = NULL;
    if (archive) {
@@ -1068,13 +1175,14 @@ kk_metal_cache_new_compute_pipeline(struct kk_metal_cache *cache,
    if (!pipeline) {
       bool captured;
       mtl_compiler *compiler =
-         kk_metal_begin_compile(cache, key, &captured, true);
+         kk_metal_begin_compile(cache, key, &captured, !uncacheable);
       int64_t start = kk_metal_trace_time();
       pipeline =
          mtl_new_compute_pipeline_state(compiler, function, max_threads);
       kk_metal_trace_event("native_create", key, start);
-      kk_metal_end_compile(cache, key, captured, pipeline != NULL, function,
-                           true, max_threads);
+      kk_metal_end_compile(cache, key, captured,
+                           pipeline != NULL && !uncacheable, function, true,
+                           max_threads);
    }
    kk_metal_operation_end(cache);
    return pipeline;

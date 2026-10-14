@@ -510,6 +510,136 @@ test_recapture_yields_to_flush(void)
    kk_metal_cache_destroy(cache);
 }
 
+static mtl_render_pipeline_state *
+compile_desc(struct kk_metal_cache *cache, struct mock_desc *desc, bool *hit)
+{
+   cache_key key;
+   desc_key(desc, key);
+   return kk_metal_cache_new_render_pipeline(
+      cache, key, (mtl_render_pipeline_descriptor *)desc, hit);
+}
+
+static void
+wait_serializes(unsigned count)
+{
+   int64_t give_up = os_time_get_nano() + 5000000000ll;
+   for (;;) {
+      mtx_lock(&mock.lock);
+      bool done = mock.serializes >= count;
+      mtx_unlock(&mock.lock);
+      if (done)
+         return;
+      CHECK(os_time_get_nano() < give_up);
+      thrd_sleep(&(struct timespec){ .tv_nsec = 1000000 }, NULL);
+   }
+}
+
+static unsigned
+cache_limit(struct kk_metal_cache *cache)
+{
+   mtx_lock(&cache->mutex);
+   unsigned limit = cache->max_pending;
+   mtx_unlock(&cache->mutex);
+   return limit;
+}
+
+static void
+test_oversized_batch_limit_persists(void)
+{
+   mock_reset(true);
+   mock.key_bytes = 1000;
+   const uint64_t budget = 6500;
+   setenv("MESA_KK_PSO_CACHE_MAX_PENDING", "8", 1);
+   struct mock_desc keys[8];
+   for (unsigned i = 0; i < ARRAY_SIZE(keys); ++i)
+      keys[i] = (struct mock_desc){ 3000 + i };
+
+   struct kk_metal_cache *cache = make_cache(budget, 0);
+   CHECK(cache_limit(cache) == 8);
+   bool hit;
+   for (unsigned i = 0; i < ARRAY_SIZE(keys); ++i)
+      CHECK(compile_desc(cache, &keys[i], &hit) && !hit);
+   wait_serializes(1);
+   wait_recapture_idle(cache);
+   CHECK(cache_limit(cache) == 4);
+   kk_metal_cache_destroy(cache);
+
+   mock_reset(false);
+   mock.key_bytes = 1000;
+   cache = make_cache(budget, 0);
+   CHECK(cache_limit(cache) == 4);
+   for (unsigned i = 0; i < ARRAY_SIZE(keys); ++i)
+      CHECK(compile_desc(cache, &keys[i], &hit) && !hit);
+   wait_recapture_idle(cache);
+   kk_metal_cache_flush(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serializes >= 2 && mock.archive_hits == 0);
+   CHECK(mock.call_count == ARRAY_SIZE(keys));
+   mtx_unlock(&mock.lock);
+   CHECK(cache_limit(cache) == 4);
+   kk_metal_cache_destroy(cache);
+
+   mock_reset(false);
+   cache = make_cache(budget, 0);
+   for (unsigned i = 0; i < ARRAY_SIZE(keys); ++i)
+      CHECK(compile_desc(cache, &keys[i], &hit) && hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.archive_hits == ARRAY_SIZE(keys));
+   CHECK(mock.call_count == 0 && mock.uncaptured_calls == 0);
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_destroy(cache);
+   unsetenv("MESA_KK_PSO_CACHE_MAX_PENDING");
+}
+
+static void
+test_single_oversized_pso(void)
+{
+   mock_reset(true);
+   mock.key_bytes = 10000;
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   setenv("MESA_KK_PSO_CACHE_MAX_PENDING", "8", 1);
+   struct mock_desc big = { 4000 }, small = { 4001 };
+   struct kk_metal_cache *cache = make_cache(4500, 0);
+   bool hit;
+   CHECK(compile_desc(cache, &big, &hit) && !hit);
+   kk_metal_cache_flush(cache);
+   CHECK(cache_limit(cache) == 8);
+   CHECK(log_contains(path, "\"outcome\":\"archive_uncacheable\""));
+   CHECK(!log_contains(path, "archive_limit_lowered"));
+   CHECK(compile_desc(cache, &big, &hit) && !hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.call_count == 1 && mock.uncaptured_calls == 1);
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_destroy(cache);
+
+   mock_reset(false);
+   mock.key_bytes = 10000;
+   cache = make_cache(4500, 0);
+   CHECK(compile_desc(cache, &big, &hit) && !hit);
+   mtx_lock(&cache->mutex);
+   CHECK(!cache->recapture && !cache->pending);
+   mtx_unlock(&cache->mutex);
+   mock.key_bytes = 100;
+   CHECK(compile_desc(cache, &small, &hit) && !hit);
+   kk_metal_cache_flush(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.uncaptured_calls == 1 && mock.call_count == 1);
+   CHECK(mock.calls[0] == small.id && mock.serializes == 1);
+   mtx_unlock(&mock.lock);
+   CHECK(log_contains(path, "\"outcome\":\"ref_uncacheable\""));
+   kk_metal_cache_destroy(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serializes == 1);
+   mtx_unlock(&mock.lock);
+   unsetenv("MESA_KK_PSO_CACHE_MAX_PENDING");
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
 int
 main(void)
 {
@@ -521,6 +651,8 @@ main(void)
    test_recapture_order_and_dedup();
    test_recapture_failures();
    test_recapture_yields_to_flush();
+   test_oversized_batch_limit_persists();
+   test_single_oversized_pso();
    mock_reset(true);
    cnd_destroy(&mock.cond);
    mtx_destroy(&mock.lock);
