@@ -40,7 +40,12 @@ struct mock_desc {
    unsigned failures;
 };
 
+#define ARCHIVE_ALIVE 0x41524348u
+#define ARCHIVE_DEAD 0xdeadu
+
 struct mock_archive {
+   uint32_t magic;
+   int refs;
    unsigned count;
    uint32_t ids[MAX_KEYS];
 };
@@ -68,6 +73,9 @@ static struct {
    uint32_t block_id;
    bool blocked;
    unsigned archive_hits;
+   struct mock_archive **archives;
+   unsigned archive_count;
+   unsigned archives_dead;
    struct mock_entry disk[MAX_DISK];
    unsigned disk_count;
 } mock;
@@ -90,15 +98,41 @@ mock_compile_phase_end(struct mtl_compile_phase phase, bool success)
 {
 }
 
+static struct mock_archive *
+mock_find_archive_locked(void *object)
+{
+   for (unsigned i = 0; i < mock.archive_count; ++i)
+      if (mock.archives[i] == object)
+         return object;
+   return NULL;
+}
+
 void *
 mock_retain(void *object)
 {
+   mtx_lock(&mock.lock);
+   struct mock_archive *archive = mock_find_archive_locked(object);
+   if (archive) {
+      CHECK(archive->magic == ARCHIVE_ALIVE && archive->refs > 0);
+      archive->refs++;
+   }
+   mtx_unlock(&mock.lock);
    return object;
 }
 
 void
 mock_release(void *object)
 {
+   mtx_lock(&mock.lock);
+   struct mock_archive *archive = mock_find_archive_locked(object);
+   if (archive) {
+      CHECK(archive->magic == ARCHIVE_ALIVE && archive->refs > 0);
+      if (!--archive->refs) {
+         archive->magic = ARCHIVE_DEAD;
+         mock.archives_dead++;
+      }
+   }
+   mtx_unlock(&mock.lock);
 }
 
 mtl_compiler *
@@ -197,8 +231,16 @@ mock_new_archive(mtl_device *dev, const void *data, size_t size)
 {
    const uint32_t *words = data;
    struct mock_archive *archive = calloc(1, sizeof(*archive));
+   archive->magic = ARCHIVE_ALIVE;
+   archive->refs = 1;
    archive->count = words[1];
    memcpy(archive->ids, words + 2, archive->count * sizeof(uint32_t));
+   mtx_lock(&mock.lock);
+   mock.archives = realloc(mock.archives,
+                           (mock.archive_count + 1) * sizeof(*mock.archives));
+   CHECK(mock.archives);
+   mock.archives[mock.archive_count++] = archive;
+   mtx_unlock(&mock.lock);
    return (mtl_archive *)archive;
 }
 
@@ -207,6 +249,9 @@ mock_archive_lookup(mtl_archive *object, void *descriptor)
 {
    struct mock_archive *archive = (struct mock_archive *)object;
    struct mock_desc *desc = descriptor;
+   mtx_lock(&mock.lock);
+   CHECK(archive->magic == ARCHIVE_ALIVE && archive->refs > 0);
+   mtx_unlock(&mock.lock);
    for (unsigned i = 0; i < archive->count; ++i) {
       if (archive->ids[i] == desc->id) {
          mtx_lock(&mock.lock);
@@ -300,6 +345,13 @@ mock_reset(bool clear_disk)
    mock.block_id = 0;
    mock.archive_hits = 0;
    mock.key_bytes = 64;
+   for (unsigned i = 0; i < mock.archive_count; ++i) {
+      CHECK(mock.archives[i]->magic == ARCHIVE_DEAD && !mock.archives[i]->refs);
+      free(mock.archives[i]);
+   }
+   free(mock.archives);
+   mock.archives = NULL;
+   mock.archive_count = mock.archives_dead = 0;
    if (clear_disk) {
       for (unsigned i = 0; i < mock.disk_count; ++i)
          free(mock.disk[i].data);
@@ -640,6 +692,130 @@ test_single_oversized_pso(void)
    unlink(path);
 }
 
+struct hit_loop {
+   struct kk_metal_cache *cache;
+   struct mock_desc *descs;
+   unsigned first, count, rounds;
+};
+
+static int
+run_hit_loop(void *data)
+{
+   struct hit_loop *loop = data;
+   for (unsigned round = 0; round < loop->rounds; ++round) {
+      for (unsigned i = loop->first; i < loop->first + loop->count; ++i) {
+         bool hit;
+         CHECK(compile_desc(loop->cache, &loop->descs[i], &hit) && hit);
+      }
+   }
+   return 0;
+}
+
+static void
+test_archive_eviction_in_use(void)
+{
+   mock_reset(true);
+   static struct mock_desc descs[KK_METAL_ARCHIVE_CAPACITY + 44];
+   struct kk_metal_cache *cache = make_cache(0, 1);
+   bool hit;
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+      descs[i] = (struct mock_desc){ 5000 + i };
+      CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+   }
+   wait_recapture_idle(cache);
+   kk_metal_cache_flush(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serializes >= ARRAY_SIZE(descs));
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_destroy(cache);
+
+   mock_reset(false);
+   cache = make_cache(0, 1000);
+   struct hit_loop hot = { cache, descs, 0, 1, 3000 };
+   struct hit_loop sweep = { cache, descs, 1, ARRAY_SIZE(descs) - 1, 2 };
+   thrd_t hot_thread, sweep_thread;
+   CHECK(thrd_create(&hot_thread, run_hit_loop, &hot) == thrd_success);
+   CHECK(thrd_create(&sweep_thread, run_hit_loop, &sweep) == thrd_success);
+   CHECK(thrd_join(hot_thread, NULL) == thrd_success);
+   CHECK(thrd_join(sweep_thread, NULL) == thrd_success);
+   mtx_lock(&cache->mutex);
+   CHECK(cache->archive_count == KK_METAL_ARCHIVE_CAPACITY);
+   mtx_unlock(&cache->mutex);
+   mtx_lock(&mock.lock);
+   CHECK(mock.call_count == 0 && mock.uncaptured_calls == 0);
+   CHECK(mock.archives_dead >= ARRAY_SIZE(descs) - KK_METAL_ARCHIVE_CAPACITY);
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_destroy(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.archives_dead == mock.archive_count);
+   mtx_unlock(&mock.lock);
+}
+
+struct destroy_op {
+   struct kk_metal_cache *cache;
+   struct mock_desc *desc;
+   void *result;
+   bool done;
+};
+
+static int
+run_compile_op(void *data)
+{
+   struct destroy_op *op = data;
+   bool hit;
+   op->result = compile_desc(op->cache, op->desc, &hit);
+   return 0;
+}
+
+static int
+run_destroy(void *data)
+{
+   struct destroy_op *op = data;
+   kk_metal_cache_destroy(op->cache);
+   p_atomic_set(&op->done, true);
+   return 0;
+}
+
+static void
+test_destroy_drains_operation(void)
+{
+   mock_reset(true);
+   struct mock_desc desc = { 6000 };
+   struct kk_metal_cache *cache = make_cache(0, 1000);
+   struct destroy_op op = { cache, &desc };
+   mtx_lock(&mock.lock);
+   mock.block_id = desc.id;
+   mtx_unlock(&mock.lock);
+   thrd_t compile, destroy;
+   CHECK(thrd_create(&compile, run_compile_op, &op) == thrd_success);
+   mtx_lock(&mock.lock);
+   while (!mock.blocked)
+      cnd_wait(&mock.cond, &mock.lock);
+   mtx_unlock(&mock.lock);
+   CHECK(thrd_create(&destroy, run_destroy, &op) == thrd_success);
+   thrd_sleep(&(struct timespec){ .tv_nsec = 20000000 }, NULL);
+   CHECK(!p_atomic_read(&op.done));
+   mtx_lock(&cache->mutex);
+   CHECK(cache->closing && cache->active_operations == 1);
+   mtx_unlock(&cache->mutex);
+   mtx_lock(&mock.lock);
+   mock.block_id = 0;
+   cnd_broadcast(&mock.cond);
+   mtx_unlock(&mock.lock);
+   CHECK(thrd_join(compile, NULL) == thrd_success);
+   CHECK(thrd_join(destroy, NULL) == thrd_success);
+   CHECK(op.result && op.done);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serializes == 1);
+   mtx_unlock(&mock.lock);
+
+   mock_reset(false);
+   cache = make_cache(0, 1000);
+   bool hit;
+   CHECK(compile_desc(cache, &desc, &hit) && hit);
+   kk_metal_cache_destroy(cache);
+}
+
 int
 main(void)
 {
@@ -653,6 +829,8 @@ main(void)
    test_recapture_yields_to_flush();
    test_oversized_batch_limit_persists();
    test_single_oversized_pso();
+   test_archive_eviction_in_use();
+   test_destroy_drains_operation();
    mock_reset(true);
    cnd_destroy(&mock.cond);
    mtx_destroy(&mock.lock);

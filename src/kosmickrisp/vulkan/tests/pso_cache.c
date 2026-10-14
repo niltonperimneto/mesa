@@ -1155,6 +1155,109 @@ test_native_waiters(void)
    kk_pso_cache_finish(&dev.pso_cache);
 }
 
+struct start_barrier {
+   mtx_t lock;
+   cnd_t cond;
+   unsigned waiting;
+   unsigned total;
+};
+
+struct barrier_demand {
+   struct start_barrier *barrier;
+   struct kk_device *dev;
+   struct kk_pso_key key;
+   struct kk_pso_result result;
+};
+
+static int
+run_barrier_child(void *data)
+{
+   struct barrier_demand *d = data;
+   mtx_lock(&d->barrier->lock);
+   if (++d->barrier->waiting == d->barrier->total)
+      cnd_broadcast(&d->barrier->cond);
+   while (d->barrier->waiting < d->barrier->total)
+      cnd_wait(&d->barrier->cond, &d->barrier->lock);
+   mtx_unlock(&d->barrier->lock);
+   kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
+   d->result = kk_pso_cache_get(d->dev, &d->key, NULL, NULL, NULL);
+   return 0;
+}
+
+static void
+test_simultaneous_first_lookup(void)
+{
+   struct kk_device dev;
+   struct kk_physical_device pdev;
+   specialize_fixture(&dev, &pdev);
+   reset_producer(0);
+   struct start_barrier barrier = { .total = 8 };
+   CHECK(mtx_init(&barrier.lock, mtx_plain) == thrd_success);
+   CHECK(cnd_init(&barrier.cond) == thrd_success);
+   struct barrier_demand d[8];
+   thrd_t threads[8];
+   for (unsigned i = 0; i < ARRAY_SIZE(d); ++i) {
+      d[i] = (struct barrier_demand){ .barrier = &barrier, .dev = &dev };
+      kk_pso_key_init(&d[i].key);
+      d[i].key.rast[0] = 12;
+      CHECK(thrd_create(&threads[i], run_barrier_child, &d[i]) == thrd_success);
+   }
+   wait_for_producer();
+   thrd_sleep(&(struct timespec){ .tv_nsec = 20000000 }, NULL);
+   CHECK(producer_calls() == 1);
+   release_producer();
+   for (unsigned i = 0; i < ARRAY_SIZE(d); ++i) {
+      CHECK(thrd_join(threads[i], NULL) == thrd_success);
+      CHECK(d[i].result.status == VK_SUCCESS &&
+            d[i].result.pso == d[0].result.pso);
+   }
+   CHECK(producer_calls() == 1);
+   CHECK(_mesa_hash_table_num_entries(dev.pso_cache.table) == 1);
+   cnd_destroy(&barrier.cond);
+   mtx_destroy(&barrier.lock);
+   kk_pso_cache_finish(&dev.pso_cache);
+}
+
+struct finish_test {
+   struct kk_pso_cache *cache;
+   bool done;
+};
+
+static int
+run_finish(void *data)
+{
+   struct finish_test *t = data;
+   kk_pso_cache_finish(t->cache);
+   p_atomic_set(&t->done, true);
+   return 0;
+}
+
+static void
+test_finish_drains_admitted_work(void)
+{
+   struct link_fixture f;
+   link_fixture_init(&f);
+   reset_producer(0);
+   struct kk_link_state ls = { .dyn = &f.cmd.vk.dynamic_graphics_state };
+   ls.shaders[MESA_SHADER_VERTEX] = &f.vs;
+   ls.shaders[MESA_SHADER_FRAGMENT] = &f.fs;
+   kk_schedule_recipe(&f.dev, &ls, true, NULL);
+   CHECK(f.dev.pso_cache.pending_jobs == 1);
+   CHECK(p_atomic_read(&f.vs.vk.pipeline.cache_obj.ref_cnt) == 2);
+   wait_for_producer();
+   struct finish_test t = { .cache = &f.dev.pso_cache };
+   thrd_t thread;
+   CHECK(thrd_create(&thread, run_finish, &t) == thrd_success);
+   thrd_sleep(&(struct timespec){ .tv_nsec = 20000000 }, NULL);
+   CHECK(!p_atomic_read(&t.done));
+   release_producer();
+   CHECK(thrd_join(thread, NULL) == thrd_success);
+   CHECK(t.done && producer_calls() == 1);
+   CHECK(!f.dev.pso_cache.pending_jobs && !f.dev.pso_cache.exact_jobs);
+   CHECK(p_atomic_read(&f.vs.vk.pipeline.cache_obj.ref_cnt) == 1);
+   CHECK(p_atomic_read(&f.fs.vk.pipeline.cache_obj.ref_cnt) == 1);
+}
+
 static void
 test_normalized_fs_keys(void)
 {
@@ -1258,6 +1361,8 @@ main(void)
    test_specialize_lookup_only();
    test_native_retry();
    test_native_waiters();
+   test_simultaneous_first_lookup();
+   test_finish_drains_admitted_work();
    test_normalized_fs_keys();
    test_history_yields_to_draws();
    cnd_destroy(&specializer.ready);
