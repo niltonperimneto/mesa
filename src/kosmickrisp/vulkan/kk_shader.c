@@ -2301,8 +2301,8 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
       }
       free(pending);
       request.lookup_only = false;
-      pipe->gfx.render = kk_pso_cache_acquire(
-         device, &key, vertex_function, fragment_function, &request);
+      pipe->gfx.render = kk_pso_cache_acquire(device, &key, vertex_function,
+                                              fragment_function, &request);
    }
    if (pipe->gfx.render == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
@@ -3462,8 +3462,7 @@ kk_compile_fs_variant(struct kk_device *dev, struct kk_shader *fs,
                _mesa_blake3_compute(data.code, strlen(data.code),
                                     variant->hash);
                variant->shader_blend = key->shader_blend;
-               variant->native_primitive_id =
-                  kk_msl_native_primitive_id(&data);
+               variant->native_primitive_id = kk_msl_native_primitive_id(&data);
             }
          } else {
             result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;

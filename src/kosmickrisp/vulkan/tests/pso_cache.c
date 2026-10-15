@@ -995,7 +995,7 @@ test_native_primitive_id(void)
    reset_specializer(false, false);
    struct kk_pso_key key;
    color_key(&key, MTL_PIXEL_FORMAT_R8G8B8A8_UNORM, false, 0xf);
-   struct kk_pso_request request = { .native_primitive_id = true };
+   struct kk_pso_request request = {.native_primitive_id = true};
    struct kk_pso_result result =
       kk_pso_cache_get(&dev, &key, NULL, NULL, &request);
    CHECK(result.status == VK_SUCCESS && result.pso);

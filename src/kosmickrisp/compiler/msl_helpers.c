@@ -8,16 +8,16 @@
 
 #include "util/ralloc.h"
 
-#define GROUP_DIM_SHIFT      0
-#define GROUP_DIM_MASK       0xf
-#define GROUP_ARRAY          (1u << 4)
-#define GROUP_DEPTH          (1u << 5)
-#define GROUP_TYPE_SHIFT     6
-#define GROUP_TYPE_MASK      0x7
-#define GROUP_ACCESS_SHIFT   9
-#define GROUP_ACCESS_MASK    0x3
-#define GROUP_COHERENT       (1u << 11)
-#define GROUP_TEXTURE_MASK   0xfffu
+#define GROUP_DIM_SHIFT    0
+#define GROUP_DIM_MASK     0xf
+#define GROUP_ARRAY        (1u << 4)
+#define GROUP_DEPTH        (1u << 5)
+#define GROUP_TYPE_SHIFT   6
+#define GROUP_TYPE_MASK    0x7
+#define GROUP_ACCESS_SHIFT 9
+#define GROUP_ACCESS_MASK  0x3
+#define GROUP_COHERENT     (1u << 11)
+#define GROUP_TEXTURE_MASK 0xfffu
 
 static const nir_alu_type group_types[] = {
    nir_type_float32, nir_type_float16, nir_type_int32,
@@ -151,8 +151,8 @@ group_from_id(uint32_t id, struct msl_tex_group *group)
       .access = (id >> GROUP_ACCESS_SHIFT) & GROUP_ACCESS_MASK,
       .coherent = id & GROUP_COHERENT,
    };
-   if (group->depth && (group->type != nir_type_float32 || group->access ||
-                        group->coherent))
+   if (group->depth &&
+       (group->type != nir_type_float32 || group->access || group->coherent))
       return false;
    return group_supported(group) && msl_tex_group_id(group) == id;
 }
@@ -180,10 +180,9 @@ msl_print_texture_type(struct _mesa_string_buffer *buf,
       access = ", access::read_write";
       break;
    }
-   _mesa_string_buffer_printf(buf, "texture%s%s<%s%s%s>", dim, arrayed,
-                              msl_tex_type_name(group->type), access,
-                              group->coherent ? ", memory_coherence_device"
-                                              : "");
+   _mesa_string_buffer_printf(
+      buf, "texture%s%s<%s%s%s>", dim, arrayed, msl_tex_type_name(group->type),
+      access, group->coherent ? ", memory_coherence_device" : "");
 }
 
 unsigned
@@ -668,18 +667,18 @@ print_group_catalogue(struct _mesa_string_buffer *buf,
       }
    }
    for (unsigned c = 0; c < 4; c++)
-      ops[n++] = (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER,
-                                         .component = c};
-   ops[n++] = (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER,
-                                      .compare = true};
+      ops[n++] =
+         (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER, .component = c};
+   ops[n++] =
+      (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER, .compare = true};
    for (unsigned i = 0; i < ARRAY_SIZE(atomics); i++)
       ops[n++] = (struct msl_tex_helper){.kind = MSL_TEX_HELPER_ATOMIC,
                                          .atomic = atomics[i]};
    static const enum msl_tex_helper_kind simple[] = {
-      MSL_TEX_HELPER_READ,        MSL_TEX_HELPER_WRITE,
-      MSL_TEX_HELPER_CMPXCHG,     MSL_TEX_HELPER_FENCE,
-      MSL_TEX_HELPER_SIZE,        MSL_TEX_HELPER_LEVELS,
-      MSL_TEX_HELPER_SAMPLES,     MSL_TEX_HELPER_LOD_CLAMPED,
+      MSL_TEX_HELPER_READ,          MSL_TEX_HELPER_WRITE,
+      MSL_TEX_HELPER_CMPXCHG,       MSL_TEX_HELPER_FENCE,
+      MSL_TEX_HELPER_SIZE,          MSL_TEX_HELPER_LEVELS,
+      MSL_TEX_HELPER_SAMPLES,       MSL_TEX_HELPER_LOD_CLAMPED,
       MSL_TEX_HELPER_LOD_UNCLAMPED,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(simple); i++)

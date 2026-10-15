@@ -595,9 +595,8 @@ kk_pso_build(struct kk_device *dev, const struct kk_pso_key *key,
 
 static struct kk_pso_result
 kk_pso_entry_compile(struct kk_device *dev, struct kk_pso_entry *entry,
-                     const struct kk_pso_key *key,
-                     mtl_function_descriptor *vs, mtl_function_descriptor *fs,
-                     bool specialize)
+                     const struct kk_pso_key *key, mtl_function_descriptor *vs,
+                     mtl_function_descriptor *fs, bool specialize)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    mtl_render_pipeline_state *pso =

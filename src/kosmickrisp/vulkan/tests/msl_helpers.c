@@ -73,8 +73,8 @@ test_group_libraries(mtl_compiler *compiler)
       }
       ralloc_free(src);
    }
-   printf("helper groups: %u, functions: %u, failures: %u\n", groups,
-          functions, failures);
+   printf("helper groups: %u, functions: %u, failures: %u\n", groups, functions,
+          failures);
    CHECK(groups > 0 && failures == 0);
    uint32_t group;
    CHECK(!msl_helper_name_group("kk_t_fff_s", &group));

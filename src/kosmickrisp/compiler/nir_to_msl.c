@@ -5,10 +5,10 @@
  */
 
 #include "nir_to_msl.h"
+#include "util/u_dynarray.h"
 #include "msl_private.h"
 #include "nir.h"
 #include "nir_builder.h"
-#include "util/u_dynarray.h"
 
 static const char *
 get_stage_string(mesa_shader_stage stage)
@@ -1081,8 +1081,8 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
    nir_src *min_lod = nir_tex_get_src(tex, nir_tex_src_min_lod);
    uint64_t allowed = BITFIELD64_BIT(nir_tex_src_texture_handle) |
                       BITFIELD64_BIT(nir_tex_src_sampler_handle);
-   bool same_type = group->dim == tex->sampler_dim &&
-                    group->array == tex->is_array;
+   bool same_type =
+      group->dim == tex->sampler_dim && group->array == tex->is_array;
    unsigned sample_coords = msl_tex_coord_components(group->dim, false);
    unsigned read_coords = msl_tex_coord_components(group->dim, true);
    unsigned coord_components =
@@ -1093,13 +1093,12 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
    case nir_texop_txb:
    case nir_texop_txl:
    case nir_texop_txd:
-      allowed |= BITFIELD64_BIT(nir_tex_src_coord) |
-                 BITFIELD64_BIT(nir_tex_src_comparator) |
-                 BITFIELD64_BIT(nir_tex_src_bias) |
-                 BITFIELD64_BIT(nir_tex_src_lod) |
-                 BITFIELD64_BIT(nir_tex_src_ddx) |
-                 BITFIELD64_BIT(nir_tex_src_ddy) |
-                 BITFIELD64_BIT(nir_tex_src_min_lod);
+      allowed |=
+         BITFIELD64_BIT(nir_tex_src_coord) |
+         BITFIELD64_BIT(nir_tex_src_comparator) |
+         BITFIELD64_BIT(nir_tex_src_bias) | BITFIELD64_BIT(nir_tex_src_lod) |
+         BITFIELD64_BIT(nir_tex_src_ddx) | BITFIELD64_BIT(nir_tex_src_ddy) |
+         BITFIELD64_BIT(nir_tex_src_min_lod);
       op->kind = MSL_TEX_HELPER_SAMPLE;
       op->compare = comparator;
       op->min_lod = min_lod;
@@ -1122,14 +1121,13 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
       nir_src *extra = tex->op == nir_texop_txf
                           ? lod
                           : nir_tex_get_src(tex, nir_tex_src_ms_index);
-      allowed |= BITFIELD64_BIT(nir_tex_src_coord) |
-                 BITFIELD64_BIT(tex->op == nir_texop_txf
-                                   ? nir_tex_src_lod
-                                   : nir_tex_src_ms_index);
+      allowed |=
+         BITFIELD64_BIT(nir_tex_src_coord) |
+         BITFIELD64_BIT(tex->op == nir_texop_txf ? nir_tex_src_lod
+                                                 : nir_tex_src_ms_index);
       op->kind = MSL_TEX_HELPER_READ;
       if (!same_type || !coord || coord_components != read_coords ||
-          !src_is_scalar(extra) ||
-          (tex->op == nir_texop_txf_ms && !extra) ||
+          !src_is_scalar(extra) || (tex->op == nir_texop_txf_ms && !extra) ||
           (group->dim == GLSL_SAMPLER_DIM_BUF && extra))
          return false;
       break;
@@ -1169,9 +1167,8 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
                  BITFIELD64_BIT(nir_tex_src_max_lod_kk);
       op->kind = MSL_TEX_HELPER_LOD_CLAMPED;
       if (!sampler || !coord || !bias || !min_lod || !max_lod ||
-          coord->ssa->num_components != sample_coords ||
-          !src_is_scalar(bias) || !src_is_scalar(min_lod) ||
-          !src_is_scalar(max_lod))
+          coord->ssa->num_components != sample_coords || !src_is_scalar(bias) ||
+          !src_is_scalar(min_lod) || !src_is_scalar(max_lod))
          return false;
       break;
    }

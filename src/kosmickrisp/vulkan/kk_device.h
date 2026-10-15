@@ -8,8 +8,8 @@
 #ifndef KK_DEVICE_H
 #define KK_DEVICE_H 1
 
-#include "kk_private.h"
 #include "kk_msl_helpers.h"
+#include "kk_private.h"
 #include "kk_pso_cache.h"
 
 #include "kk_query_table.h"

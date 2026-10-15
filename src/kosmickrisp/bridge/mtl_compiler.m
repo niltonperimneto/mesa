@@ -7,21 +7,21 @@
 #include "mtl_compiler.h"
 #include "mtl_format.h"
 
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include "util/log.h"
+#include "util/u_debug.h"
+#include <Metal/MTL4Archive.h>
 #include <Metal/MTL4ComputePipeline.h>
 #include <Metal/MTL4LibraryDescriptor.h>
 #include <Metal/MTL4LibraryFunctionDescriptor.h>
 #include <Metal/MTL4LinkingDescriptor.h>
+#include <Metal/MTL4PipelineDataSetSerializer.h>
 #include <Metal/MTL4RenderPipeline.h>
 #include <Metal/MTLDevice.h>
-#include <Metal/MTL4Archive.h>
-#include <Metal/MTL4PipelineDataSetSerializer.h>
 #include <objc/runtime.h>
-#include <pthread.h>
 #include <sys/sysctl.h>
-#include <unistd.h>
-#include <time.h>
-#include "util/log.h"
-#include "util/u_debug.h"
 
 static pthread_once_t kk_metal_log_once = PTHREAD_ONCE_INIT;
 static FILE *kk_metal_log;
@@ -176,9 +176,9 @@ static const char mtl_linked_functions_key;
 static MTL4StaticLinkingDescriptor *
 mtl_static_linking(mtl_function_descriptor *function)
 {
-   NSArray *functions = function
-      ? objc_getAssociatedObject((id)function, &mtl_linked_functions_key)
-      : nil;
+   NSArray *functions = function ? objc_getAssociatedObject(
+                                      (id)function, &mtl_linked_functions_key)
+                                 : nil;
    if (!functions)
       return nil;
    MTL4StaticLinkingDescriptor *linking =
@@ -290,9 +290,9 @@ mtl_new_library_function_descriptor(mtl_library *library, const char *entry_poin
 }
 
 void
-mtl_function_descriptor_set_linked_functions(
-   mtl_function_descriptor *function,
-   mtl_function_descriptor **functions, uint32_t count)
+mtl_function_descriptor_set_linked_functions(mtl_function_descriptor *function,
+                                             mtl_function_descriptor **functions,
+                                             uint32_t count)
 {
    @autoreleasepool {
       NSArray *linked =
