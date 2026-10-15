@@ -246,7 +246,11 @@ main(void)
    unsetenv("MESA_KK_PSO_CACHE_DISABLE");
    unsetenv("MESA_SHADER_CACHE_DISABLE");
    mtl_device *dev = mtl_device_create();
-   CHECK(dev);
+   if (!dev) {
+      /* Virtualised CI runners expose no Metal device; 77 is meson's skip. */
+      fprintf(stderr, "no Metal device; skipping\n");
+      return 77;
+   }
    mtl_compiler *compiler = mtl_new_uncaptured_compiler(dev);
    CHECK(compiler);
    test_group_libraries(compiler);
