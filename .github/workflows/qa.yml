@@ -1,0 +1,21 @@
+name: qa
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: qa-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  qa:
+    uses: niltonperimneto/winecx-gptk/.github/workflows/qa-common.yml@main
+    # Upstream Mesa tree: kosmickrisp.yml keeps its own clang-format check.
+    with:
+      exclude: '.'
+      whitespace: false
