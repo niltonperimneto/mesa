@@ -107,3 +107,24 @@ jobs:
           name: kosmickrisp-meson-logs
           path: build/meson-logs/
           retention-days: 7
+
+  # Lets winecx-gptk open a pin bump; it rebuilds only the KosmicKrisp layer.
+  notify-hub:
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch component-updated to winecx-gptk
+        env:
+          GH_TOKEN: ${{ secrets.HUB_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::HUB_DISPATCH_TOKEN is not set; winecx-gptk was not notified"
+            exit 0
+          fi
+          gh api repos/niltonperimneto/winecx-gptk/dispatches \
+            -f event_type=component-updated \
+            -F "client_payload[component]=mesa" \
+            -F "client_payload[repo]=${{ github.repository }}" \
+            -F "client_payload[sha]=${{ github.sha }}"
