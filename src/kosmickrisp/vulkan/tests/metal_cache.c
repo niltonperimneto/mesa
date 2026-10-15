@@ -721,6 +721,7 @@ test_archive_eviction_in_use(void)
    for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
       descs[i] = (struct mock_desc){ 5000 + i };
       CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+      kk_metal_cache_flush(cache);
    }
    wait_recapture_idle(cache);
    kk_metal_cache_flush(cache);

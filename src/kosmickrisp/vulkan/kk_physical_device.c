@@ -1010,7 +1010,7 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
 
    const uint64_t compile_flags =
       kk_mesa_debug_flags & (KK_DEBUG_FORCE_ROBUSTNESS | KK_DEBUG_DYNAMIC_VI |
-                             KK_DEBUG_PARTITION);
+                             KK_DEBUG_PARTITION | KK_DEBUG_NO_MSL_HELPERS);
    const uint32_t binary_version = KK_SHADER_BINARY_VERSION;
    _mesa_blake3_update(&blake3_ctx, &binary_version, sizeof(binary_version));
    _mesa_blake3_update(&blake3_ctx, &compile_flags, sizeof(compile_flags));

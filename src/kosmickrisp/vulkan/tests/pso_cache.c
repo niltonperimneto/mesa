@@ -502,7 +502,7 @@ test_lookup_only_miss(void)
    result = kk_pso_cache_get(&dev, &key, NULL, NULL, &request);
    CHECK(os_time_get_nano() - start < 10000000);
    CHECK(result.status == VK_NOT_READY && !result.pso);
-   CHECK(!kk_pso_cache_acquire(&dev, &key, NULL, NULL, true));
+   CHECK(!kk_pso_cache_acquire(&dev, &key, NULL, NULL, &request));
    CHECK(producer_calls() == 1);
    release_producer();
    CHECK(thrd_join(thread, NULL) == thrd_success);
@@ -985,6 +985,37 @@ test_concurrent_specialize(void)
 }
 
 static void
+test_native_primitive_id(void)
+{
+   struct kk_device dev;
+   struct kk_physical_device pdev;
+   specialize_fixture(&dev, &pdev);
+   reset_producer(0);
+   release_producer();
+   reset_specializer(false, false);
+   struct kk_pso_key key;
+   color_key(&key, MTL_PIXEL_FORMAT_R8G8B8A8_UNORM, false, 0xf);
+   struct kk_pso_request request = { .native_primitive_id = true };
+   struct kk_pso_result result =
+      kk_pso_cache_get(&dev, &key, NULL, NULL, &request);
+   CHECK(result.status == VK_SUCCESS && result.pso);
+   CHECK(producer_calls() == 1 && specializer_calls() == 0);
+   struct kk_pso_key base;
+   kk_pso_base_key(&key, &base);
+   CHECK(!table_entry(&dev, &base));
+   CHECK(_mesa_hash_table_num_entries(dev.pso_cache.table) == 1);
+
+   struct kk_pso_key other;
+   color_key(&other, MTL_PIXEL_FORMAT_B8G8R8A8_UNORM, false, 0xf);
+   request.lookup_only = true;
+   result = kk_pso_cache_get(&dev, &other, NULL, NULL, &request);
+   CHECK(specializer_calls() == 0);
+   kk_pso_base_key(&other, &base);
+   CHECK(!table_entry(&dev, &base));
+   kk_pso_cache_finish(&dev.pso_cache);
+}
+
+static void
 test_specialize_fallback(void)
 {
    struct kk_device dev;
@@ -1358,6 +1389,7 @@ main(void)
    test_shared_base();
    test_concurrent_specialize();
    test_specialize_fallback();
+   test_native_primitive_id();
    test_specialize_lookup_only();
    test_native_retry();
    test_native_waiters();

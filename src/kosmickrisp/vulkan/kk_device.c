@@ -593,6 +593,10 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_mem_cache;
    }
    simple_mtx_init(&dev->empty_fs_lock, mtx_plain);
+   if (!kk_msl_helpers_init(&dev->msl_helpers)) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_mem_cache;
+   }
 
    result = kk_device_init_meta(dev);
    if (result != VK_SUCCESS)
@@ -660,6 +664,7 @@ fail_query_table:
 fail_meta:
    kk_device_finish_meta(dev);
 fail_mem_cache:
+   kk_msl_helpers_finish(&dev->msl_helpers);
    if (dev->pso_cache.table) {
       kk_pso_cache_finish(&dev->pso_cache);
       simple_mtx_destroy(&dev->empty_fs_lock);
@@ -712,6 +717,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
    kk_device_finish_empty_fs(dev);
    simple_mtx_destroy(&dev->empty_fs_lock);
+   kk_msl_helpers_finish(&dev->msl_helpers);
    kk_query_table_finish(dev, &dev->occlusion_queries);
    kk_destroy_sampler_heap(dev, &dev->samplers);
 

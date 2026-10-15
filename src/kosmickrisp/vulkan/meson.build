@@ -110,6 +110,8 @@ kk_files = files(
   'kk_shader.h',
   'kk_metal_cache.c',
   'kk_metal_cache.h',
+  'kk_msl_helpers.c',
+  'kk_msl_helpers.h',
   'kk_pso_cache.c',
   'kk_variant_history.c',
   'kk_variant_history.h',
@@ -276,6 +278,26 @@ if with_tests
     suite : ['kosmickrisp'],
     timeout : 30,
   )
+  if host_machine.system() == 'darwin'
+    test(
+      'kk-msl-helpers',
+      executable(
+        'kk-msl-helpers-test',
+        'tests/msl_helpers.c',
+        include_directories : [inc_include, inc_src],
+        dependencies : [
+          idep_nir,
+          idep_mesautil,
+          idep_mtl_bridge,
+          idep_msl_to_nir,
+          dependency('appleframeworks', modules : ['Foundation', 'Metal']),
+        ],
+        link_args : ['-Wl,-dead_strip'],
+      ),
+      suite : ['kosmickrisp'],
+      timeout : 600,
+    )
+  endif
   test(
     'kk-metal-trace',
     prog_python,
