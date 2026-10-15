@@ -18,6 +18,79 @@ struct io_slot_info {
    bool uses_interpolant;
 };
 
+struct msl_tex_group {
+   enum glsl_sampler_dim dim;
+   nir_alu_type type;
+   uint8_t access;
+   bool array;
+   bool depth;
+   bool coherent;
+};
+
+enum msl_tex_helper_kind {
+   MSL_TEX_HELPER_SAMPLE,
+   MSL_TEX_HELPER_GATHER,
+   MSL_TEX_HELPER_READ,
+   MSL_TEX_HELPER_WRITE,
+   MSL_TEX_HELPER_ATOMIC,
+   MSL_TEX_HELPER_CMPXCHG,
+   MSL_TEX_HELPER_FENCE,
+   MSL_TEX_HELPER_SIZE,
+   MSL_TEX_HELPER_LEVELS,
+   MSL_TEX_HELPER_SAMPLES,
+   MSL_TEX_HELPER_LOD_CLAMPED,
+   MSL_TEX_HELPER_LOD_UNCLAMPED,
+};
+
+enum msl_tex_helper_lod {
+   MSL_TEX_HELPER_LOD_NONE,
+   MSL_TEX_HELPER_LOD_BIAS,
+   MSL_TEX_HELPER_LOD_LEVEL,
+   MSL_TEX_HELPER_LOD_GRADIENT,
+};
+
+struct msl_tex_helper {
+   enum msl_tex_helper_kind kind;
+   enum msl_tex_helper_lod lod;
+   bool compare;
+   bool min_lod;
+   uint8_t component;
+   nir_atomic_op atomic;
+};
+
+#define MSL_TEX_HELPER_MAX_PARAMS 8
+
+struct msl_tex_helper_sig {
+   const char *ret;
+   const char *params[MSL_TEX_HELPER_MAX_PARAMS];
+   unsigned num_params;
+};
+
+struct msl_helper_ref {
+   struct msl_tex_group group;
+   struct msl_tex_helper op;
+};
+
+bool msl_tex_group_init(struct msl_tex_group *group,
+                        const nir_intrinsic_instr *handle);
+uint32_t msl_tex_group_id(const struct msl_tex_group *group);
+void msl_print_texture_type(struct _mesa_string_buffer *buf,
+                            const struct msl_tex_group *group);
+bool msl_tex_helper_valid(const struct msl_tex_group *group,
+                          const struct msl_tex_helper *op);
+void msl_tex_helper_signature(const struct msl_tex_group *group,
+                              const struct msl_tex_helper *op,
+                              struct msl_tex_helper_sig *sig);
+void msl_print_tex_helper_name(struct _mesa_string_buffer *buf,
+                               uint32_t group_id,
+                               const struct msl_tex_helper *op);
+void msl_print_tex_helper_decl(struct _mesa_string_buffer *buf,
+                               const struct msl_tex_group *group,
+                               const struct msl_tex_helper *op);
+unsigned msl_tex_coord_components(enum glsl_sampler_dim dim, bool read);
+const char *msl_texture_dim(enum glsl_sampler_dim dim);
+const char *msl_tex_type_name(nir_alu_type type);
+
 struct nir_to_msl_ctx {
    FILE *output;
    struct hash_table *types;
@@ -26,6 +99,7 @@ struct nir_to_msl_ctx {
    uint64_t disabled_workarounds;
    bool uses_per_draw_data;
    bool separate_io;
+   bool tex_helpers;
    unsigned short indentlevel;
    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];

@@ -38,6 +38,13 @@ mtl_new_library_function_descriptor(mtl_library *library,
    return NULL;
 }
 
+void
+mtl_function_descriptor_set_linked_functions(mtl_function_descriptor *function,
+                                             mtl_function_descriptor **functions,
+                                             uint32_t count)
+{
+}
+
 /* Compute pipeline */
 mtl_compute_pipeline_state *
 mtl_new_compute_pipeline_state(mtl_compiler *compiler,

@@ -103,6 +103,7 @@ VkBool32 kk_pso_prewarm_ready(struct kk_device *dev);
 
 struct kk_pso_request {
    bool lookup_only;
+   bool native_primitive_id;
 };
 
 struct kk_pso_result {
@@ -122,7 +123,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
 mtl_render_pipeline_state *
 kk_pso_cache_acquire(struct kk_device *dev, const struct kk_pso_key *key,
                      mtl_function_descriptor *vs, mtl_function_descriptor *fs,
-                     bool lookup_only);
+                     const struct kk_pso_request *request);
 
 struct kk_pso_result
 kk_link_pipeline(struct kk_device *dev, const struct kk_link_state *ls);

@@ -1327,6 +1327,7 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
       .mem_ctx = NULL,
       .disabled_workarounds = pdev->settings.disabled_workarounds,
       .separate_io = partition,
+      .use_helpers = !KK_DEBUG(NO_MSL_HELPERS),
    };
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       for (uint32_t i = 0u; i < MAX_DRAW_BUFFERS; ++i) {
@@ -1887,6 +1888,12 @@ kk_compile_compute_pipeline(struct kk_device *device,
 
    mtl_function_descriptor *function =
       mtl_new_library_function_descriptor(library, data->entrypoint_name);
+   VkResult link_result = kk_msl_helpers_link(device, function, data);
+   if (link_result != VK_SUCCESS) {
+      mtl_release(function);
+      mtl_release(library);
+      return link_result;
+   }
    struct mesa_blake3 hash;
    _mesa_blake3_init(&hash);
    const uint32_t kind = MESA_SHADER_COMPUTE;
@@ -2154,9 +2161,16 @@ kk_new_function(struct kk_device *device, const struct msl_compile_data *data,
    if (library == NULL)
       return VK_ERROR_INVALID_SHADER_NV;
 
-   *lib_out = library;
-   *fn_out =
+   mtl_function_descriptor *function =
       mtl_new_library_function_descriptor(library, data->entrypoint_name);
+   VkResult result = kk_msl_helpers_link(device, function, data);
+   if (result != VK_SUCCESS) {
+      mtl_release(function);
+      mtl_release(library);
+      return result;
+   }
+   *lib_out = library;
+   *fn_out = function;
    return VK_SUCCESS;
 }
 
@@ -2201,6 +2215,12 @@ kk_build_prerender(struct kk_device *device, struct kk_shader *vs,
 
    *rast_out = &vs->msl_data[vs_stage];
    return VK_SUCCESS;
+}
+
+static bool
+kk_msl_native_primitive_id(const struct msl_compile_data *data)
+{
+   return strstr(data->code, "[[primitive_id]]") != NULL;
 }
 
 static void
@@ -2259,13 +2279,18 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    if (vs->info.vs.has_ms)
       key.sample_count = vs->info.vs.sample_count;
 
+   struct kk_pso_request request = {
+      .lookup_only = kk_fail_on_compile,
+      .native_primitive_id =
+         kk_msl_native_primitive_id(&vs->msl_data[MESA_SHADER_FRAGMENT]),
+   };
    pipe->gfx.render = kk_pso_cache_acquire(device, &key, vertex_function,
-                                           fragment_function,
-                                           kk_fail_on_compile);
+                                           fragment_function, &request);
    if (pipe->gfx.render == NULL && kk_fail_on_compile) {
       struct kk_render_pending *pending = calloc(1, sizeof(*pending));
       if (pending && cnd_init(&pending->ready) == thrd_success) {
          pending->compiling = true;
+         pending->native_primitive_id = request.native_primitive_id;
          pending->key = key;
          pending->vertex_library = vertex_library;
          pending->vertex_function = vertex_function;
@@ -2275,8 +2300,9 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
          return VK_SUCCESS;
       }
       free(pending);
-      pipe->gfx.render = kk_pso_cache_acquire(
-         device, &key, vertex_function, fragment_function, false);
+      request.lookup_only = false;
+      pipe->gfx.render = kk_pso_cache_acquire(device, &key, vertex_function,
+                                              fragment_function, &request);
    }
    if (pipe->gfx.render == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
@@ -2540,6 +2566,7 @@ kk_init_fast_fs(struct kk_device *device, struct kk_shader *fs)
       return result;
 
    _mesa_blake3_compute(data->code, strlen(data->code), fs->fast.hash);
+   fs->fast.native_primitive_id = kk_msl_native_primitive_id(data);
 
    fs->variants =
       _mesa_hash_table_create(NULL, kk_fs_link_key_hash, kk_fs_link_key_equal);
@@ -3435,6 +3462,7 @@ kk_compile_fs_variant(struct kk_device *dev, struct kk_shader *fs,
                _mesa_blake3_compute(data.code, strlen(data.code),
                                     variant->hash);
                variant->shader_blend = key->shader_blend;
+               variant->native_primitive_id = kk_msl_native_primitive_id(&data);
             }
          } else {
             result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
@@ -3541,6 +3569,7 @@ kk_compile_fs_variant(struct kk_device *dev, struct kk_shader *fs,
    if (result == VK_SUCCESS) {
       _mesa_blake3_compute(data.code, strlen(data.code), variant->hash);
       variant->shader_blend = key->shader_blend;
+      variant->native_primitive_id = kk_msl_native_primitive_id(&data);
       if (cache) {
          struct blob blob;
          blob_init(&blob);

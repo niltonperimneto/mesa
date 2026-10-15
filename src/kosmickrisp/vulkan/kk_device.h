@@ -8,6 +8,7 @@
 #ifndef KK_DEVICE_H
 #define KK_DEVICE_H 1
 
+#include "kk_msl_helpers.h"
 #include "kk_private.h"
 #include "kk_pso_cache.h"
 
@@ -155,6 +156,7 @@ struct kk_device {
    util_once_flag heap_init_once;
 
    struct kk_pso_cache pso_cache;
+   struct kk_msl_helpers msl_helpers;
    simple_mtx_t empty_fs_lock;
    struct kk_shader *empty_fs;
 };

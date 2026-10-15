@@ -25,10 +25,14 @@ struct nir_to_msl_options {
    uint8_t rts_component_count[MAX_DRAW_BUFFERS];
 
    bool separate_io;
+   bool use_helpers;
 };
 
 /* Assumes nir_shader_gather_info has been called beforehand. */
 char *nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options);
+
+bool msl_helper_name_group(const char *name, uint32_t *group);
+char *msl_helper_group_source(void *mem_ctx, uint32_t group);
 
 /* Call this after all API-specific lowerings. It will bring the NIR out of SSA
  * at the end */

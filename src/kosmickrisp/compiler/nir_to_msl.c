@@ -5,6 +5,7 @@
  */
 
 #include "nir_to_msl.h"
+#include "util/u_dynarray.h"
 #include "msl_private.h"
 #include "nir.h"
 #include "nir_builder.h"
@@ -640,50 +641,6 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
 
 #undef ALU_BINOP
 
-static const char *
-texture_dim(enum glsl_sampler_dim dim)
-{
-   switch (dim) {
-   case GLSL_SAMPLER_DIM_1D:
-      return "1d";
-   case GLSL_SAMPLER_DIM_2D:
-      return "2d";
-   case GLSL_SAMPLER_DIM_3D:
-      return "3d";
-   case GLSL_SAMPLER_DIM_CUBE:
-      return "cube";
-   case GLSL_SAMPLER_DIM_BUF:
-      return "_buffer";
-   case GLSL_SAMPLER_DIM_MS:
-      return "2d_ms";
-   default:
-      fprintf(stderr, "Bad texture dim %d\n", dim);
-      assert(!"Bad texture dimension");
-      return "BAD";
-   }
-}
-
-static const char *
-tex_type_name(nir_alu_type ty)
-{
-   switch (ty) {
-   case nir_type_int16:
-      return "short";
-   case nir_type_int32:
-      return "int";
-   case nir_type_uint16:
-      return "ushort";
-   case nir_type_uint32:
-      return "uint";
-   case nir_type_float16:
-      return "half";
-   case nir_type_float32:
-      return "float";
-   default:
-      return "BAD";
-   }
-}
-
 static bool
 instrinsic_needs_dest_type(nir_intrinsic_instr *instr)
 {
@@ -1027,38 +984,9 @@ msl_emit_texture_type(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    assert(instr->intrinsic == nir_intrinsic_load_texture_handle_kk ||
           instr->intrinsic == nir_intrinsic_load_depth_texture_kk);
 
-   const char *dim = texture_dim(nir_intrinsic_image_dim(instr));
-   const char *arrayed = nir_intrinsic_image_array(instr) ? "_array" : "";
-
-   if (instr->intrinsic == nir_intrinsic_load_texture_handle_kk) {
-      const char *access = "";
-      const char *coherent = nir_intrinsic_access(instr) & ACCESS_COHERENT
-                                ? ", memory_coherence_device"
-                                : "";
-      switch (nir_intrinsic_flags(instr)) {
-      case MSL_ACCESS_READ:
-         access = ", access::read";
-         break;
-      case MSL_ACCESS_WRITE:
-         access = ", access::write";
-         break;
-      case MSL_ACCESS_READ_WRITE:
-         access = ", access::read_write";
-         /* TODO_KOSMICKRISP We shouldn't need this line below but it doesn't
-          * seem we get the correct access values for what should be device
-          * coherent textures from NIR. Example test:
-          * dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_fence.atomicwrite.device.payload_local.image.guard_local.buffer.comp
-          * This test declares the texture as devicecoherent, but in NIR it
-          * appears as resctrict only with no coherent.
-          */
-         coherent = ", memory_coherence_device";
-         break;
-      }
-      P(ctx, "texture%s%s<%s%s%s>", dim, arrayed,
-        tex_type_name(nir_intrinsic_dest_type(instr)), access, coherent);
-   } else if (instr->intrinsic == nir_intrinsic_load_depth_texture_kk) {
-      P(ctx, "depth%s%s<float>", dim, arrayed);
-   }
+   struct msl_tex_group group;
+   msl_tex_group_init(&group, instr);
+   msl_print_texture_type(ctx->text, &group);
 }
 
 static const char *
@@ -1078,6 +1006,455 @@ global_access_qualifier(struct nir_to_msl_ctx *ctx,
    return access & ACCESS_COHERENT ? "coherent device" : "device";
 }
 
+static nir_src *
+nir_tex_get_src(struct nir_tex_instr *tex, nir_tex_src_type type)
+{
+   int idx = nir_tex_instr_src_index(tex, type);
+   if (idx == -1)
+      return NULL;
+   return &tex->src[idx].src;
+}
+
+static nir_intrinsic_instr *
+texture_handle_intrinsic(nir_src *src)
+{
+   if (!src)
+      return NULL;
+   nir_instr *instr = nir_def_instr(src->ssa);
+   if (instr->type != nir_instr_type_intrinsic)
+      return NULL;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_texture_handle_kk &&
+       intr->intrinsic != nir_intrinsic_load_depth_texture_kk)
+      return NULL;
+   return intr;
+}
+
+static bool
+src_is_scalar(nir_src *src)
+{
+   return !src || src->ssa->num_components == 1;
+}
+
+static bool
+tex_size_fits(const struct msl_tex_group *group, enum glsl_sampler_dim dim,
+              bool array)
+{
+   bool height = dim != GLSL_SAMPLER_DIM_1D && dim != GLSL_SAMPLER_DIM_BUF;
+   return (!height || group->dim != GLSL_SAMPLER_DIM_BUF) &&
+          (dim != GLSL_SAMPLER_DIM_3D || group->dim == GLSL_SAMPLER_DIM_3D) &&
+          (!array || group->array);
+}
+
+static unsigned
+tex_size_components(enum glsl_sampler_dim dim, bool array, char *swizzle)
+{
+   unsigned n = 0;
+   swizzle[n++] = 'x';
+   if (dim != GLSL_SAMPLER_DIM_1D && dim != GLSL_SAMPLER_DIM_BUF)
+      swizzle[n++] = 'y';
+   if (dim == GLSL_SAMPLER_DIM_3D)
+      swizzle[n++] = 'z';
+   if (array)
+      swizzle[n++] = 'w';
+   swizzle[n] = '\0';
+   return n;
+}
+
+static bool
+tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
+                   struct msl_tex_helper *op)
+{
+   nir_src *h_src = nir_tex_get_src(tex, nir_tex_src_texture_handle);
+   nir_intrinsic_instr *handle = texture_handle_intrinsic(h_src);
+   if (!handle || !msl_tex_group_init(group, handle))
+      return false;
+
+   memset(op, 0, sizeof(*op));
+   nir_src *coord = nir_tex_get_src(tex, nir_tex_src_coord);
+   nir_src *sampler = nir_tex_get_src(tex, nir_tex_src_sampler_handle);
+   nir_src *comparator = nir_tex_get_src(tex, nir_tex_src_comparator);
+   nir_src *bias = nir_tex_get_src(tex, nir_tex_src_bias);
+   nir_src *lod = nir_tex_get_src(tex, nir_tex_src_lod);
+   nir_src *ddx = nir_tex_get_src(tex, nir_tex_src_ddx);
+   nir_src *ddy = nir_tex_get_src(tex, nir_tex_src_ddy);
+   nir_src *min_lod = nir_tex_get_src(tex, nir_tex_src_min_lod);
+   uint64_t allowed = BITFIELD64_BIT(nir_tex_src_texture_handle) |
+                      BITFIELD64_BIT(nir_tex_src_sampler_handle);
+   bool same_type =
+      group->dim == tex->sampler_dim && group->array == tex->is_array;
+   unsigned sample_coords = msl_tex_coord_components(group->dim, false);
+   unsigned read_coords = msl_tex_coord_components(group->dim, true);
+   unsigned coord_components =
+      coord ? tex->coord_components - tex->is_array : 0;
+
+   switch (tex->op) {
+   case nir_texop_tex:
+   case nir_texop_txb:
+   case nir_texop_txl:
+   case nir_texop_txd:
+      allowed |=
+         BITFIELD64_BIT(nir_tex_src_coord) |
+         BITFIELD64_BIT(nir_tex_src_comparator) |
+         BITFIELD64_BIT(nir_tex_src_bias) | BITFIELD64_BIT(nir_tex_src_lod) |
+         BITFIELD64_BIT(nir_tex_src_ddx) | BITFIELD64_BIT(nir_tex_src_ddy) |
+         BITFIELD64_BIT(nir_tex_src_min_lod);
+      op->kind = MSL_TEX_HELPER_SAMPLE;
+      op->compare = comparator;
+      op->min_lod = min_lod;
+      if (!!bias + !!lod + !!ddx > 1 || !ddx != !ddy)
+         return false;
+      op->lod = bias  ? MSL_TEX_HELPER_LOD_BIAS
+                : lod ? MSL_TEX_HELPER_LOD_LEVEL
+                : ddx ? MSL_TEX_HELPER_LOD_GRADIENT
+                      : MSL_TEX_HELPER_LOD_NONE;
+      if (!same_type || !sampler || !coord ||
+          coord_components != sample_coords || !src_is_scalar(comparator) ||
+          !src_is_scalar(bias) || !src_is_scalar(lod) ||
+          !src_is_scalar(min_lod) ||
+          (ddx && (ddx->ssa->num_components != sample_coords ||
+                   ddy->ssa->num_components != sample_coords)))
+         return false;
+      break;
+   case nir_texop_txf:
+   case nir_texop_txf_ms: {
+      nir_src *extra = tex->op == nir_texop_txf
+                          ? lod
+                          : nir_tex_get_src(tex, nir_tex_src_ms_index);
+      allowed |=
+         BITFIELD64_BIT(nir_tex_src_coord) |
+         BITFIELD64_BIT(tex->op == nir_texop_txf ? nir_tex_src_lod
+                                                 : nir_tex_src_ms_index);
+      op->kind = MSL_TEX_HELPER_READ;
+      if (!same_type || !coord || coord_components != read_coords ||
+          !src_is_scalar(extra) || (tex->op == nir_texop_txf_ms && !extra) ||
+          (group->dim == GLSL_SAMPLER_DIM_BUF && extra))
+         return false;
+      break;
+   }
+   case nir_texop_txs: {
+      char swizzle[5];
+      allowed |= BITFIELD64_BIT(nir_tex_src_lod);
+      op->kind = MSL_TEX_HELPER_SIZE;
+      if (!src_is_scalar(lod) ||
+          !tex_size_fits(group, tex->sampler_dim, tex->is_array) ||
+          tex_size_components(tex->sampler_dim, tex->is_array, swizzle) !=
+             tex->def.num_components)
+         return false;
+      break;
+   }
+   case nir_texop_query_levels:
+      op->kind = MSL_TEX_HELPER_LEVELS;
+      break;
+   case nir_texop_texture_samples:
+      op->kind = MSL_TEX_HELPER_SAMPLES;
+      break;
+   case nir_texop_tg4:
+      allowed |= BITFIELD64_BIT(nir_tex_src_coord) |
+                 BITFIELD64_BIT(nir_tex_src_comparator);
+      op->kind = MSL_TEX_HELPER_GATHER;
+      op->compare = comparator;
+      op->component = comparator ? 0 : tex->component;
+      if (!same_type || !sampler || !coord ||
+          coord_components != sample_coords || !src_is_scalar(comparator))
+         return false;
+      break;
+   case nir_texop_lod: {
+      nir_src *max_lod = nir_tex_get_src(tex, nir_tex_src_max_lod_kk);
+      allowed |= BITFIELD64_BIT(nir_tex_src_coord) |
+                 BITFIELD64_BIT(nir_tex_src_bias) |
+                 BITFIELD64_BIT(nir_tex_src_min_lod) |
+                 BITFIELD64_BIT(nir_tex_src_max_lod_kk);
+      op->kind = MSL_TEX_HELPER_LOD_CLAMPED;
+      if (!sampler || !coord || !bias || !min_lod || !max_lod ||
+          coord->ssa->num_components != sample_coords || !src_is_scalar(bias) ||
+          !src_is_scalar(min_lod) || !src_is_scalar(max_lod))
+         return false;
+      break;
+   }
+   default:
+      return false;
+   }
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (!(allowed & BITFIELD64_BIT(tex->src[i].src_type)))
+         return false;
+   }
+   return msl_tex_helper_valid(group, op);
+}
+
+static bool
+is_image_helper_intrinsic(nir_intrinsic_op op)
+{
+   switch (op) {
+   case nir_intrinsic_bindless_image_levels:
+   case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_bindless_image_atomic_swap:
+   case nir_intrinsic_bindless_image_fence_kk:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+tex_helper_for_image(nir_intrinsic_instr *instr, struct msl_tex_group *group,
+                     struct msl_tex_helper *op)
+{
+   nir_intrinsic_instr *handle = texture_handle_intrinsic(&instr->src[0]);
+   if (!handle || !msl_tex_group_init(group, handle))
+      return false;
+
+   memset(op, 0, sizeof(*op));
+   bool coords = true;
+   switch (instr->intrinsic) {
+   case nir_intrinsic_bindless_image_levels:
+      op->kind = MSL_TEX_HELPER_LEVELS;
+      coords = false;
+      break;
+   case nir_intrinsic_bindless_image_fence_kk:
+      op->kind = MSL_TEX_HELPER_FENCE;
+      coords = false;
+      break;
+   case nir_intrinsic_bindless_image_load:
+      op->kind = MSL_TEX_HELPER_READ;
+      if (!src_is_scalar(&instr->src[3]))
+         return false;
+      break;
+   case nir_intrinsic_bindless_image_store:
+      op->kind = MSL_TEX_HELPER_WRITE;
+      if (instr->src[3].ssa->num_components != 4 ||
+          !src_is_scalar(&instr->src[4]))
+         return false;
+      break;
+   case nir_intrinsic_bindless_image_atomic:
+      op->kind = MSL_TEX_HELPER_ATOMIC;
+      op->atomic = nir_intrinsic_atomic_op(instr);
+      if (instr->def.num_components != 1 || !src_is_scalar(&instr->src[3]))
+         return false;
+      break;
+   case nir_intrinsic_bindless_image_atomic_swap:
+      op->kind = MSL_TEX_HELPER_CMPXCHG;
+      if (nir_intrinsic_atomic_op(instr) != nir_atomic_op_cmpxchg ||
+          instr->def.num_components != 1 || !src_is_scalar(&instr->src[3]) ||
+          !src_is_scalar(&instr->src[4]))
+         return false;
+      break;
+   default:
+      return false;
+   }
+
+   if (coords) {
+      unsigned components =
+         msl_tex_coord_components(nir_intrinsic_image_dim(instr), true) +
+         nir_intrinsic_image_array(instr);
+      if (nir_intrinsic_image_dim(instr) != group->dim ||
+          nir_intrinsic_image_array(instr) != group->array ||
+          components <= group->array ||
+          instr->src[1].ssa->num_components < components)
+         return false;
+   }
+   return msl_tex_helper_valid(group, op);
+}
+
+static bool
+texture_handle_uses_supported(nir_def *def)
+{
+   nir_foreach_use_including_if(use, def) {
+      if (nir_src_is_if(use))
+         return false;
+      nir_instr *parent = nir_src_use_instr(use);
+      if (parent->type == nir_instr_type_tex) {
+         nir_tex_src *tex_src = container_of(use, nir_tex_src, src);
+         if (tex_src->src_type != nir_tex_src_texture_handle)
+            return false;
+      } else if (parent->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(parent);
+         if (!is_image_helper_intrinsic(intr->intrinsic) ||
+             use != &intr->src[0])
+            return false;
+      } else {
+         return false;
+      }
+   }
+   return true;
+}
+
+static void
+add_helper_ref(struct util_dynarray *refs, const struct msl_tex_group *group,
+               const struct msl_tex_helper *op)
+{
+   uint32_t id = msl_tex_group_id(group);
+   util_dynarray_foreach(refs, struct msl_helper_ref, ref) {
+      if (msl_tex_group_id(&ref->group) == id &&
+          !memcmp(&ref->op, op, sizeof(*op)))
+         return;
+   }
+   struct msl_helper_ref ref = {.group = *group, .op = *op};
+   util_dynarray_append(refs, ref);
+}
+
+static bool
+collect_tex_helpers(nir_function_impl *impl, struct util_dynarray *refs)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         struct msl_tex_group group;
+         struct msl_tex_helper op;
+         if (instr->type == nir_instr_type_tex) {
+            if (!tex_helper_for_tex(nir_instr_as_tex(instr), &group, &op))
+               return false;
+            add_helper_ref(refs, &group, &op);
+            if (op.kind == MSL_TEX_HELPER_LOD_CLAMPED) {
+               op.kind = MSL_TEX_HELPER_LOD_UNCLAMPED;
+               add_helper_ref(refs, &group, &op);
+            }
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_texture_handle_kk ||
+                intr->intrinsic == nir_intrinsic_load_depth_texture_kk) {
+               if (!texture_handle_uses_supported(&intr->def))
+                  return false;
+            } else if (is_image_helper_intrinsic(intr->intrinsic)) {
+               if (!tex_helper_for_image(intr, &group, &op))
+                  return false;
+               add_helper_ref(refs, &group, &op);
+            }
+         }
+      }
+   }
+   return true;
+}
+
+static void
+helper_call_begin(struct nir_to_msl_ctx *ctx, const struct msl_tex_group *group,
+                  const struct msl_tex_helper *op, nir_src *handle,
+                  struct msl_tex_helper_sig *sig)
+{
+   msl_tex_helper_signature(group, op, sig);
+   msl_print_tex_helper_name(ctx->text, msl_tex_group_id(group), op);
+   P(ctx, "(");
+   src_to_msl(ctx, handle);
+}
+
+static void
+helper_arg(struct nir_to_msl_ctx *ctx, const struct msl_tex_helper_sig *sig,
+           unsigned *param, nir_src *src)
+{
+   const char *type = sig->params[(*param)++];
+   if (!strcmp(type, "sampler")) {
+      P(ctx, ", ");
+      src_to_msl(ctx, src);
+      return;
+   }
+   P(ctx, ", %s(", type);
+   if (src)
+      src_to_msl(ctx, src);
+   else
+      P(ctx, "0");
+   P(ctx, ")");
+}
+
+static void
+helper_coord_args(struct nir_to_msl_ctx *ctx,
+                  const struct msl_tex_helper_sig *sig, unsigned *param,
+                  nir_src *coord, unsigned components, bool is_array)
+{
+   P(ctx, ", %s(", sig->params[(*param)++]);
+   src_to_msl(ctx, coord);
+   if (components < coord->ssa->num_components) {
+      P(ctx, ".");
+      for (unsigned i = 0; i < components; i++)
+         P(ctx, "%c", "xyzw"[i]);
+   }
+   P(ctx, ")");
+   if (is_array) {
+      P(ctx, ", %s(", sig->params[(*param)++]);
+      round_src_component_to_uint(ctx, coord, "xyzw"[components]);
+      P(ctx, ")");
+   }
+}
+
+static void
+image_helper_coord_args(struct nir_to_msl_ctx *ctx,
+                        const struct msl_tex_helper_sig *sig, unsigned *param,
+                        nir_intrinsic_instr *instr)
+{
+   helper_coord_args(
+      ctx, sig, param, &instr->src[1],
+      msl_tex_coord_components(nir_intrinsic_image_dim(instr), true),
+      nir_intrinsic_image_array(instr));
+}
+
+static void
+image_helper_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+{
+   struct msl_tex_group group;
+   struct msl_tex_helper op;
+   struct msl_tex_helper_sig sig;
+   unsigned param = 0;
+   ASSERTED bool valid = tex_helper_for_image(instr, &group, &op);
+   assert(valid);
+   bool has_lod = group.dim != GLSL_SAMPLER_DIM_BUF;
+
+   switch (instr->intrinsic) {
+   case nir_intrinsic_bindless_image_levels:
+      helper_call_begin(ctx, &group, &op, &instr->src[0], &sig);
+      P(ctx, ");\n");
+      break;
+   case nir_intrinsic_bindless_image_fence_kk:
+      P_INDENT(ctx);
+      helper_call_begin(ctx, &group, &op, &instr->src[0], &sig);
+      P(ctx, ");\n");
+      break;
+   case nir_intrinsic_bindless_image_load:
+      helper_call_begin(ctx, &group, &op, &instr->src[0], &sig);
+      image_helper_coord_args(ctx, &sig, &param, instr);
+      if (has_lod)
+         helper_arg(ctx, &sig, &param, &instr->src[3]);
+      P(ctx, ").");
+      for (uint32_t i = 0u; i < instr->def.num_components; ++i)
+         P(ctx, "%c", "xyzw"[i]);
+      P(ctx, ";\n");
+      break;
+   case nir_intrinsic_bindless_image_store:
+      P_INDENT(ctx);
+      helper_call_begin(ctx, &group, &op, &instr->src[0], &sig);
+      helper_arg(ctx, &sig, &param, &instr->src[3]);
+      image_helper_coord_args(ctx, &sig, &param, instr);
+      if (has_lod)
+         helper_arg(ctx, &sig, &param, &instr->src[4]);
+      P(ctx, ");\n");
+      break;
+   case nir_intrinsic_bindless_image_atomic:
+      helper_call_begin(ctx, &group, &op, &instr->src[0], &sig);
+      image_helper_coord_args(ctx, &sig, &param, instr);
+      helper_arg(ctx, &sig, &param, &instr->src[3]);
+      P(ctx, ").x;\n");
+      break;
+   case nir_intrinsic_bindless_image_atomic_swap:
+      P_IND(ctx, "%s t%d = ", msl_type_for_def(ctx->types, &instr->def),
+            instr->def.index);
+      helper_call_begin(ctx, &group, &op, &instr->src[0], &sig);
+      image_helper_coord_args(ctx, &sig, &param, instr);
+      helper_arg(ctx, &sig, &param, &instr->src[3]);
+      helper_arg(ctx, &sig, &param, &instr->src[4]);
+      P(ctx, ");\n");
+      break;
+   default:
+      UNREACHABLE("not an image helper");
+   }
+}
+
+static void
+emit_helper_decls(struct nir_to_msl_ctx *ctx, struct util_dynarray *refs)
+{
+   util_dynarray_foreach(refs, struct msl_helper_ref, ref)
+      msl_print_tex_helper_decl(ctx->text, &ref->group, &ref->op);
+}
+
 static void
 intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 {
@@ -1093,6 +1470,10 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
    if (instrinsic_needs_dest_type(instr)) {
       P_IND(ctx, "t%d = ", instr->def.index);
+   }
+   if (ctx->tex_helpers && is_image_helper_intrinsic(instr->intrinsic)) {
+      image_helper_to_msl(ctx, instr);
+      return;
    }
    switch (instr->intrinsic) {
    case nir_intrinsic_decl_reg: {
@@ -1273,7 +1654,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       bool needs_padding =
          FRAG_RESULT_DATA0 <= io.location && io.location <= FRAG_RESULT_DATA7;
       if (needs_padding) {
-         const char *type = tex_type_name(nir_intrinsic_dest_type(instr));
+         const char *type = msl_tex_type_name(nir_intrinsic_dest_type(instr));
          uint32_t num_components =
             ctx->outputs_info[io.location].num_components;
          if (num_components == 1) {
@@ -1571,6 +1952,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       break;
    case nir_intrinsic_load_texture_handle_kk:
    case nir_intrinsic_load_depth_texture_kk:
+      if (ctx->tex_helpers) {
+         src_to_msl(ctx, &instr->src[0]);
+         P(ctx, ";\n");
+         break;
+      }
       P(ctx, "*(constant ");
       msl_emit_texture_type(ctx, instr);
       P(ctx, "*)");
@@ -1806,20 +2192,121 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    }
 }
 
-static nir_src *
-nir_tex_get_src(struct nir_tex_instr *tex, nir_tex_src_type type)
-{
-   int idx = nir_tex_instr_src_index(tex, type);
-   if (idx == -1)
-      return NULL;
-   return &tex->src[idx].src;
-}
-
 static void
 tex_coord_swizzle(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
 {
    texture_src_coord_swizzle(ctx, nir_tex_get_src(tex, nir_tex_src_coord),
                              tex->coord_components, false, tex->is_array);
+}
+
+static void
+tex_helper_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
+{
+   nir_src *texhandle = nir_tex_get_src(tex, nir_tex_src_texture_handle);
+   nir_src *sampler = nir_tex_get_src(tex, nir_tex_src_sampler_handle);
+   nir_src *coord = nir_tex_get_src(tex, nir_tex_src_coord);
+   nir_src *lod = nir_tex_get_src(tex, nir_tex_src_lod);
+   struct msl_tex_group group;
+   struct msl_tex_helper op;
+   struct msl_tex_helper_sig sig;
+   unsigned param = 0;
+   ASSERTED bool valid = tex_helper_for_tex(tex, &group, &op);
+   assert(valid);
+
+   switch (tex->op) {
+   case nir_texop_tex:
+   case nir_texop_txb:
+   case nir_texop_txl:
+   case nir_texop_txd:
+      helper_call_begin(ctx, &group, &op, texhandle, &sig);
+      helper_arg(ctx, &sig, &param, sampler);
+      helper_coord_args(ctx, &sig, &param, coord,
+                        tex->coord_components - tex->is_array, tex->is_array);
+      if (op.compare)
+         helper_arg(ctx, &sig, &param,
+                    nir_tex_get_src(tex, nir_tex_src_comparator));
+      switch (op.lod) {
+      case MSL_TEX_HELPER_LOD_BIAS:
+         helper_arg(ctx, &sig, &param, nir_tex_get_src(tex, nir_tex_src_bias));
+         break;
+      case MSL_TEX_HELPER_LOD_LEVEL:
+         helper_arg(ctx, &sig, &param, lod);
+         break;
+      case MSL_TEX_HELPER_LOD_GRADIENT:
+         helper_arg(ctx, &sig, &param, nir_tex_get_src(tex, nir_tex_src_ddx));
+         helper_arg(ctx, &sig, &param, nir_tex_get_src(tex, nir_tex_src_ddy));
+         break;
+      case MSL_TEX_HELPER_LOD_NONE:
+         break;
+      }
+      if (op.min_lod)
+         helper_arg(ctx, &sig, &param,
+                    nir_tex_get_src(tex, nir_tex_src_min_lod));
+      P(ctx, ");\n");
+      break;
+   case nir_texop_txf:
+   case nir_texop_txf_ms:
+      helper_call_begin(ctx, &group, &op, texhandle, &sig);
+      helper_coord_args(ctx, &sig, &param, coord,
+                        tex->coord_components - tex->is_array, tex->is_array);
+      if (group.dim != GLSL_SAMPLER_DIM_BUF)
+         helper_arg(ctx, &sig, &param,
+                    tex->op == nir_texop_txf
+                       ? lod
+                       : nir_tex_get_src(tex, nir_tex_src_ms_index));
+      P(ctx, ");\n");
+      break;
+   case nir_texop_txs: {
+      char swizzle[5];
+      unsigned n =
+         tex_size_components(tex->sampler_dim, tex->is_array, swizzle);
+      if (n > 1) {
+         P(ctx, "%s%u(", msl_tex_type_name(tex->dest_type), n);
+      } else {
+         P(ctx, "%s(", msl_tex_type_name(tex->dest_type));
+      }
+      helper_call_begin(ctx, &group, &op, texhandle, &sig);
+      helper_arg(ctx, &sig, &param, lod);
+      P(ctx, ").%s);\n", swizzle);
+      break;
+   }
+   case nir_texop_query_levels:
+   case nir_texop_texture_samples:
+      helper_call_begin(ctx, &group, &op, texhandle, &sig);
+      P(ctx, ");\n");
+      break;
+   case nir_texop_tg4:
+      helper_call_begin(ctx, &group, &op, texhandle, &sig);
+      helper_arg(ctx, &sig, &param, sampler);
+      helper_coord_args(ctx, &sig, &param, coord,
+                        tex->coord_components - tex->is_array, tex->is_array);
+      if (op.compare)
+         helper_arg(ctx, &sig, &param,
+                    nir_tex_get_src(tex, nir_tex_src_comparator));
+      P(ctx, ");\n");
+      break;
+   case nir_texop_lod:
+      P(ctx, "float2(clamp(");
+      helper_call_begin(ctx, &group, &op, texhandle, &sig);
+      helper_arg(ctx, &sig, &param, sampler);
+      helper_arg(ctx, &sig, &param, coord);
+      P(ctx, ") + ");
+      src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_bias));
+      P(ctx, ", ");
+      src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_min_lod));
+      P(ctx, ", ");
+      src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_max_lod_kk));
+      P(ctx, "), ");
+      op.kind = MSL_TEX_HELPER_LOD_UNCLAMPED;
+      param = 0;
+      helper_call_begin(ctx, &group, &op, texhandle, &sig);
+      helper_arg(ctx, &sig, &param, sampler);
+      helper_arg(ctx, &sig, &param, coord);
+      P(ctx, "));\n");
+      break;
+   default:
+      UNREACHABLE("texture op without a helper");
+   }
 }
 
 static void
@@ -1831,6 +2318,10 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
    assert(!nir_tex_get_src(tex, nir_tex_src_projector));
 
    P_IND(ctx, "t%d = ", tex->def.index);
+   if (ctx->tex_helpers) {
+      tex_helper_to_msl(ctx, tex);
+      return;
+   }
 
    switch (tex->op) {
    case nir_texop_tex:
@@ -1868,7 +2359,7 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          P(ctx, ")");
       }
       if (ddx) {
-         P(ctx, ", gradient%s(", texture_dim(tex->sampler_dim));
+         P(ctx, ", gradient%s(", msl_texture_dim(tex->sampler_dim));
          src_to_msl(ctx, ddx);
          P(ctx, ", ");
          src_to_msl(ctx, ddy);
@@ -1909,10 +2400,10 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
    case nir_texop_txs: {
       nir_src *lod = nir_tex_get_src(tex, nir_tex_src_lod);
       if (tex->def.num_components > 1u) {
-         P(ctx, "%s%d(", tex_type_name(tex->dest_type),
+         P(ctx, "%s%d(", msl_tex_type_name(tex->dest_type),
            tex->def.num_components);
       } else {
-         P(ctx, "%s(", tex_type_name(tex->dest_type));
+         P(ctx, "%s(", msl_tex_type_name(tex->dest_type));
       }
       src_to_msl(ctx, texhandle);
       P(ctx, ".get_width(")
@@ -2463,7 +2954,9 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
          default:
             continue;
          }
-         if (msl_def_is_texture(ctx, def)) {
+         if (msl_def_is_texture(ctx, def) && ctx->tex_helpers) {
+            P_IND(ctx, "ulong t%u;\n", def->index);
+         } else if (msl_def_is_texture(ctx, def)) {
             P_INDENT(ctx);
             msl_emit_texture_type(ctx, nir_instr_as_intrinsic(instr));
             P(ctx, " t%u;\n", def->index);
@@ -2471,10 +2964,7 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
             const char *type = msl_type_for_def(ctx->types, def);
             if (!type)
                continue;
-            if (msl_def_is_sampler(ctx, def)) {
-               P_IND(ctx, "%s t%u;\n", type, def->index);
-            } else
-               P_IND(ctx, "%s t%u = %s(0);\n", type, def->index, type);
+            P_IND(ctx, "%s t%u;\n", type, def->index);
          }
       }
    }
@@ -2519,12 +3009,20 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    msl_gather_info(&ctx, options);
 
+   struct util_dynarray helpers;
+   util_dynarray_init(&helpers, NULL);
+   ctx.tex_helpers =
+      options->use_helpers && collect_tex_helpers(impl, &helpers);
+
    P(&ctx, "// Generated by Mesa compiler\n");
    if (shader->info.stage == MESA_SHADER_COMPUTE ||
        shader->info.stage == MESA_SHADER_TESS_CTRL)
       P(&ctx, "#include <metal_compute>\n");
    P(&ctx, "#include <metal_stdlib>\n");
    P(&ctx, "using namespace metal;\n");
+   if (ctx.tex_helpers)
+      emit_helper_decls(&ctx, &helpers);
+   util_dynarray_fini(&helpers);
 
    msl_emit_constant_data(&ctx, shader);
 

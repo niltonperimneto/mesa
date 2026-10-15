@@ -572,9 +572,9 @@ kk_pso_entry_insert_locked(struct kk_pso_cache *cache, uint32_t hash,
 static mtl_render_pipeline_state *
 kk_pso_build(struct kk_device *dev, const struct kk_pso_key *key,
              mtl_function_descriptor *vs, mtl_function_descriptor *fs,
-             bool lookup_only)
+             bool lookup_only, bool specialize)
 {
-   if (!kk_pso_key_specializable(key))
+   if (!specialize || !kk_pso_key_specializable(key))
       return kk_new_render_pipeline(dev, vs, fs, key, lookup_only);
 
    struct kk_pso_key base_key;
@@ -595,11 +595,12 @@ kk_pso_build(struct kk_device *dev, const struct kk_pso_key *key,
 
 static struct kk_pso_result
 kk_pso_entry_compile(struct kk_device *dev, struct kk_pso_entry *entry,
-                     const struct kk_pso_key *key,
-                     mtl_function_descriptor *vs, mtl_function_descriptor *fs)
+                     const struct kk_pso_key *key, mtl_function_descriptor *vs,
+                     mtl_function_descriptor *fs, bool specialize)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
-   mtl_render_pipeline_state *pso = kk_pso_build(dev, key, vs, fs, false);
+   mtl_render_pipeline_state *pso =
+      kk_pso_build(dev, key, vs, fs, false, specialize);
    VkResult status = pso ? VK_SUCCESS : VK_ERROR_UNKNOWN;
    mtx_lock(&cache->lock);
    if (pso) {
@@ -620,13 +621,13 @@ kk_pso_entry_compile(struct kk_device *dev, struct kk_pso_entry *entry,
 static struct kk_pso_result
 kk_pso_found(struct kk_device *dev, struct kk_pso_entry *entry,
              const struct kk_pso_key *key, mtl_function_descriptor *vs,
-             mtl_function_descriptor *fs, bool lookup_only)
+             mtl_function_descriptor *fs, bool lookup_only, bool specialize)
 {
    bool compile = false;
    struct kk_pso_result result = kk_pso_entry_get(
       dev, entry, key, !lookup_only, lookup_only ? NULL : &compile);
    if (compile)
-      return kk_pso_entry_compile(dev, entry, key, vs, fs);
+      return kk_pso_entry_compile(dev, entry, key, vs, fs, specialize);
    return result;
 }
 
@@ -638,6 +639,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
    struct kk_pso_cache *cache = &dev->pso_cache;
    uint32_t hash = kk_pso_key_hash(key);
    bool lookup_only = request && request->lookup_only;
+   bool specialize = !(request && request->native_primitive_id);
 
    u_rwlock_rdlock(&cache->index_lock);
    struct hash_entry *he =
@@ -645,10 +647,11 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
    struct kk_pso_entry *found = he ? he->data : NULL;
    u_rwlock_rdunlock(&cache->index_lock);
    if (found)
-      return kk_pso_found(dev, found, key, vs, fs, lookup_only);
+      return kk_pso_found(dev, found, key, vs, fs, lookup_only, specialize);
 
    if (lookup_only) {
-      mtl_render_pipeline_state *pso = kk_pso_build(dev, key, vs, fs, true);
+      mtl_render_pipeline_state *pso =
+         kk_pso_build(dev, key, vs, fs, true, specialize);
       if (!pso)
          return (struct kk_pso_result){ .status = VK_NOT_READY };
       u_rwlock_wrlock(&cache->index_lock);
@@ -659,7 +662,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
       u_rwlock_wrunlock(&cache->index_lock);
       if (found) {
          mtl_release(pso);
-         return kk_pso_found(dev, found, key, vs, fs, true);
+         return kk_pso_found(dev, found, key, vs, fs, true, specialize);
       }
       if (!entry) {
          mtl_release(pso);
@@ -676,7 +679,7 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
       found ? NULL : kk_pso_entry_insert_locked(cache, hash, key, NULL);
    u_rwlock_wrunlock(&cache->index_lock);
    if (found)
-      return kk_pso_found(dev, found, key, vs, fs, false);
+      return kk_pso_found(dev, found, key, vs, fs, false, specialize);
    if (entry == NULL)
       return (struct kk_pso_result){ .status = VK_ERROR_OUT_OF_HOST_MEMORY };
 
@@ -685,17 +688,15 @@ kk_pso_cache_get(struct kk_device *dev, const struct kk_pso_key *key,
                      key, sizeof(*key));
    if (KK_DEBUG(PSO))
       mesa_logi("PSO compile");
-   return kk_pso_entry_compile(dev, entry, key, vs, fs);
+   return kk_pso_entry_compile(dev, entry, key, vs, fs, specialize);
 }
 
 mtl_render_pipeline_state *
 kk_pso_cache_acquire(struct kk_device *dev, const struct kk_pso_key *key,
                      mtl_function_descriptor *vs, mtl_function_descriptor *fs,
-                     bool lookup_only)
+                     const struct kk_pso_request *request)
 {
-   const struct kk_pso_request lookup = { .lookup_only = true };
-   struct kk_pso_result result =
-      kk_pso_cache_get(dev, key, vs, fs, lookup_only ? &lookup : NULL);
+   struct kk_pso_result result = kk_pso_cache_get(dev, key, vs, fs, request);
    return result.pso ? mtl_retain(result.pso) : NULL;
 }
 
@@ -1061,7 +1062,11 @@ kk_prepare_recipe(struct kk_device *dev, struct kk_shader *vs,
    memcpy(key.rast, rast->hash, sizeof(key.rast));
    memcpy(key.fs, variant->hash, sizeof(key.fs));
    *native_key = key;
-   return kk_pso_cache_get(dev, &key, rast->fn, variant->fn, request);
+   struct kk_pso_request pso_request = {
+      .lookup_only = request && request->lookup_only,
+      .native_primitive_id = variant->native_primitive_id,
+   };
+   return kk_pso_cache_get(dev, &key, rast->fn, variant->fn, &pso_request);
 }
 
 enum kk_job_type {
@@ -1113,9 +1118,12 @@ kk_render_compile(struct kk_device *dev, struct kk_shader *vs)
 {
    struct kk_pso_cache *cache = &dev->pso_cache;
    struct kk_render_pending *pending = vs->pending;
+   const struct kk_pso_request request = {
+      .native_primitive_id = pending->native_primitive_id,
+   };
    mtl_render_pipeline_state *pso =
       kk_pso_cache_acquire(dev, &pending->key, pending->vertex_function,
-                           pending->fragment_function, false);
+                           pending->fragment_function, &request);
    mtx_lock(&cache->lock);
    vs->pipeline.gfx.render = pso;
    pending->compiling = false;

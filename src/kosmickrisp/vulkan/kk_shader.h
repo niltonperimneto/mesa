@@ -181,12 +181,14 @@ struct kk_fs_variant {
    mtl_library *lib;
    mtl_function_descriptor *fn;
    bool shader_blend;
+   bool native_primitive_id;
 };
 
 struct kk_render_pending {
    cnd_t ready;
    bool compiling;
    bool queued;
+   bool native_primitive_id;
    struct kk_pso_key key;
    mtl_library *vertex_library;
    mtl_function_descriptor *vertex_function;

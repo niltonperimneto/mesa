@@ -15,6 +15,7 @@ enum kk_debug {
    KK_DEBUG_DYNAMIC_VI = 1ull << 3,
    KK_DEBUG_PARTITION = 1ull << 4,
    KK_DEBUG_PSO = 1ull << 6,
+   KK_DEBUG_NO_MSL_HELPERS = 1ull << 7,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;

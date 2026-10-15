@@ -14,6 +14,7 @@ const struct debug_named_value debug_flags[] = {
    {"dynamic_vi", KK_DEBUG_DYNAMIC_VI},
    {"partition", KK_DEBUG_PARTITION},
    {"pso", KK_DEBUG_PSO},
+   {"no_msl_helpers", KK_DEBUG_NO_MSL_HELPERS},
    {NULL, 0},
 };
 
