@@ -1,0 +1,109 @@
+name: KosmicKrisp
+
+# Builds and tests only the KosmicKrisp Vulkan driver on a native macOS runner.
+# Upstream Mesa CI lives in .gitlab-ci.yml and never runs on GitHub.
+on:
+  push:
+    branches: [main]
+    paths: &kk_paths
+      - 'src/kosmickrisp/**'
+      - 'src/compiler/**'
+      - 'src/vulkan/**'
+      - 'src/util/**'
+      - 'include/**'
+      - 'meson.build'
+      - 'meson.options'
+      - '**/meson.build'
+      - '.github/workflows/kosmickrisp.yml'
+  pull_request:
+    paths: *kk_paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kosmickrisp-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MESON_OPTIONS: >-
+    -Dbuildtype=release -Dplatforms=macos -Dvulkan-drivers=kosmickrisp
+    -Dgallium-drivers= -Dopengl=false -Dzstd=disabled -Dbuild-tests=true
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+  CCACHE_COMPILERCHECK: content
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+
+jobs:
+  format:
+    name: clang-format (src/kosmickrisp)
+    if: github.event_name == 'pull_request'
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check formatting of changed KosmicKrisp lines
+        run: |
+          brew install clang-format
+          base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          diff=$(git clang-format --binary "$(brew --prefix clang-format)/bin/clang-format" \
+                   --diff "$base" -- src/kosmickrisp || true)
+          if printf '%s\n' "$diff" | grep -q '^@@'; then
+            printf '%s\n' "$diff"
+            echo "::error::src/kosmickrisp changes are not clang-formatted"
+            exit 1
+          fi
+
+  build-test:
+    name: build + meson test (arm64)
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: |
+          brew install ccache ninja llvm libclc spirv-llvm-translator spirv-tools glslang bison flex
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet meson mako pyyaml packaging
+          {
+            echo "$RUNNER_TEMP/venv/bin"
+            echo "$(brew --prefix llvm)/bin"
+            echo "$(brew --prefix bison)/bin"
+            echo "$(brew --prefix flex)/bin"
+            echo "$(brew --prefix ccache)/libexec"
+          } >> "$GITHUB_PATH"
+          echo "TOOLCHAIN_ID=$(brew list --versions llvm spirv-llvm-translator libclc | tr '\n ' '__')" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: kk-ccache-${{ runner.os }}-${{ runner.arch }}-${{ env.TOOLCHAIN_ID }}-${{ github.sha }}
+          restore-keys: |
+            kk-ccache-${{ runner.os }}-${{ runner.arch }}-${{ env.TOOLCHAIN_ID }}-
+
+      - name: Configure
+        run: |
+          # shellcheck disable=SC2086
+          meson setup build $MESON_OPTIONS
+
+      - name: Build
+        run: |
+          ninja -C build
+          ccache --show-stats
+
+      - name: Test
+        run: meson test -C build --suite kosmickrisp --print-errorlogs
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kosmickrisp-meson-logs
+          path: build/meson-logs/
+          retention-days: 7
