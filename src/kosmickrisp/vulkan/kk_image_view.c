@@ -211,7 +211,21 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
           * 0, 1) for d/s attachments and render targets cannot have swizzle
           * according to Metal...
           */
-         if (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
+         if ((view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
+             plane->layout.linear) {
+            /* Metal can't view linear textures as arrays. Input attachment
+             * reads of them take the 2D ID (see kk_nir_lower_descriptors.c).
+             * Always a view: the image's texture has no swizzle.
+             */
+            VkImageViewType original_type = view_layout.view_type;
+            view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D;
+            view->planes[view_plane].mtl_handle_input =
+               mtl_new_texture_view_with(mtl_handle, &view_layout);
+            view->planes[view_plane].input_2d_gpu_resource_id =
+               mtl_texture_get_gpu_resource_id(
+                  view->planes[view_plane].mtl_handle_input);
+            view_layout.view_type = original_type;
+         } else if (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
             VkImageViewType original_type = view_layout.view_type;
             if (requires_type_change || requires_format_change) {
                view_layout.view_type = requires_type_change

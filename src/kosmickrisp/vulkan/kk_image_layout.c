@@ -24,9 +24,12 @@ vk_image_to_mtl_texture_type(const struct vk_image *image)
    switch (image->image_type) {
    case VK_IMAGE_TYPE_1D:
    case VK_IMAGE_TYPE_2D:
-      /* We require input attachments to be arrays */
+      /* We require input attachments to be arrays, except linear ones: Metal
+       * has no linear arrays, so those are read as 2D textures.
+       */
       if (array_layers > 1 ||
-          (image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+          ((image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
+           image->tiling == VK_IMAGE_TILING_OPTIMAL))
          return samples > 1u ? MTL_TEXTURE_TYPE_2D_ARRAY_MULTISAMPLE
                              : MTL_TEXTURE_TYPE_2D_ARRAY;
       return samples > 1u ? MTL_TEXTURE_TYPE_2D_MULTISAMPLE
