@@ -247,6 +247,9 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
             view->planes[view_plane].render_is_view = requires_format_change;
             if (requires_format_change) {
+               /* Metal can't view linear textures as arrays */
+               if (plane->layout.linear)
+                  view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D;
                view->planes[view_plane].mtl_handle_render =
                   mtl_new_texture_view_with_no_swizzle(mtl_handle,
                                                        &view_layout);
