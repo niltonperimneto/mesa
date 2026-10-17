@@ -2746,7 +2746,8 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED ||
        (cmd->state.shaders[MESA_SHADER_GEOMETRY]
            ? cmd->state.shaders[MESA_SHADER_GEOMETRY]->info.gs_needs_main
-           : vs->info.gs_needs_main) || gs->xfb) {
+           : vs->info.gs_needs_main) ||
+       gs->xfb) {
       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                        MTL_STAGE_DISPATCH);
       mtl_compute_set_pipeline_state(

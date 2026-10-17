@@ -1751,7 +1751,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
             count->info.stage = MESA_SHADER_COMPUTE;
             memset(&count->info.cs, 0, sizeof(count->info.cs));
             count->xfb_info = NULL;
-            kk_compile_msl(pdev, count, state, partition, &shader->gs_count, NULL);
+            kk_compile_msl(pdev, count, state, partition, &shader->gs_count,
+                           NULL);
          }
          kk_compile_msl(pdev, pre_gs, state, partition, &shader->pre_gs, NULL);
       } else {
