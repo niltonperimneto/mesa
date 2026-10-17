@@ -28,7 +28,12 @@ struct kk_sampled_image_descriptor {
 
    uint16_t pad_to_64_bits;
    uint32_t border[4];
-   uint64_t pad_to_power_2[3];
+
+   /* Input attachments only: a 2D view, read when image_gpu_resource_id is 0
+    * because Metal can't view the image as an array (linear images).
+    */
+   uint64_t input_2d_gpu_resource_id;
+   uint64_t pad_to_power_2[2];
 };
 
 static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
