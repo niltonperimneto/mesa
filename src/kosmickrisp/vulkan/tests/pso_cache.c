@@ -20,6 +20,10 @@ test_vk_errorf(const void *object, VkResult error, const char *file, int line,
 }
 
 #include <stdio.h>
+#include <ftw.h>
+#include "util/disk_cache.h"
+
+#define KK_RECIPE_GOLDEN "5e3e2509b74c14ef536f4fd3faedd1d6167ae2bb36ee5a04c9c5b92e775b90b6"
 
 #define CHECK(x) do { \
    if (!(x)) { \
@@ -112,9 +116,21 @@ test_release(void *object)
 void kk_log_compile(struct kk_device *dev, const char *kind, int64_t start) {}
 void kk_log_cache_pso(struct kk_device *dev, const char *event,
                        const void *key, size_t size) {}
+static unsigned queue_wait_count;
+static int64_t queue_wait_max_ns;
+
 void kk_variant_trace(struct kk_device *dev, enum kk_variant_phase phase,
                        const void *key, size_t size, int64_t start,
-                       int64_t end) {}
+                       int64_t end)
+{
+   if (phase != KK_VARIANT_QUEUE_WAIT)
+      return;
+   p_atomic_inc(&queue_wait_count);
+   int64_t wait = end - start;
+   int64_t seen = p_atomic_read(&queue_wait_max_ns);
+   while (wait > seen && p_atomic_cmpxchg(&queue_wait_max_ns, seen, wait) != seen)
+      seen = p_atomic_read(&queue_wait_max_ns);
+}
 void kk_variant_metal_event(void *data, const char *phase, const uint8_t *key,
                              size_t size, int64_t start, int64_t end) {}
 
@@ -270,6 +286,12 @@ test_recipe(bool fail)
    late.origin = KK_COMPILE_ORIGIN_PREWARM;
    struct demand second = d;
    CHECK(thrd_create(&late_worker, run_demand, &late) == thrd_success);
+   CHECK(thrd_join(late_worker, NULL) == thrd_success);
+   CHECK(late.result.status == VK_NOT_READY && !late.result.pso);
+   kk_compile_origin = KK_COMPILE_ORIGIN_PREWARM;
+   CHECK(kk_prewarm_recipe(&dev, &vs, &fs, &d.recipe));
+   kk_compile_origin = KK_COMPILE_ORIGIN_DRAW;
+   CHECK(producer_calls() == 1);
    CHECK(thrd_create(&second_draw, run_demand, &second) == thrd_success);
    thrd_sleep(&(struct timespec){ .tv_nsec = 20000000 }, NULL);
    mtx_lock(&dev.pso_cache.lock);
@@ -279,14 +301,12 @@ test_recipe(bool fail)
 
    release_producer();
    CHECK(thrd_join(owner, NULL) == thrd_success);
-   CHECK(thrd_join(late_worker, NULL) == thrd_success);
    CHECK(thrd_join(second_draw, NULL) == thrd_success);
    CHECK(producer_calls() == 1);
    CHECK(!dev.pso_cache.draw_demand);
    CHECK(d.result.status == (fail ? VK_ERROR_UNKNOWN : VK_SUCCESS));
-   CHECK(d.result.pso == late.result.pso && d.result.pso == second.result.pso);
-   CHECK(late.result.status == d.result.status &&
-         second.result.status == d.result.status);
+   CHECK(d.result.pso == second.result.pso);
+   CHECK(second.result.status == d.result.status);
 
    unsigned calls = 1;
    if (fail) {
@@ -413,8 +433,13 @@ test_queued_job(void)
    struct kk_link_state ls = { .dyn = &dyn };
    ls.shaders[MESA_SHADER_VERTEX] = &vs;
    ls.shaders[MESA_SHADER_FRAGMENT] = &fs;
+   p_atomic_set(&queue_wait_count, 0);
+   p_atomic_set(&queue_wait_max_ns, 0);
    kk_schedule_recipe(&dev, &ls, true, NULL);
+   int64_t queued_at = os_time_get_nano();
    CHECK(dev.pso_cache.pending_jobs == 1 && dev.pso_cache.exact_jobs == 1);
+   CHECK(dev.pso_cache.peak_pending_jobs == 1 &&
+         dev.pso_cache.peak_exact_jobs == 1);
    CHECK(p_atomic_read(&vs.vk.pipeline.cache_obj.ref_cnt) == 2);
    CHECK(p_atomic_read(&fs.vk.pipeline.cache_obj.ref_cnt) == 2);
    struct demand d = { .dev = &dev, .vs = &vs, .fs = &fs,
@@ -444,11 +469,14 @@ test_queued_job(void)
    CHECK(thrd_join(link, NULL) == thrd_success);
    CHECK(linker.pso && linker.pso == d.result.pso);
    CHECK(cmd.vk.record_result == VK_SUCCESS);
+   int64_t released_at = os_time_get_nano();
    mtx_lock(&queue_gate.lock);
    queue_gate.release = true;
    cnd_broadcast(&queue_gate.ready);
    mtx_unlock(&queue_gate.lock);
    CHECK(kk_pso_prewarm_wait(&dev) == VK_SUCCESS);
+   CHECK(p_atomic_read(&queue_wait_count) == 1);
+   CHECK(p_atomic_read(&queue_wait_max_ns) >= released_at - queued_at);
    CHECK(producer_calls() == 1);
    CHECK(!dev.pso_cache.pending_jobs && !dev.pso_cache.exact_jobs);
    CHECK(p_atomic_read(&vs.vk.pipeline.cache_obj.ref_cnt) == 1);
@@ -678,6 +706,71 @@ test_pending_render_waits_for_completion(void)
    cnd_destroy(&pending.ready);
 }
 
+static struct {
+   mtx_t lock;
+   cnd_t ready;
+   unsigned entered;
+   bool release;
+} busy;
+
+static void
+hold_worker(void *data, void *global, int thread)
+{
+   mtx_lock(&busy.lock);
+   busy.entered++;
+   cnd_broadcast(&busy.ready);
+   while (!busy.release)
+      cnd_wait(&busy.ready, &busy.lock);
+   mtx_unlock(&busy.lock);
+}
+
+static void
+test_render_takeover(void)
+{
+   struct link_fixture f;
+   struct kk_render_pending pending;
+   link_fixture_init(&f);
+   pending_render_init(&f, &pending);
+   reset_producer(0);
+   release_producer();
+   CHECK(mtx_init(&busy.lock, mtx_plain) == thrd_success);
+   CHECK(cnd_init(&busy.ready) == thrd_success);
+   busy.entered = 0;
+   busy.release = false;
+   struct util_queue_fence fences[2];
+   for (unsigned i = 0; i < ARRAY_SIZE(fences); ++i) {
+      util_queue_fence_init(&fences[i]);
+      util_queue_add_job(&f.dev.pso_cache.prewarm_queue, &busy, &fences[i],
+                         hold_worker, NULL, 0);
+   }
+   mtx_lock(&busy.lock);
+   while (busy.entered < ARRAY_SIZE(fences))
+      cnd_wait(&busy.ready, &busy.lock);
+   mtx_unlock(&busy.lock);
+
+   kk_pso_schedule_render(&f.dev, &f.vs);
+   CHECK(pending.queued && pending.compiling && !pending.started);
+   mtl_render_pipeline_state *pso = kk_cmd_acquire_render(&f.cmd, &f.vs);
+   CHECK(pso && f.vs.pipeline.gfx.render == pso);
+   CHECK(pending.started && !pending.compiling);
+   CHECK(producer_calls() == 1);
+
+   mtx_lock(&busy.lock);
+   busy.release = true;
+   cnd_broadcast(&busy.ready);
+   mtx_unlock(&busy.lock);
+   for (unsigned i = 0; i < ARRAY_SIZE(fences); ++i) {
+      util_queue_fence_wait(&fences[i]);
+      util_queue_fence_destroy(&fences[i]);
+   }
+   CHECK(kk_pso_prewarm_wait(&f.dev) == VK_SUCCESS);
+   CHECK(producer_calls() == 1);
+   link_fixture_finish(&f);
+   cnd_destroy(&pending.ready);
+   cnd_destroy(&busy.ready);
+   mtx_destroy(&busy.lock);
+}
+
 static void
 test_metal_cache_size(void)
 {
@@ -770,6 +863,135 @@ test_normalized_recipes(void)
    make_blend_recipe(&a, &vs, &fs, &ra);
    make_blend_recipe(&b, &vs, &fs, &rb);
    CHECK(memcmp(&ra, &rb, sizeof(ra)));
+}
+
+static void
+digest_hex(const void *data, size_t size, char out[BLAKE3_HEX_LEN])
+{
+   blake3_hash digest;
+   _mesa_blake3_compute(data, size, digest);
+   _mesa_blake3_format(out, digest);
+}
+
+static void
+test_recipe_codec(void)
+{
+   struct kk_device dev = {0};
+   struct kk_physical_device pdev = {0};
+   dev.vk.physical = &pdev.vk;
+   pdev.vk.properties.framebufferColorSampleCounts =
+      VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+   struct kk_shader vs = {0}, fs = {0};
+   vs.fast.hash[0] = 1;
+   fs.fast.hash[0] = 2;
+   fs.info.fs.color_outputs = 1;
+   struct vk_dynamic_graphics_state dyn;
+   init_blend_state(&dyn);
+   dyn.cb.attachments[0].blend_enable = true;
+   dyn.cb.attachments[0].color_blend_op = VK_BLEND_OP_SUBTRACT;
+   struct kk_variant_recipe recipe;
+   make_blend_recipe(&dyn, &vs, &fs, &recipe);
+   CHECK(kk_recipe_valid(&dev, &vs, &fs, &recipe));
+
+   uint8_t encoded[KK_RECIPE_ENCODED_SIZE];
+   kk_recipe_encode(&recipe, encoded);
+   struct kk_variant_recipe decoded;
+   CHECK(kk_recipe_decode(encoded, &decoded));
+   CHECK(!memcmp(&decoded, &recipe, sizeof(recipe)));
+   char hex[BLAKE3_HEX_LEN];
+   digest_hex(encoded, sizeof(encoded), hex);
+   if (strcmp(hex, KK_RECIPE_GOLDEN)) {
+      fprintf(stderr, "recipe encoding digest %s\n", hex);
+      CHECK(!"recipe encoding changed");
+   }
+
+   struct kk_variant_recipe padded = recipe;
+   memset((uint8_t *)&padded + offsetof(struct kk_variant_recipe, input_blend) +
+             sizeof(padded.input_blend),
+          0xaa, sizeof(padded) - offsetof(struct kk_variant_recipe, input_blend) -
+                   sizeof(padded.input_blend));
+   for (unsigned i = 0; i < MAX_DRAW_BUFFERS; ++i)
+      memset((uint8_t *)&padded.input_blend[i] +
+                offsetof(struct vk_color_blend_attachment_state, write_mask) + 1,
+             0xaa, offsetof(struct vk_color_blend_attachment_state,
+                            color_blend_op) -
+                   offsetof(struct vk_color_blend_attachment_state,
+                            write_mask) - 1);
+   uint8_t padded_encoded[KK_RECIPE_ENCODED_SIZE];
+   kk_recipe_encode(&padded, padded_encoded);
+   CHECK(!memcmp(padded_encoded, encoded, sizeof(encoded)));
+
+   struct kk_variant_recipe other;
+   dyn.cb.attachments[0].color_blend_op = VK_BLEND_OP_ADD;
+   make_blend_recipe(&dyn, &vs, &fs, &other);
+   uint8_t other_encoded[KK_RECIPE_ENCODED_SIZE];
+   kk_recipe_encode(&other, other_encoded);
+   CHECK(memcmp(other_encoded, encoded, sizeof(encoded)));
+
+   uint8_t bad[KK_RECIPE_ENCODED_SIZE];
+   memcpy(bad, encoded, sizeof(bad));
+   bad[0] ^= 1;
+   CHECK(!kk_recipe_decode(bad, &decoded));
+   memcpy(bad, encoded, sizeof(bad));
+   bad[4 + 32 + 32 + 8 + 4 + 3] = 2;
+   CHECK(!kk_recipe_decode(bad, &decoded));
+   memcpy(bad, encoded, sizeof(bad));
+   bad[4 + 32 + 32 + 8] = 1;
+   CHECK(kk_recipe_decode(bad, &decoded));
+   CHECK(decoded.fs.advanced_blend_mask == 1);
+   CHECK(!kk_recipe_valid(&dev, &vs, &fs, &decoded));
+}
+
+static int
+remove_entry(const char *path, const struct stat *sb, int flag,
+             struct FTW *ftw)
+{
+   return remove(path);
+}
+
+static void
+test_history_round_trip(void)
+{
+   char dir[] = "/tmp/kk-history-XXXXXX";
+   CHECK(mkdtemp(dir));
+   setenv("MESA_SHADER_CACHE_DIR", dir, 1);
+   struct kk_shader vs = {0}, fs = {0};
+   vs.fast.hash[0] = 3;
+   fs.fast.hash[0] = 4;
+   fs.info.fs.color_outputs = 1;
+   struct vk_dynamic_graphics_state dyn;
+   init_blend_state(&dyn);
+   struct kk_variant_recipe recipe;
+   make_blend_recipe(&dyn, &vs, &fs, &recipe);
+   uint8_t encoded[KK_RECIPE_ENCODED_SIZE];
+   kk_recipe_encode(&recipe, encoded);
+
+   struct disk_cache *disk = disk_cache_create("kk-history-test", "schema", 0);
+   CHECK(disk);
+   struct kk_variant_history *history =
+      kk_variant_history_create(disk, KK_RECIPE_ENCODED_SIZE);
+   CHECK(history);
+   kk_variant_history_record(history, recipe.family, encoded);
+   kk_variant_history_destroy(history);
+   disk_cache_destroy(disk);
+
+   disk = disk_cache_create("kk-history-test", "schema", 0);
+   CHECK(disk);
+   history = kk_variant_history_create(disk, KK_RECIPE_ENCODED_SIZE);
+   uint8_t loaded[2][KK_RECIPE_ENCODED_SIZE];
+   CHECK(kk_variant_history_load(history, recipe.family, loaded, 2) == 1);
+   struct kk_variant_recipe decoded;
+   CHECK(kk_recipe_decode(loaded[0], &decoded));
+   CHECK(!memcmp(&decoded, &recipe, sizeof(recipe)));
+   kk_variant_history_destroy(history);
+
+   history = kk_variant_history_create(disk, KK_RECIPE_ENCODED_SIZE + 1);
+   uint8_t wider[KK_RECIPE_ENCODED_SIZE + 1];
+   CHECK(kk_variant_history_load(history, recipe.family, wider, 1) == 0);
+   kk_variant_history_destroy(history);
+   disk_cache_destroy(disk);
+   unsetenv("MESA_SHADER_CACHE_DIR");
+   nftw(dir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
 }
 
 struct concurrent_hits {
@@ -1380,9 +1602,12 @@ main(void)
    test_lookup_only_miss();
    test_lookup_only_recipe();
    test_concurrent_hits();
+   test_recipe_codec();
+   test_history_round_trip();
    test_normalized_recipes();
    test_link_waits_for_completion();
    test_pending_render_waits_for_completion();
+   test_render_takeover();
    test_metal_cache_size();
    CHECK(mtx_init(&specializer.lock, mtx_plain) == thrd_success);
    CHECK(cnd_init(&specializer.ready) == thrd_success);

@@ -73,6 +73,17 @@ struct kk_pso_cache {
    unsigned draw_demand;
    unsigned pending_jobs;
    unsigned exact_jobs;
+   unsigned peak_pending_jobs;
+   unsigned peak_exact_jobs;
+   struct {
+      unsigned native;
+      unsigned native_ready;
+      unsigned native_failed;
+      unsigned recipes;
+      unsigned recipes_ready;
+      unsigned families;
+      uint64_t bytes;
+   } summary;
    unsigned failed_jobs;
    unsigned recipe_count;
    unsigned recipe_limit;

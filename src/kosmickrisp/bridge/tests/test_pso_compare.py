@@ -52,6 +52,7 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(env['MESA_SHADER_CACHE_DIR'], '/cache/mesa')
             diagnostic = compare.environment(workload, Path('/cache'), Path('/run'), True)
             self.assertEqual(diagnostic['MESA_KK_METAL_CONCURRENCY_LOG'], '/run/metal.jsonl')
+            self.assertEqual(diagnostic['MESA_KK_VARIANT_STATS'], '/run/variant-stats.jsonl')
 
     def test_stack_categories(self):
         self.assertEqual(compare.classify_stack('disk_cache_destroy util_queue_finish cnd_wait'),
@@ -101,6 +102,49 @@ class ComparisonTests(unittest.TestCase):
             self.assertTrue(result['metal']['truncated_last_record'])
             self.assertEqual(len(result['metal']['unfinished_operations']), 1)
             self.assertEqual((directory / 'metal.jsonl').read_text(), raw)
+
+    def test_persistence_and_variant_summaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            records = [
+                dict(event='persistence', outcome='native_compile', key='a', kind='render',
+                     reason='ref_missing', route='captured', duration_ns=7, success=True),
+                dict(event='persistence', outcome='native_compile', key='b', kind='compute',
+                     reason='blob_missing', route='uncaptured_batch_full', duration_ns=5,
+                     success=False),
+                dict(event='persistence', outcome='native_compile', key='c', kind='render',
+                     reason='ref_missing', route='uncaptured_serializing', duration_ns=3,
+                     success=True),
+                dict(event='persistence', outcome='persist_dropped', key='a',
+                     reason='oversized_batch'),
+                dict(event='pso', outcome='archive_hit', key='d'),
+                dict(event='persistence', outcome='cache_summary', archives=2,
+                     ref_collisions=1),
+            ]
+            (directory / 'cache.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
+            (directory / 'variant-stats.jsonl').write_text(
+                json.dumps(dict(event='variant_summary', phase='queue_wait', count=2,
+                                duration_ns=40, draw_count=0, draw_duration_ns=0)) + '\n' +
+                json.dumps(dict(event='queue_summary', peak_pending_jobs=3,
+                                peak_exact_jobs=1)) + '\n' +
+                json.dumps(dict(event='cache_summary', native=5, recipes=2)) + '\n')
+            result = compare.diagnostics(directory)
+            persistence = result['persistence']
+            self.assertEqual(persistence['native_compile_reasons'],
+                             {'ref_missing': 2, 'blob_missing': 1})
+            self.assertEqual(persistence['native_compile_routes'],
+                             {'captured': 1, 'uncaptured_batch_full': 1,
+                              'uncaptured_serializing': 1})
+            self.assertEqual(persistence['native_compile_duration_ns'],
+                             {'ref_missing': 10, 'blob_missing': 5})
+            self.assertEqual(persistence['native_compile_failures'], 1)
+            self.assertEqual(persistence['dropped'], {'oversized_batch': 1})
+            self.assertEqual(result['cache']['outcomes'], {'archive_hit': 1})
+            self.assertEqual(result['variant']['phases']['queue_wait']['duration_ns'], 40)
+            self.assertEqual(result['variant']['queue'],
+                             {'peak_pending_jobs': 3, 'peak_exact_jobs': 1})
+            self.assertEqual(result['variant']['cache'], {'native': 5, 'recipes': 2})
+            self.assertEqual(persistence['summary'], {'archives': 2, 'ref_collisions': 1})
 
     def test_archive_miss_is_not_a_compilation_failure(self):
         with tempfile.TemporaryDirectory() as temporary:

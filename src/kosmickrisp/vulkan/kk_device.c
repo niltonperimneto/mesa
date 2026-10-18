@@ -346,7 +346,8 @@ static const char *const kk_variant_names[KK_VARIANT_COUNT] = {
    "raster_wait", "pso_create", "pso_wait", "archive_lookup", "archive_load",
    "native_create", "complete", "first_demand", "ready_hit", "failure",
    "history_load", "ref_missing", "blob_missing", "archive_rejected",
-   "pipeline_absent",
+   "pipeline_absent", "queue_wait", "native_compile", "native_specialize",
+   "ref_uncacheable", "blob_corrupt",
 };
 
 void
@@ -410,6 +411,14 @@ kk_variant_metal_event(void *data, const char *phase, const uint8_t *key,
       variant_phase = KK_VARIANT_ARCHIVE_REJECTED;
    else if (strcmp(phase, "pipeline_absent") == 0)
       variant_phase = KK_VARIANT_PIPELINE_ABSENT;
+   else if (strcmp(phase, "native_compile") == 0)
+      variant_phase = KK_VARIANT_NATIVE_COMPILE;
+   else if (strcmp(phase, "native_specialize") == 0)
+      variant_phase = KK_VARIANT_NATIVE_SPECIALIZE;
+   else if (strcmp(phase, "ref_uncacheable") == 0)
+      variant_phase = KK_VARIANT_REF_UNCACHEABLE;
+   else if (strcmp(phase, "blob_corrupt") == 0)
+      variant_phase = KK_VARIANT_BLOB_CORRUPT;
    else
       return;
    kk_variant_trace(data, variant_phase, key, key_size, start, end);
@@ -430,6 +439,23 @@ kk_variant_trace_finish(struct kk_device *dev)
                  (unsigned long long)counter->draw_count,
                  (unsigned long long)counter->draw_duration_ns);
       }
+      fprintf(dev->variant_stats,
+              "{\"event\":\"queue_summary\","
+              "\"peak_pending_jobs\":%u,\"peak_exact_jobs\":%u}\n",
+              dev->pso_cache.peak_pending_jobs,
+              dev->pso_cache.peak_exact_jobs);
+      fprintf(dev->variant_stats,
+              "{\"event\":\"cache_summary\",\"native\":%u,"
+              "\"native_ready\":%u,\"native_failed\":%u,\"recipes\":%u,"
+              "\"recipes_ready\":%u,\"families\":%u,\"entry_bytes\":%llu,"
+              "\"fs_variants_created\":%llu}\n",
+              dev->pso_cache.summary.native, dev->pso_cache.summary.native_ready,
+              dev->pso_cache.summary.native_failed,
+              dev->pso_cache.summary.recipes,
+              dev->pso_cache.summary.recipes_ready,
+              dev->pso_cache.summary.families,
+              (unsigned long long)dev->pso_cache.summary.bytes,
+              (unsigned long long)p_atomic_read(&dev->fs_variants_created));
       fclose(dev->variant_stats);
    }
    if (dev->variant_log)

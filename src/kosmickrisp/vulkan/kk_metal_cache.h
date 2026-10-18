@@ -21,6 +21,7 @@ struct kk_metal_cache *kk_metal_cache_create(struct disk_cache *disk_cache,
                                             mtl_compiler *compiler,
                                             uint64_t blob_budget);
 void kk_metal_cache_flush(struct kk_metal_cache *cache);
+void kk_metal_cache_request_flush(struct kk_metal_cache *cache);
 void kk_metal_cache_destroy(struct kk_metal_cache *cache);
 
 mtl_render_pipeline_state *kk_metal_cache_lookup_render_pipeline(

@@ -195,6 +195,7 @@ struct kk_render_pending {
    cnd_t ready;
    bool compiling;
    bool queued;
+   bool started;
    bool native_primitive_id;
    struct kk_pso_key key;
    mtl_library *vertex_library;

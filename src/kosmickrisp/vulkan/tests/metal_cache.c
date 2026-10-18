@@ -76,6 +76,13 @@ static struct {
    struct mock_archive **archives;
    unsigned archive_count;
    unsigned archives_dead;
+   unsigned archive_creates;
+   bool archive_gate;
+   bool archive_gated;
+   bool archive_reject;
+   unsigned disk_gets;
+   unsigned serialize_failures;
+   unsigned max_batch;
    struct mock_entry disk[MAX_DISK];
    unsigned disk_count;
 } mock;
@@ -213,6 +220,13 @@ mock_compiler_serialize(mtl_compiler *compiler, size_t *size)
    int queued = mock.cache->recapture_count;
    mtx_unlock(&mock.cache->mutex);
    mtx_lock(&mock.lock);
+   if (mock.serialize_failures) {
+      mock.serialize_failures--;
+      mtx_unlock(&mock.lock);
+      *size = 0;
+      return NULL;
+   }
+   mock.max_batch = MAX2(mock.max_batch, mock.captured_count);
    if (!mock.serializes++)
       mock.first_serialize_queue = queued;
    *size = sizeof(uint32_t) * (2 + mock.captured_count) +
@@ -230,6 +244,17 @@ mtl_archive *
 mock_new_archive(mtl_device *dev, const void *data, size_t size)
 {
    const uint32_t *words = data;
+   mtx_lock(&mock.lock);
+   mock.archive_creates++;
+   mock.archive_gated = mock.archive_gate;
+   cnd_broadcast(&mock.cond);
+   while (mock.archive_gate)
+      cnd_wait(&mock.cond, &mock.lock);
+   mock.archive_gated = false;
+   bool reject = mock.archive_reject;
+   mtx_unlock(&mock.lock);
+   if (reject)
+      return NULL;
    struct mock_archive *archive = calloc(1, sizeof(*archive));
    archive->magic = ARCHIVE_ALIVE;
    archive->refs = 1;
@@ -319,6 +344,7 @@ mock_disk_cache_get(struct disk_cache *cache, const cache_key key,
                     size_t *size)
 {
    mtx_lock(&mock.lock);
+   mock.disk_gets++;
    struct mock_entry *entry = mock_disk_find(key);
    void *data = NULL;
    if (entry) {
@@ -352,6 +378,9 @@ mock_reset(bool clear_disk)
    free(mock.archives);
    mock.archives = NULL;
    mock.archive_count = mock.archives_dead = 0;
+   mock.archive_creates = mock.disk_gets = 0;
+   mock.serialize_failures = mock.max_batch = 0;
+   mock.archive_gate = mock.archive_gated = mock.archive_reject = false;
    if (clear_disk) {
       for (unsigned i = 0; i < mock.disk_count; ++i)
          free(mock.disk[i].data);
@@ -495,6 +524,34 @@ log_contains(const char *path, const char *needle)
    return found;
 }
 
+static bool
+log_has_drop(const char *path, struct mock_desc *desc, const char *reason)
+{
+   cache_key key;
+   desc_key(desc, key);
+   char hex[CACHE_KEY_SIZE * 2 + 1], needle[256];
+   kk_metal_format_key(key, hex);
+   snprintf(needle, sizeof(needle),
+            "\"outcome\":\"persist_dropped\",\"key\":\"%s\",\"reason\":\"%s\"",
+            hex, reason);
+   return log_contains(path, needle);
+}
+
+static bool
+log_has_compile(const char *path, struct mock_desc *desc, const char *reason,
+                const char *route)
+{
+   cache_key key;
+   desc_key(desc, key);
+   char hex[CACHE_KEY_SIZE * 2 + 1], needle[256];
+   kk_metal_format_key(key, hex);
+   snprintf(needle, sizeof(needle),
+            "\"outcome\":\"native_compile\",\"key\":\"%s\",\"kind\":\"render\","
+            "\"reason\":\"%s\",\"route\":\"%s\"",
+            hex, reason, route);
+   return log_contains(path, needle);
+}
+
 static void
 test_recapture_failures(void)
 {
@@ -532,6 +589,11 @@ test_recapture_failures(void)
    kk_metal_cache_flush(cache);
    CHECK(log_contains(path, "\"dropped\":2,\"dropped_capacity\":1,"
                             "\"dropped_alloc\":0,\"dropped_failed\":1"));
+   CHECK(log_has_drop(path, &g, "recapture_failed"));
+   CHECK(!log_has_drop(path, &f, "recapture_failed"));
+   CHECK(log_has_drop(path, &many[KK_METAL_RECAPTURE_LIMIT],
+                      "recapture_capacity"));
+   CHECK(!log_has_drop(path, &many[0], "recapture_capacity"));
    mtx_lock(&cache->mutex);
    CHECK(!cache->dropped_capacity && !cache->dropped_failed && !cache->pending);
    mtx_unlock(&cache->mutex);
@@ -601,6 +663,11 @@ test_oversized_batch_limit_persists(void)
    mock_reset(true);
    mock.key_bytes = 1000;
    const uint64_t budget = 6500;
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
    setenv("MESA_KK_PSO_CACHE_MAX_PENDING", "8", 1);
    struct mock_desc keys[8];
    for (unsigned i = 0; i < ARRAY_SIZE(keys); ++i)
@@ -613,8 +680,15 @@ test_oversized_batch_limit_persists(void)
       CHECK(compile_desc(cache, &keys[i], &hit) && !hit);
    wait_serializes(1);
    wait_recapture_idle(cache);
+   kk_metal_cache_flush(cache);
    CHECK(cache_limit(cache) == 4);
+   for (unsigned i = 0; i < ARRAY_SIZE(keys); ++i) {
+      CHECK(log_has_drop(path, &keys[i], "oversized_batch"));
+      CHECK(log_has_compile(path, &keys[i], "ref_missing", "captured"));
+   }
    kk_metal_cache_destroy(cache);
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
 
    mock_reset(false);
    mock.key_bytes = 1000;
@@ -658,11 +732,15 @@ test_single_oversized_pso(void)
    struct kk_metal_cache *cache = make_cache(4500, 0);
    bool hit;
    CHECK(compile_desc(cache, &big, &hit) && !hit);
+   CHECK(log_has_compile(path, &big, "ref_missing", "captured"));
    kk_metal_cache_flush(cache);
    CHECK(cache_limit(cache) == 8);
    CHECK(log_contains(path, "\"outcome\":\"archive_uncacheable\""));
    CHECK(!log_contains(path, "archive_limit_lowered"));
+   CHECK(!log_has_drop(path, &big, "oversized_batch"));
    CHECK(compile_desc(cache, &big, &hit) && !hit);
+   CHECK(log_has_compile(path, &big, "ref_uncacheable",
+                         "uncaptured_uncacheable"));
    mtx_lock(&mock.lock);
    CHECK(mock.call_count == 1 && mock.uncaptured_calls == 1);
    mtx_unlock(&mock.lock);
@@ -688,6 +766,318 @@ test_single_oversized_pso(void)
    CHECK(mock.serializes == 1);
    mtx_unlock(&mock.lock);
    unsetenv("MESA_KK_PSO_CACHE_MAX_PENDING");
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
+struct cold_user {
+   struct kk_metal_cache *cache;
+   struct mock_desc *desc;
+   bool hit;
+   bool compiled;
+};
+
+static int
+run_cold_user(void *data)
+{
+   struct cold_user *user = data;
+   user->compiled = compile_desc(user->cache, user->desc, &user->hit) != NULL;
+   return 0;
+}
+
+static void
+persist_descs(struct mock_desc *descs, unsigned count)
+{
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   bool hit;
+   for (unsigned i = 0; i < count; ++i)
+      CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+   kk_metal_cache_flush(cache);
+   kk_metal_cache_destroy(cache);
+}
+
+static unsigned
+loading_users(struct kk_metal_cache *cache)
+{
+   mtx_lock(&cache->mutex);
+   unsigned users = cache->loading ? cache->loading->users : 0;
+   mtx_unlock(&cache->mutex);
+   return users;
+}
+
+static void
+run_cold_users(struct kk_metal_cache *cache, struct mock_desc *descs,
+               struct cold_user *users, unsigned count)
+{
+   mtx_lock(&mock.lock);
+   mock.archive_gate = true;
+   mtx_unlock(&mock.lock);
+   thrd_t threads[8];
+   for (unsigned i = 0; i < count; ++i) {
+      users[i] = (struct cold_user){ .cache = cache, .desc = &descs[i] };
+      CHECK(thrd_create(&threads[i], run_cold_user, &users[i]) == thrd_success);
+   }
+   int64_t give_up = os_time_get_nano() + 5000000000ll;
+   while (loading_users(cache) < count) {
+      CHECK(os_time_get_nano() < give_up);
+      thrd_sleep(&(struct timespec){ .tv_nsec = 1000000 }, NULL);
+   }
+   mtx_lock(&mock.lock);
+   CHECK(mock.archive_gated && mock.archive_creates == 1);
+   mock.archive_gate = false;
+   cnd_broadcast(&mock.cond);
+   mtx_unlock(&mock.lock);
+   for (unsigned i = 0; i < count; ++i)
+      CHECK(thrd_join(threads[i], NULL) == thrd_success);
+}
+
+static void
+test_concurrent_cold_archive(void)
+{
+   struct mock_desc descs[4];
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      descs[i] = (struct mock_desc){ 6000 + i };
+   persist_descs(descs, ARRAY_SIZE(descs));
+
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   mock_reset(false);
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   struct cold_user users[ARRAY_SIZE(descs)];
+   run_cold_users(cache, descs, users, ARRAY_SIZE(descs));
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      CHECK(users[i].compiled && users[i].hit);
+   bool hit;
+   CHECK(compile_desc(cache, &descs[0], &hit) && hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.archive_creates == 1 &&
+         mock.archive_hits == ARRAY_SIZE(descs) + 1);
+   CHECK(mock.call_count == 0 && mock.uncaptured_calls == 0);
+   mtx_unlock(&mock.lock);
+   CHECK(!cache->loading);
+   kk_metal_cache_destroy(cache);
+   CHECK(log_contains(path, "\"archives\":1,\"archive_peak\":1,"));
+   CHECK(log_contains(path, "\"archive_loads\":1,\"archive_evictions\":0,"));
+   CHECK(log_contains(path, "\"ref_occupied\":4,\"ref_hits\":1,"
+                            "\"ref_misses\":4,\"ref_stale_hits\":0,"
+                            "\"ref_collisions\":0,"));
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
+static void
+test_ref_collision(void)
+{
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   struct mock_desc a = { 7000 }, b = { 7001 };
+   cache_key ka, kb;
+   desc_key(&a, ka);
+   for (;; b.id++) {
+      desc_key(&b, kb);
+      if (kk_metal_ref_slot(cache, ka) == kk_metal_ref_slot(cache, kb))
+         break;
+   }
+   cache_key ref_a, ref_b, out;
+   memset(ref_a, 1, sizeof(ref_a));
+   memset(ref_b, 2, sizeof(ref_b));
+   uint8_t stale;
+   mtx_lock(&cache->mutex);
+   kk_metal_ref_set_locked(cache, ka, ref_a);
+   kk_metal_ref_set_locked(cache, ka, ref_a);
+   CHECK(cache->ref_collisions == 0);
+   kk_metal_ref_set_locked(cache, kb, ref_b);
+   CHECK(cache->ref_collisions == 1);
+   CHECK(!kk_metal_ref_get_locked(cache, ka, out, &stale));
+   CHECK(kk_metal_ref_get_locked(cache, kb, out, &stale) &&
+         !memcmp(out, ref_b, sizeof(out)) && !stale);
+   mtx_unlock(&cache->mutex);
+   kk_metal_cache_destroy(cache);
+}
+
+static void
+test_rejected_archive_waiters(void)
+{
+   struct mock_desc descs[4];
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      descs[i] = (struct mock_desc){ 6100 + i };
+   persist_descs(descs, ARRAY_SIZE(descs));
+
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   mock_reset(false);
+   mock.archive_reject = true;
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   struct cold_user users[ARRAY_SIZE(descs)];
+   run_cold_users(cache, descs, users, ARRAY_SIZE(descs));
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+      CHECK(users[i].compiled && !users[i].hit);
+      CHECK(log_has_compile(path, &descs[i], "archive_rejected", "captured"));
+   }
+   mtx_lock(&mock.lock);
+   CHECK(mock.archive_creates == 1 && mock.call_count == ARRAY_SIZE(descs));
+   unsigned gets = mock.disk_gets;
+   mtx_unlock(&mock.lock);
+   cache_key key;
+   desc_key(&descs[0], key);
+   CHECK(!kk_metal_cache_lookup_render_pipeline(
+      cache, key, (mtl_render_pipeline_descriptor *)&descs[0]));
+   mtx_lock(&mock.lock);
+   CHECK(mock.disk_gets == gets && mock.archive_creates == 1);
+   mock.archive_reject = false;
+   mtx_unlock(&mock.lock);
+
+   kk_metal_cache_flush(cache);
+   bool hit;
+   CHECK(compile_desc(cache, &descs[0], &hit) && hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.archive_creates == 2 && mock.call_count == ARRAY_SIZE(descs));
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_destroy(cache);
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
+static struct mock_entry *
+mock_blob_entry(void)
+{
+   struct mock_entry *blob = NULL;
+   for (unsigned i = 0; i < mock.disk_count; ++i)
+      if (mock.disk[i].size > CACHE_KEY_SIZE)
+         blob = &mock.disk[i];
+   return blob;
+}
+
+static void
+test_damaged_blob(bool corrupt)
+{
+   struct mock_desc desc = { corrupt ? 6200 : 6201 };
+   persist_descs(&desc, 1);
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   mock_reset(false);
+   mtx_lock(&mock.lock);
+   struct mock_entry *blob = mock_blob_entry();
+   CHECK(blob);
+   if (corrupt)
+      ((uint8_t *)blob->data)[blob->size - 1] ^= 0xff;
+   else
+      blob->size = 0;
+   mtx_unlock(&mock.lock);
+
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   bool hit;
+   CHECK(compile_desc(cache, &desc, &hit) && !hit);
+   const char *reason = corrupt ? "blob_corrupt" : "blob_missing";
+   CHECK(log_has_compile(path, &desc, reason, "captured"));
+   CHECK(log_contains(path, corrupt ? "\"outcome\":\"blob_corrupt\"" :
+                                      "\"outcome\":\"blob_missing\""));
+   mtx_lock(&mock.lock);
+   unsigned gets = mock.disk_gets;
+   mtx_unlock(&mock.lock);
+   cache_key key;
+   desc_key(&desc, key);
+   CHECK(!kk_metal_cache_lookup_render_pipeline(
+      cache, key, (mtl_render_pipeline_descriptor *)&desc));
+   mtx_lock(&mock.lock);
+   CHECK(mock.disk_gets == gets && mock.archive_creates == 0);
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_flush(cache);
+   CHECK(compile_desc(cache, &desc, &hit) && hit);
+   kk_metal_cache_destroy(cache);
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
+static void
+test_shutdown_drain_respects_limit(void)
+{
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 2);
+   struct mock_desc descs[5];
+   mtx_lock(&cache->mutex);
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+      descs[i] = (struct mock_desc){ 8000 + i };
+      defer_locked(cache, &descs[i]);
+   }
+   mtx_unlock(&cache->mutex);
+   kk_metal_cache_destroy(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.max_batch && mock.max_batch <= 2);
+   CHECK(mock.serializes >= 3);
+   mtx_unlock(&mock.lock);
+
+   mock_reset(false);
+   cache = make_cache(0, 0);
+   bool hit;
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      CHECK(compile_desc(cache, &descs[i], &hit) && hit);
+   kk_metal_cache_destroy(cache);
+}
+
+static void
+test_final_flush_failure(void)
+{
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   struct mock_desc descs[3];
+   bool hit;
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+      descs[i] = (struct mock_desc){ 8100 + i };
+      CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+   }
+   mtx_lock(&mock.lock);
+   mock.serialize_failures = 100;
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_destroy(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serialize_failures == 100 - KK_METAL_FINAL_FLUSH_ATTEMPTS);
+   CHECK(!mock.serializes);
+   mtx_unlock(&mock.lock);
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      CHECK(log_has_drop(path, &descs[i], "final_flush_failed"));
+   CHECK(log_contains(path, "\"outcome\":\"final_flush_failed\",\"keys\":3"));
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
+static void
+test_closing_compiles_uncached(void)
+{
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   kk_metal_cache_close(cache);
+   struct mock_desc desc = { 8200 };
+   bool hit = true;
+   CHECK(compile_desc(cache, &desc, &hit) && !hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.uncaptured_calls == 1 && mock.call_count == 0);
+   mtx_unlock(&mock.lock);
+   CHECK(log_has_compile(path, &desc, "none", "closing"));
+   mtx_lock(&cache->mutex);
+   CHECK(!cache->pending && !cache->recapture && !cache->active_operations);
+   mtx_unlock(&cache->mutex);
+   kk_metal_cache_destroy(cache);
    unsetenv("MESA_KK_CACHE_LOG");
    unlink(path);
 }
@@ -832,6 +1222,14 @@ main(void)
    test_single_oversized_pso();
    test_archive_eviction_in_use();
    test_destroy_drains_operation();
+   test_concurrent_cold_archive();
+   test_ref_collision();
+   test_rejected_archive_waiters();
+   test_damaged_blob(true);
+   test_damaged_blob(false);
+   test_shutdown_drain_respects_limit();
+   test_final_flush_failure();
+   test_closing_compiles_uncached();
    mock_reset(true);
    cnd_destroy(&mock.cond);
    mtx_destroy(&mock.lock);
