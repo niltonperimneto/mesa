@@ -15,6 +15,11 @@
 #include "util/u_math.h"
 #include "shader_enums.h"
 
+struct dynamic_ctx {
+   bool robustness2;
+   bool use_helpers;
+};
+
 struct ctx {
    struct kk_attribute *attribs;
    bool requires_robustness2;
@@ -438,7 +443,8 @@ pass_dynamic(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (intr->intrinsic != nir_intrinsic_load_input)
       return false;
 
-   bool robustness2 = *(bool *)data;
+   struct dynamic_ctx *ctx = data;
+   bool robustness2 = ctx->robustness2;
    b->cursor = nir_instr_remove(&intr->instr);
 
    nir_src *offset_src = nir_get_io_offset_src(intr);
@@ -484,6 +490,23 @@ pass_dynamic(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    nir_def *addr = nir_iadd(b, base, nir_u2u64(b, nir_imul(b, el, stride)));
+   if (ctx->use_helpers) {
+      nir_alu_type type = is_int ? base_type | 32 : nir_type_float32;
+      nir_def *memory = nir_load_vbo_kk(b, addr, fmt, fetch, .dest_type = type);
+      nir_def *channels[4];
+      for (unsigned i = 0; i < intr->num_components; i++) {
+         nir_def *ch =
+            nir_channel(b, memory, nir_intrinsic_component(intr) + i);
+         if (intr->def.bit_size != 32)
+            ch = is_int ? nir_u2uN(b, ch, intr->def.bit_size)
+                        : nir_f2fN(b, ch, intr->def.bit_size);
+         channels[i] = ch;
+      }
+      nir_def_rewrite_uses(&intr->def,
+                           nir_vec(b, channels, intr->num_components));
+      return true;
+   }
+
    nir_def *size_log2 =
       fmt_field(b, fmt, KK_VBO_FMT_SIZE_SHIFT, KK_VBO_FMT_SIZE_MASK);
    nir_def *count_m1 =
@@ -544,10 +567,11 @@ pass_dynamic(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 bool
-kk_nir_lower_vbo_dynamic(nir_shader *nir, bool robustness2)
+kk_nir_lower_vbo_dynamic(nir_shader *nir, bool robustness2, bool use_helpers)
 {
    assert(nir->info.stage == MESA_SHADER_VERTEX);
 
+   struct dynamic_ctx ctx = {robustness2, use_helpers};
    return nir_shader_intrinsics_pass(nir, pass_dynamic, nir_metadata_none,
-                                     &robustness2);
+                                     &ctx);
 }

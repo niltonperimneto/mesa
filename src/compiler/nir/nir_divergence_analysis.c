@@ -857,6 +857,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_constant_agx:
    case nir_intrinsic_load_texture_handle_agx:
    case nir_intrinsic_load_from_texture_handle_agx:
+   case nir_intrinsic_load_vbo_kk:
    case nir_intrinsic_load_vbo_base_agx:
    case nir_intrinsic_load_attrib_clamp_agx:
    case nir_intrinsic_bindless_image_agx:

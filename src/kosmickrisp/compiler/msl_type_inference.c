@@ -282,6 +282,13 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->def, ty);
       break;
    }
+   case nir_intrinsic_load_vbo_kk:
+      set_type(types, &instr->def,
+               ti_type_from_nir(nir_intrinsic_dest_type(instr)));
+      set_type(types, &instr->src[0], TYPE_UINT);
+      set_type(types, &instr->src[1], TYPE_UINT);
+      set_type(types, &instr->src[2], TYPE_BOOL);
+      break;
    case nir_intrinsic_load_sample_pos_from_id:
       set_type(types, &instr->def, TYPE_FLOAT);
       set_type(types, &instr->src[0], TYPE_UINT);

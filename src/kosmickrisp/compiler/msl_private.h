@@ -164,3 +164,5 @@ bool msl_def_is_texture(struct nir_to_msl_ctx *ctx, nir_def *def);
 void msl_nir_lower_subgroups(nir_shader *nir);
 
 bool msl_nir_lower_algebraic_late(nir_shader *shader);
+
+bool msl_reg_needs_initializer(nir_intrinsic_instr *reg);
