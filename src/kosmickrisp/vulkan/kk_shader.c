@@ -540,7 +540,8 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
       rs->vertex_inputs ==
       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
    if (!kk_vi_is_static(state)) {
-      NIR_PASS(_, nir, kk_nir_lower_vbo_dynamic, robustness2);
+      NIR_PASS(_, nir, kk_nir_lower_vbo_dynamic, robustness2,
+               !KK_DEBUG(NO_MSL_HELPERS));
       return;
    }
 

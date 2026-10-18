@@ -214,6 +214,23 @@ devenv.append('VK_DRIVER_FILES', kosmickrisp_icd.full_path())
 
 if with_tests
   test(
+    'kk-vbo',
+    executable(
+      'kk-vbo-test',
+      ['tests/vbo.c', 'kk_nir_lower_vbo.c'],
+      include_directories : [inc_include, inc_src],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_vulkan_util,
+        idep_vulkan_runtime_headers, idep_vulkan_wsi_headers,
+        idep_mtl_bridge, idep_msl_to_nir,
+        idep_libkk_shaders_h.partial_dependency(includes : true, sources : true),
+      ],
+      link_args : host_machine.system() == 'darwin' ? ['-Wl,-dead_strip'] : ld_args_gc_sections,
+    ),
+    suite : ['kosmickrisp'],
+    timeout : 180,
+  )
+  test(
     'kk-polygon-point',
     executable(
       'kk-polygon-point-test',

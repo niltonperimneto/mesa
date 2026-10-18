@@ -4,6 +4,7 @@
  */
 
 #include "msl_private.h"
+#include "msl_vbo.h"
 #include "nir_to_msl.h"
 
 #include "util/ralloc.h"
@@ -694,6 +695,11 @@ print_group_catalogue(struct _mesa_string_buffer *buf,
 bool
 msl_helper_name_group(const char *name, uint32_t *group)
 {
+   if (!strcmp(name, "kk_v_f") || !strcmp(name, "kk_v_i") ||
+       !strcmp(name, "kk_v_u")) {
+      *group = MSL_VBO_HELPER_GROUP;
+      return true;
+   }
    unsigned id;
    int end = 0;
    if (sscanf(name, "kk_t_%3x_%n", &id, &end) == 1 && end == 9) {
@@ -709,6 +715,8 @@ msl_helper_name_group(const char *name, uint32_t *group)
 char *
 msl_helper_group_source(void *mem_ctx, uint32_t group_id)
 {
+   if (group_id == MSL_VBO_HELPER_GROUP)
+      return msl_vbo_helper_source(mem_ctx);
    struct msl_tex_group group;
    if (!group_from_id(group_id, &group))
       return NULL;

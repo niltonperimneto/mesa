@@ -8,6 +8,7 @@
 #include "kosmickrisp/bridge/mtl_device.h"
 #include "kosmickrisp/bridge/mtl_format.h"
 #include "kosmickrisp/compiler/msl_private.h"
+#include "kosmickrisp/compiler/msl_vbo.h"
 #include "kosmickrisp/compiler/nir_to_msl.h"
 
 #include "util/ralloc.h"
@@ -58,7 +59,7 @@ static void
 test_group_libraries(mtl_compiler *compiler)
 {
    unsigned groups = 0, functions = 0, failures = 0;
-   for (uint32_t id = 0; id <= 0xfff; id++) {
+   for (uint32_t id = 0; id <= MSL_VBO_HELPER_GROUP; id++) {
       char *src = msl_helper_group_source(NULL, id);
       if (!src)
          continue;

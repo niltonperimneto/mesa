@@ -7,6 +7,7 @@
 #include "nir_to_msl.h"
 #include "util/u_dynarray.h"
 #include "msl_private.h"
+#include "msl_vbo.h"
 #include "nir.h"
 #include "nir_builder.h"
 
@@ -1455,6 +1456,47 @@ emit_helper_decls(struct nir_to_msl_ctx *ctx, struct util_dynarray *refs)
       msl_print_tex_helper_decl(ctx->text, &ref->group, &ref->op);
 }
 
+bool
+msl_reg_needs_initializer(nir_intrinsic_instr *reg)
+{
+   if (nir_intrinsic_num_array_elems(reg))
+      return true;
+   unsigned mask = BITFIELD_MASK(nir_intrinsic_num_components(reg));
+   nir_foreach_use_including_if(use, &reg->def) {
+      if (nir_src_is_if(use))
+         return true;
+      nir_instr *instr = nir_src_use_instr(use);
+      if (instr->type != nir_instr_type_intrinsic)
+         return true;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_store_reg && use == &intr->src[1])
+         continue;
+      if (intr->intrinsic != nir_intrinsic_load_reg || use != &intr->src[0])
+         return true;
+   }
+   nir_foreach_reg_load(use, reg) {
+      nir_instr *instr = nir_src_use_instr(use);
+      bool initialized = false;
+      nir_foreach_reg_store(store_use, reg) {
+         nir_intrinsic_instr *store =
+            nir_instr_as_intrinsic(nir_src_use_instr(store_use));
+         if (store->intrinsic != nir_intrinsic_store_reg ||
+             nir_intrinsic_write_mask(store) != mask)
+            continue;
+         if (store->instr.block == instr->block) {
+            initialized = store->instr.index < instr->index;
+         } else {
+            initialized = nir_block_dominates(store->instr.block, instr->block);
+         }
+         if (initialized)
+            break;
+      }
+      if (!initialized)
+         return true;
+   }
+   return false;
+}
+
 static void
 intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 {
@@ -1476,10 +1518,23 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       return;
    }
    switch (instr->intrinsic) {
+   case nir_intrinsic_load_vbo_kk:
+      P(ctx, "%s(", msl_vbo_helper_name(nir_intrinsic_dest_type(instr)));
+      for (unsigned i = 0; i < 3; i++) {
+         if (i)
+            P(ctx, ", ");
+         src_to_msl(ctx, &instr->src[i]);
+      }
+      P(ctx, ");\n");
+      break;
    case nir_intrinsic_decl_reg: {
       const char *reg_type = msl_uint_type(nir_intrinsic_bit_size(instr),
                                            nir_intrinsic_num_components(instr));
-      P_IND(ctx, "%s r%d = %s(0);\n", reg_type, instr->def.index, reg_type);
+      if (msl_reg_needs_initializer(instr)) {
+         P_IND(ctx, "%s r%d = %s(0);\n", reg_type, instr->def.index, reg_type);
+      } else {
+         P_IND(ctx, "%s r%d;\n", reg_type, instr->def.index);
+      }
    } break;
    case nir_intrinsic_load_reg:
       // register loads get inlined into the uses
@@ -3007,6 +3062,8 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
       .separate_io = options->separate_io,
    };
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_metadata_require(impl,
+                        nir_metadata_dominance | nir_metadata_instr_index);
    msl_gather_info(&ctx, options);
 
    struct util_dynarray helpers;
@@ -3022,6 +3079,24 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
    P(&ctx, "using namespace metal;\n");
    if (ctx.tex_helpers)
       emit_helper_decls(&ctx, &helpers);
+   unsigned vbo_types = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_vbo_kk)
+            continue;
+         nir_alu_type type = nir_intrinsic_dest_type(intr);
+         unsigned bit = type == nir_type_float32 ? 1
+                        : type == nir_type_int32 ? 2
+                                                 : 4;
+         if (!(vbo_types & bit)) {
+            msl_print_vbo_helper_decl(ctx.text, type);
+            vbo_types |= bit;
+         }
+      }
+   }
    util_dynarray_fini(&helpers);
 
    msl_emit_constant_data(&ctx, shader);
