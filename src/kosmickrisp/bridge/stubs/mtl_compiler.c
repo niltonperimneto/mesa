@@ -45,6 +45,12 @@ mtl_function_descriptor_set_linked_functions(mtl_function_descriptor *function,
 {
 }
 
+bool
+mtl_function_descriptor_has_linked_functions(mtl_function_descriptor *function)
+{
+   return false;
+}
+
 /* Compute pipeline */
 mtl_compute_pipeline_state *
 mtl_new_compute_pipeline_state(mtl_compiler *compiler,

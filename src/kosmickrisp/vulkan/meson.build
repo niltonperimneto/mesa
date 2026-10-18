@@ -339,7 +339,7 @@ if with_tests
       'kk-msl-helpers',
       executable(
         'kk-msl-helpers-test',
-        'tests/msl_helpers.c',
+        ['tests/msl_helpers.c', 'kk_metal_cache.c'],
         include_directories : [inc_include, inc_src],
         dependencies : [
           idep_nir,

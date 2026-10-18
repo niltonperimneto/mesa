@@ -38,6 +38,8 @@
 struct mock_desc {
    uint32_t id;
    unsigned failures;
+   uint32_t vertex;
+   uint32_t fragment;
 };
 
 #define ARCHIVE_ALIVE 0x41524348u
@@ -66,6 +68,8 @@ static struct {
    unsigned call_count;
    unsigned uncaptured_calls;
    uint32_t captured[MAX_KEYS];
+   uint32_t captured_vertex[MAX_KEYS];
+   uint32_t captured_fragment[MAX_KEYS];
    unsigned captured_count;
    size_t key_bytes;
    unsigned serializes;
@@ -184,6 +188,11 @@ mock_compile(mtl_compiler *compiler, void *descriptor)
       desc->failures--;
    if (!fail && compiler == (mtl_compiler *)&captured_compiler) {
       CHECK(mock.captured_count < MAX_KEYS);
+      for (unsigned i = 0; i < mock.captured_count; ++i)
+         CHECK(!desc->vertex || desc->vertex != mock.captured_vertex[i] ||
+               desc->fragment == mock.captured_fragment[i]);
+      mock.captured_vertex[mock.captured_count] = desc->vertex;
+      mock.captured_fragment[mock.captured_count] = desc->fragment;
       mock.captured[mock.captured_count++] = desc->id;
    }
    mtx_unlock(&mock.lock);
@@ -410,12 +419,23 @@ desc_key(const struct mock_desc *desc, cache_key key)
    _mesa_blake3_compute(&desc->id, sizeof(desc->id), key);
 }
 
+static struct kk_metal_capture_key
+capture_key(const struct mock_desc *desc)
+{
+   struct kk_metal_capture_key key = {0};
+   memcpy(key.vertex, &desc->vertex, sizeof(desc->vertex));
+   memcpy(key.fragment, &desc->fragment, sizeof(desc->fragment));
+   return key;
+}
+
 static void
 defer_locked(struct kk_metal_cache *cache, struct mock_desc *desc)
 {
    cache_key key;
    desc_key(desc, key);
-   kk_metal_defer_recapture_locked(cache, key, desc, false, 0);
+   struct kk_metal_capture_key group = capture_key(desc);
+   kk_metal_defer_recapture_locked(cache, key, desc, false, 0,
+                                   desc->vertex ? &group : NULL);
 }
 
 static bool
@@ -629,8 +649,10 @@ compile_desc(struct kk_metal_cache *cache, struct mock_desc *desc, bool *hit)
 {
    cache_key key;
    desc_key(desc, key);
+   struct kk_metal_capture_key group = capture_key(desc);
    return kk_metal_cache_new_render_pipeline(
-      cache, key, (mtl_render_pipeline_descriptor *)desc, hit);
+      cache, key, (mtl_render_pipeline_descriptor *)desc,
+      desc->vertex ? &group : NULL, hit);
 }
 
 static void
@@ -1207,6 +1229,80 @@ test_destroy_drains_operation(void)
    kk_metal_cache_destroy(cache);
 }
 
+static void
+test_linked_vertex_batches(bool bypass_disabled, bool shutdown, bool fail)
+{
+   mock_reset(true);
+   setenv("MESA_KK_PSO_CACHE_BYPASS_DISABLE",
+          bypass_disabled ? "true" : "false", 1);
+   struct kk_metal_cache *cache = make_cache(0, 1000);
+   struct mock_desc descs[] = {
+      {.id = 12000, .vertex = 1, .fragment = 1},
+      {.id = 12001, .vertex = 1, .fragment = 1},
+      {.id = 12002, .vertex = 2, .fragment = 2},
+      {.id = 12003},
+      {.id = 12004, .vertex = 1, .fragment = 2},
+      {.id = 12005, .vertex = 1, .fragment = 3},
+   };
+   bool hit;
+   for (unsigned i = 0; i < 4; ++i)
+      CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serializes == 0 && mock.captured_count == 4);
+   mock.serialize_failures = fail ? 1 : 0;
+   mtx_unlock(&mock.lock);
+   for (unsigned i = 4; i < ARRAY_SIZE(descs); ++i)
+      CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+   if (!shutdown) {
+      wait_recapture_idle(cache);
+      kk_metal_cache_flush(cache);
+   }
+   kk_metal_cache_destroy(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serializes == 3 && mock.max_batch == 4);
+   mtx_unlock(&mock.lock);
+   mock_reset(false);
+   cache = make_cache(0, 1000);
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      CHECK(compile_desc(cache, &descs[i], &hit) && hit);
+   CHECK(mock.call_count == 0 && mock.uncaptured_calls == 0);
+   kk_metal_cache_destroy(cache);
+   unsetenv("MESA_KK_PSO_CACHE_BYPASS_DISABLE");
+}
+
+static void
+test_linked_vertex_inflight(void)
+{
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 1000);
+   struct mock_desc first = {.id = 13000, .vertex = 1, .fragment = 1};
+   struct mock_desc second = {.id = 13001, .vertex = 1, .fragment = 2};
+   struct cold_user user = {.cache = cache, .desc = &first};
+   mock.block_id = first.id;
+   thrd_t thread;
+   CHECK(thrd_create(&thread, run_cold_user, &user) == thrd_success);
+   mtx_lock(&mock.lock);
+   while (!mock.blocked)
+      cnd_wait(&mock.cond, &mock.lock);
+   mtx_unlock(&mock.lock);
+   bool hit;
+   CHECK(compile_desc(cache, &second, &hit) && !hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.uncaptured_calls == 1 && mock.serializes == 0);
+   mock.block_id = 0;
+   cnd_broadcast(&mock.cond);
+   mtx_unlock(&mock.lock);
+   CHECK(thrd_join(thread, NULL) == thrd_success);
+   CHECK(user.compiled && !user.hit);
+   kk_metal_cache_destroy(cache);
+   CHECK(mock.serializes == 2);
+   mock_reset(false);
+   cache = make_cache(0, 1000);
+   CHECK(compile_desc(cache, &first, &hit) && hit);
+   CHECK(compile_desc(cache, &second, &hit) && hit);
+   kk_metal_cache_destroy(cache);
+}
+
 int
 main(void)
 {
@@ -1215,6 +1311,9 @@ main(void)
    setenv("MESA_KK_PSO_CACHE_MAX_AGE_MS", "1000000000", 1);
    CHECK(mtx_init(&mock.lock, mtx_plain) == thrd_success);
    CHECK(cnd_init(&mock.cond) == thrd_success);
+   for (unsigned i = 0; i < 8; ++i)
+      test_linked_vertex_batches(i & 1, i & 2, i & 4);
+   test_linked_vertex_inflight();
    test_recapture_order_and_dedup();
    test_recapture_failures();
    test_recapture_yields_to_flush();

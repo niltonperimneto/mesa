@@ -47,6 +47,9 @@ void mtl_function_descriptor_set_linked_functions(
    mtl_function_descriptor *function, mtl_function_descriptor **functions,
    uint32_t count);
 
+bool
+mtl_function_descriptor_has_linked_functions(mtl_function_descriptor *function);
+
 /* Compute pipeline */
 mtl_compute_pipeline_state *
 mtl_new_compute_pipeline_state(mtl_compiler *compiler,

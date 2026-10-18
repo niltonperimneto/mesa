@@ -541,6 +541,12 @@ kk_new_render_pipeline(struct kk_device *dev, mtl_function_descriptor *vs,
 
    blake3_hash digest;
    _mesa_blake3_compute(key, sizeof(*key), digest);
+   struct kk_metal_capture_key capture_key;
+   bool linked_vertex = mtl_function_descriptor_has_linked_functions(vs);
+   if (linked_vertex) {
+      memcpy(capture_key.vertex, key->rast, CACHE_KEY_SIZE);
+      memcpy(capture_key.fragment, key->fs, CACHE_KEY_SIZE);
+   }
    bool archive_hit = false;
    int64_t start = os_time_get_nano();
    struct mtl_compile_phase phase =
@@ -559,10 +565,11 @@ kk_new_render_pipeline(struct kk_device *dev, mtl_function_descriptor *vs,
             dev->metal_cache, digest, desc);
       archive_hit = pso != NULL;
    } else {
-      pso = dev->metal_cache ?
-         kk_metal_cache_new_render_pipeline(
-            dev->metal_cache, digest, desc, &archive_hit) :
-         mtl_new_render_pipeline(dev->mtl_compiler_handle, desc);
+      pso = dev->metal_cache
+               ? kk_metal_cache_new_render_pipeline(
+                    dev->metal_cache, digest, desc,
+                    linked_vertex ? &capture_key : NULL, &archive_hit)
+               : mtl_new_render_pipeline(dev->mtl_compiler_handle, desc);
    }
    kk_metal_cache_set_trace(previous_trace);
    mtl_compile_phase_end(phase, pso != NULL);

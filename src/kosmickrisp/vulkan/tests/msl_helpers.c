@@ -11,6 +11,8 @@
 #include "kosmickrisp/compiler/msl_vbo.h"
 #include "kosmickrisp/compiler/nir_to_msl.h"
 
+#include "../kk_metal_cache.h"
+#include "util/os_time.h"
 #include "util/ralloc.h"
 
 #include <stdio.h>
@@ -241,6 +243,91 @@ test_static_link_archive(mtl_device *dev)
    mtl_release(compiler);
 }
 
+static void
+test_linked_vertex_cache(mtl_device *dev)
+{
+   static const char helper_src[] =
+      "#include <metal_stdlib>\nusing namespace metal;\n"
+      "[[visible]] float4 kk_h(float4 x) { return x * 2; }\n";
+   static const char vertex_src[] =
+      "#include <metal_stdlib>\nusing namespace metal;\n"
+      "[[visible]] extern float4 kk_h(float4);\n"
+      "struct O { float4 p [[position]]; float4 u [[user(u)]]; "
+      "float4 v [[user(v)]]; };\n"
+      "vertex O vs(uint id [[vertex_id]]) { "
+      "float4 x = kk_h(float4(id, 0, 0, 1)); "
+      "O o; o.p = x; o.u = x.wzyx; o.v = x.yzwx; return o; }\n";
+   static const char *fragment_src[] = {
+      "#include <metal_stdlib>\nusing namespace metal;\n"
+      "struct I { float4 x [[user(u)]]; };\n"
+      "fragment float4 fs(I in [[stage_in]]) { return in.x; }\n",
+      "#include <metal_stdlib>\nusing namespace metal;\n"
+      "struct I { float4 x [[user(v)]]; };\n"
+      "fragment float4 fs(I in [[stage_in]]) { return in.x; }\n",
+   };
+   char identity[64];
+   snprintf(identity, sizeof(identity), "%lld", (long long)os_time_get_nano());
+   struct disk_cache *disk =
+      disk_cache_create("kk-linked-vertex-test", identity, 0);
+   CHECK(disk);
+   mtl_compiler *compiler = mtl_new_compiler(dev);
+   CHECK(compiler && mtl_compiler_has_serializer(compiler));
+   mtl_library *helper = compile(compiler, helper_src);
+   mtl_library *vertex = compile(compiler, vertex_src);
+   CHECK(helper && vertex);
+   mtl_function_descriptor *vs = linked_function(vertex, "vs", helper, "kk_h");
+   CHECK(mtl_function_descriptor_has_linked_functions(vs));
+   mtl_render_pipeline_descriptor *descs[2];
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+      mtl_library *fragment = compile(compiler, fragment_src[i]);
+      CHECK(fragment);
+      mtl_function_descriptor *fs =
+         mtl_new_library_function_descriptor(fragment, "fs");
+      CHECK(!mtl_function_descriptor_has_linked_functions(fs));
+      descs[i] = mtl_new_render_pipeline_descriptor();
+      mtl_render_pipeline_descriptor_set_vertex_shader(descs[i], vs);
+      mtl_render_pipeline_descriptor_set_fragment_shader(descs[i], fs);
+      mtl_render_pipeline_descriptor_set_input_primitive_topology(
+         descs[i], MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE);
+      mtl_render_pipeline_descriptor_set_raster_sample_count(descs[i], 1);
+      for (unsigned j = 0; j < 8; ++j)
+         mtl_render_pipeline_descriptor_set_color_attachment_unspecialized(
+            descs[i], j);
+      mtl_release(fs);
+      mtl_release(fragment);
+   }
+   for (unsigned warm = 0; warm < 2; ++warm) {
+      struct kk_metal_cache *cache =
+         kk_metal_cache_create(disk, dev, 0, compiler, 0);
+      CHECK(cache);
+      for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+         cache_key key = {i + 1};
+         struct kk_metal_capture_key group = {
+            .vertex = {1},
+            .fragment = {i + 1},
+         };
+         bool hit;
+         mtl_render_pipeline_state *pipeline =
+            kk_metal_cache_new_render_pipeline(cache, key, descs[i], &group,
+                                               &hit);
+         CHECK(pipeline && hit == (bool)warm);
+         mtl_release(pipeline);
+      }
+      kk_metal_cache_destroy(cache);
+      disk_cache_wait_for_idle(disk);
+      mtl_release(compiler);
+      compiler = warm ? NULL : mtl_new_compiler(dev);
+      CHECK(warm || compiler);
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      mtl_release(descs[i]);
+   mtl_release(vs);
+   mtl_release(vertex);
+   mtl_release(helper);
+   disk_cache_destroy(disk);
+   printf("linked vertex variants: 2/2 archive hits after cache reload\n");
+}
+
 int
 main(void)
 {
@@ -257,6 +344,7 @@ main(void)
    test_group_libraries(compiler);
    mtl_release(compiler);
    test_static_link_archive(dev);
+   test_linked_vertex_cache(dev);
    mtl_release(dev);
    return 0;
 }

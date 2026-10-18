@@ -6,6 +6,11 @@
 
 struct kk_metal_cache;
 
+struct kk_metal_capture_key {
+   uint8_t vertex[CACHE_KEY_SIZE];
+   uint8_t fragment[CACHE_KEY_SIZE];
+};
+
 struct kk_metal_trace {
    void (*callback)(void *data, const char *phase, const uint8_t *key,
                     size_t key_size, int64_t start, int64_t end);
@@ -29,7 +34,8 @@ mtl_render_pipeline_state *kk_metal_cache_lookup_render_pipeline(
    mtl_render_pipeline_descriptor *descriptor);
 mtl_render_pipeline_state *kk_metal_cache_new_render_pipeline(
    struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
-   mtl_render_pipeline_descriptor *descriptor, bool *archive_hit);
+   mtl_render_pipeline_descriptor *descriptor,
+   const struct kk_metal_capture_key *capture_key, bool *archive_hit);
 mtl_render_pipeline_state *kk_metal_cache_specialize_render_pipeline(
    struct kk_metal_cache *cache, const uint8_t key[CACHE_KEY_SIZE],
    mtl_render_pipeline_descriptor *descriptor, mtl_render_pipeline_state *base);

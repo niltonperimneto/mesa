@@ -302,6 +302,13 @@ mtl_function_descriptor_set_linked_functions(mtl_function_descriptor *function,
    }
 }
 
+bool
+mtl_function_descriptor_has_linked_functions(mtl_function_descriptor *function)
+{
+   return function && objc_getAssociatedObject(
+                         (id)function, &mtl_linked_functions_key) != nil;
+}
+
 /* Compute pipeline */
 mtl_compute_pipeline_state *
 mtl_new_compute_pipeline_state(mtl_compiler *compiler,
@@ -621,7 +628,7 @@ mtl_pipeline_cache_identity(mtl_device *device, uint32_t gpu_family,
    sysctlbyname("kern.osversion", build, &build_size, NULL, 0);
    @autoreleasepool {
       const char *name = [[(id<MTLDevice>)device name] UTF8String];
-      snprintf(identity, size, "metal4-pso-3:%s:%u:%s", build, gpu_family,
+      snprintf(identity, size, "metal4-pso-4:%s:%u:%s", build, gpu_family,
                name ? name : "");
    }
 }
