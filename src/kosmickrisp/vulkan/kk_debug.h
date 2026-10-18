@@ -30,6 +30,7 @@ enum kk_experimental {
    /* Using allowGPUOptimizedContents on M5 for this format causes
     * vkCmdCopyImage() tests in CTS to fail, but it is otherwise usable */
    KK_EXPERIMENTAL_M5_OPTIMIZE_E5B9G9R9 = 1ull << 2,
+   KK_EXPERIMENTAL_TRANSFORM_FEEDBACK = 1ull << 3,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;

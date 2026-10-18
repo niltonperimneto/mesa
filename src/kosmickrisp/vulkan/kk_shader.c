@@ -3152,12 +3152,14 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    }
 
    bool has_fs = infos[shader_count - 1u].stage == MESA_SHADER_FRAGMENT;
-   bool partition = state && !(has_fs && shader_count > 1u);
+   bool partition = state && !(has_fs && shader_count > 1u) &&
+                    !KK_EXPERIMENTAL(TRANSFORM_FEEDBACK);
    bool has_gs_producer = has_fs && shader_count > 1u &&
                           infos[shader_count - 2u].stage ==
                              MESA_SHADER_GEOMETRY;
 
-   if ((KK_DEBUG(PARTITION) || has_gs_producer ||
+   if (!KK_EXPERIMENTAL(TRANSFORM_FEEDBACK) &&
+       (KK_DEBUG(PARTITION) || has_gs_producer ||
         (state && kk_state_needs_link(state)) ||
         kk_state_may_draw_points(state)) &&
        state && has_fs && shader_count > 1u) {
@@ -3240,6 +3242,14 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
          } else {
             /* Adjacency is unrolled first, so this works for any topology
              * in the same class. */
+            if (!state->ia) {
+               for (uint32_t j = 0u; j < total_shaders; ++j)
+                  ralloc_free(nir_shaders[j]);
+               for (uint32_t j = i + 1u; j < shader_count; ++j)
+                  ralloc_free(infos[j].nir);
+               memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+               return VK_ERROR_FEATURE_NOT_PRESENT;
+            }
             prim = u_reduced_prim(
                vk_topology_to_mesa(state->ia->primitive_topology));
          }

@@ -279,6 +279,24 @@ if with_tests
     timeout : 30,
   )
   if host_machine.system() == 'darwin'
+    xfb_capabilities = executable(
+      'kk-xfb-capabilities-test',
+      'tests/xfb_capabilities.c',
+      include_directories : [inc_include],
+    )
+    foreach mode : ['production', 'research']
+      test(
+        'kk-xfb-capabilities-' + mode,
+        xfb_capabilities,
+        args : [libvulkan_kosmickrisp.full_path(), mode],
+        env : ['MESA_KK_EXPERIMENTAL=' + (mode == 'research' ? 'transform_feedback' : '')],
+        depends : [libvulkan_kosmickrisp],
+        suite : ['kosmickrisp'],
+        timeout : 30,
+      )
+    endforeach
+  endif
+  if host_machine.system() == 'darwin'
     test(
       'kk-msl-helpers',
       executable(

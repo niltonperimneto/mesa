@@ -144,8 +144,8 @@ kk_get_device_extensions(const struct kk_instance *instance,
       /* Optional extensions */
       .KHR_calibrated_timestamps = true,
       .KHR_deferred_host_operations = true,
-      .KHR_pipeline_library = true,
-      .EXT_graphics_pipeline_library = true,
+      .KHR_pipeline_library = !KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
+      .EXT_graphics_pipeline_library = !KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
       .KHR_maintenance7 = true,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
@@ -200,14 +200,14 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_robustness2 = true,
       .EXT_sample_locations = true,
       .EXT_shader_atomic_float = true,
-      .EXT_shader_object = true,
+      .EXT_shader_object = !KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
       .EXT_shader_replicated_composites = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
 #ifdef KK_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
 #endif
-      .EXT_transform_feedback = true,
+      .EXT_transform_feedback = KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
       .EXT_vertex_attribute_robustness = true,
       .EXT_vertex_input_dynamic_state = true,
 
@@ -337,7 +337,7 @@ kk_get_device_features(
       .inlineUniformBlock = true,
       .maintenance4 = true,
       .pipelineCreationCacheControl = true,
-      .graphicsPipelineLibrary = true,
+      .graphicsPipelineLibrary = !KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
       .privateData = true,
       .robustImageAccess = true,
       .shaderDemoteToHelperInvocation = true,
@@ -531,8 +531,8 @@ kk_get_device_features(
          pdev->info.msl_version >= MTL_LANGUAGE_VERSION_4_1,
 
       /* VK_EXT_transform_feedback */
-      .transformFeedback = true,
-      .geometryStreams = true,
+      .transformFeedback = KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
+      .geometryStreams = KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
 
       /* VK_EXT_vertex_attribute_robustness */
       .vertexAttributeRobustness = true,
@@ -541,7 +541,7 @@ kk_get_device_features(
       .vertexInputDynamicState = true,
 
       /* VK_EXT_shader_object */
-      .shaderObject = true,
+      .shaderObject = !KK_EXPERIMENTAL(TRANSFORM_FEEDBACK),
 
       /* EXT_ycbcr_2plane_444_formats */
       .ycbcr2plane444Formats = true,
