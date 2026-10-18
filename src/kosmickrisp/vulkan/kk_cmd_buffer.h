@@ -103,6 +103,9 @@ struct kk_per_draw_data {
 
    /* Whether the last vertex of a primitive is its provoking vertex */
    uint32_t provoking_last;
+
+   /* GS stream selected for rasterization */
+   uint32_t rasterization_stream;
 };
 
 static_assert(sizeof(struct kk_per_draw_data) == 64,
@@ -216,6 +219,17 @@ struct kk_graphics_state {
       struct kk_shader *gs;
       struct kk_shader *source;
    } point;
+   /* Transform feedback */
+   struct {
+      struct kk_addr_range buffers[POLY_MAX_SO_BUFFERS];
+      /* Per-buffer byte offsets in lazily allocated command buffer memory */
+      uint64_t offsets;
+      /* Active queries for each stream: primitives written, then needed */
+      uint64_t queries[POLY_MAX_VERTEX_STREAMS];
+      /* Zero offset when XFB is disabled, then scratch for unused counters */
+      uint64_t scratch;
+      bool enabled;
+   } xfb;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;

@@ -11,6 +11,11 @@
 
 #include "compiler/libcl/libcl.h"
 
+struct libkk_xfb_counter_copy {
+   DEVICE(uint32_t) dest[4];
+   DEVICE(uint32_t) src[4];
+};
+
 struct libkk_imm_write {
    DEVICE(uint32_t) address;
    uint32_t value;

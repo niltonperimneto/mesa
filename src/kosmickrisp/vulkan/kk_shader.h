@@ -105,6 +105,10 @@ struct kk_shader_info {
          bool has_ds;
          bool has_depth_write;
          bool has_stencil_test;
+
+         /* Application or generated GS info, valid when additional_stages_bits
+          * includes a geometry shader */
+         struct poly_gs_info gs;
       } vs;
 
       struct {
@@ -140,7 +144,7 @@ struct kk_shader_info {
    };
 };
 
-static_assert(sizeof(struct kk_shader_info) == 128,
+static_assert(sizeof(struct kk_shader_info) == 216,
               "kk_shader_info is serialized");
 /* Threadgroup size the VS, TES and GS compute passes are compiled for and
  * dispatched with */
@@ -154,6 +158,9 @@ struct kk_pipeline_handles {
          /* VS, TCS, TES and the GS compute pass at most run before the render
           * pipeline. */
          mtl_compute_pipeline_state *pre_render[4];
+         /* XFB pre-GS pipeline and count pipeline, if needed */
+         mtl_compute_pipeline_state *gs_count;
+         mtl_compute_pipeline_state *pre_gs;
          mtl_depth_stencil_state *ds_handle;
          uint32_t pre_render_count;
       } gfx;
@@ -229,6 +236,9 @@ struct kk_shader {
    mtx_t variants_lock;
    struct hash_table *variants;
    struct kk_render_pending *pending;
+   /* XFB pre-GS and count shader; code is NULL when the program isn't needed. */
+   struct msl_compile_data gs_count;
+   struct msl_compile_data pre_gs;
 };
 
 struct kk_fs_link_key {

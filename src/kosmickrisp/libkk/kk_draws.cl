@@ -71,6 +71,22 @@ libkk_predicate_indirect_neq_zero(global uint32_t *out, constant uint32_t *in,
    libkk_predicate_draw(out, in, out_stride_el, in_stride_el, draw_id, enabled);
 }
 
+/* Build an indirect draw from the XFB byte counter for
+ * vkCmdDrawIndirectByteCount2EXT. */
+KERNEL(1)
+libkk_draw_byte_count(global uint32_t *out_draw, constant uint32_t *byte_count,
+                      uint32_t counter_offset, uint32_t vertex_stride,
+                      uint32_t instance_count, uint32_t first_instance)
+{
+   uint32_t bytes =
+      *byte_count > counter_offset ? *byte_count - counter_offset : 0;
+
+   out_draw[0] = bytes / vertex_stride; /* vertex_count */
+   out_draw[1] = instance_count;
+   out_draw[2] = 0; /* first_vertex */
+   out_draw[3] = first_instance;
+}
+
 KERNEL(1024)
 libkk_unroll_geometry(
    uint64_t index_buffer, global struct poly_heap *heap,

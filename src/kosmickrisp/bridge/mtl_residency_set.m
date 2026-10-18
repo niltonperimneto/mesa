@@ -16,7 +16,7 @@ mtl_new_residency_set(mtl_device *device)
       id<MTLDevice> dev = (id<MTLDevice>)device;
       MTLResidencySetDescriptor *setDescriptor = [[[MTLResidencySetDescriptor alloc] init] autorelease];
       setDescriptor.initialCapacity = 100;
-      NSError *error;
+      NSError *error = nil;
       id<MTLResidencySet> set = [dev newResidencySetWithDescriptor:setDescriptor
                                                              error:&error];
 

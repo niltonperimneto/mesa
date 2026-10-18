@@ -62,6 +62,14 @@ libkk_write_u32(global uint32_t *address, uint32_t value)
    *address = value;
 }
 
+/* Copy buffer offsets; use zero when the source is NULL. */
+KERNEL(1)
+libkk_copy_xfb_counters(constant struct libkk_xfb_counter_copy *copy)
+{
+   uint i = cl_global_id.x;
+   *(copy->dest[i]) = copy->src[i] ? *(copy->src[i]) : 0;
+}
+
 KERNEL(1)
 libkk_copy_queries(global uint32_t *availability, global uint64_t *results,
                    global uint16_t *oq_index, uint64_t dst_addr,
