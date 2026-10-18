@@ -111,11 +111,12 @@ test_specialization(bool uncaptured, bool serializing, bool fail)
          !cache.uncaptured_compiles && !cache.pending && !cache.recapture);
    mock.compiler = NULL;
    cache_key key = {0};
-   mtl_render_pipeline_state *closed = kk_metal_cache_specialize_render_pipeline(
-      &cache, key, NULL, (void *)&base_pipeline);
+   mtl_render_pipeline_state *closed =
+      kk_metal_cache_specialize_render_pipeline(&cache, key, NULL,
+                                                (void *)&base_pipeline);
    CHECK(closed == (fail ? NULL : (void *)&child_pipeline));
-   CHECK(mock.compiler == (uncaptured ? (void *)&uncaptured_compiler :
-                                         (void *)&captured_compiler));
+   CHECK(mock.compiler == (uncaptured ? (void *)&uncaptured_compiler
+                                      : (void *)&captured_compiler));
    CHECK(!cache.active_operations && !cache.captured_compiles &&
          !cache.uncaptured_compiles && !cache.pending && !cache.recapture);
    cnd_destroy(&cache.cond);

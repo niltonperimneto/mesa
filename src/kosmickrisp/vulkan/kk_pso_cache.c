@@ -63,15 +63,15 @@ struct kk_variant_recipe {
 static_assert(sizeof(struct kk_variant_recipe) == 736,
               "kk_variant_recipe is hashed and serialized");
 
-#define KK_RECIPE_SCHEMA 1
+#define KK_RECIPE_SCHEMA      1
 #define KK_RECIPE_BLEND_BYTES 21
-#define KK_RECIPE_FS_BYTES (32 + 8 + 4 + 3 + 6 + \
-                            MAX_DRAW_BUFFERS * KK_RECIPE_BLEND_BYTES)
-#define KK_RECIPE_PSO_BYTES (32 + 32 + MAX_DRAW_BUFFERS * 4 + 5 * 4 + \
-                             MAX_DRAW_BUFFERS * 8)
-#define KK_RECIPE_ENCODED_SIZE (4 + 32 + KK_RECIPE_FS_BYTES + \
-                                KK_RECIPE_PSO_BYTES + 16 + \
-                                MAX_DRAW_BUFFERS * KK_RECIPE_BLEND_BYTES)
+#define KK_RECIPE_FS_BYTES                                                     \
+   (32 + 8 + 4 + 3 + 6 + MAX_DRAW_BUFFERS * KK_RECIPE_BLEND_BYTES)
+#define KK_RECIPE_PSO_BYTES                                                    \
+   (32 + 32 + MAX_DRAW_BUFFERS * 4 + 5 * 4 + MAX_DRAW_BUFFERS * 8)
+#define KK_RECIPE_ENCODED_SIZE                                                 \
+   (4 + 32 + KK_RECIPE_FS_BYTES + KK_RECIPE_PSO_BYTES + 16 +                   \
+    MAX_DRAW_BUFFERS * KK_RECIPE_BLEND_BYTES)
 
 struct kk_recipe_stream {
    uint8_t *data;
@@ -193,7 +193,7 @@ static void
 kk_put_pso_blend(struct kk_recipe_stream *s, const struct kk_pso_blend *b)
 {
    const uint8_t fields[] = {
-      b->enable, b->src_rgb, b->dst_rgb, b->op_rgb,
+      b->enable,    b->src_rgb,   b->dst_rgb,  b->op_rgb,
       b->src_alpha, b->dst_alpha, b->op_alpha, b->write_mask,
    };
    kk_put_bytes(s, fields, sizeof(fields));
@@ -216,7 +216,7 @@ static void
 kk_recipe_encode(const struct kk_variant_recipe *recipe,
                  uint8_t data[KK_RECIPE_ENCODED_SIZE])
 {
-   struct kk_recipe_stream s = { .data = data };
+   struct kk_recipe_stream s = {.data = data};
    kk_put_u32(&s, KK_RECIPE_SCHEMA);
    kk_put_bytes(&s, recipe->family, sizeof(recipe->family));
    const struct kk_fs_link_key *fs = &recipe->fs;
@@ -260,7 +260,7 @@ static bool
 kk_recipe_decode(const uint8_t data[KK_RECIPE_ENCODED_SIZE],
                  struct kk_variant_recipe *recipe)
 {
-   struct kk_recipe_stream s = { .data = (uint8_t *)data, .valid = true };
+   struct kk_recipe_stream s = {.data = (uint8_t *)data, .valid = true};
    memset(recipe, 0, sizeof(*recipe));
    if (kk_get_u32(&s) != KK_RECIPE_SCHEMA)
       return false;
@@ -626,8 +626,7 @@ kk_pso_cache_init(struct kk_pso_cache *cache)
    struct disk_cache *disk = kk_device_physical(dev)->vk.disk_cache;
    if (!dev->vk.disable_internal_cache &&
        !debug_get_bool_option("MESA_KK_PSO_CACHE_DISABLE", false)) {
-      cache->history =
-         kk_variant_history_create(disk, KK_RECIPE_ENCODED_SIZE);
+      cache->history = kk_variant_history_create(disk, KK_RECIPE_ENCODED_SIZE);
       cache->limited = !cache->history;
    }
    bool background = util_queue_init(&cache->prewarm_queue, "kk-pso", 64, 2,
@@ -1579,8 +1578,8 @@ kk_recipe_get(struct kk_device *dev, struct kk_shader *vs,
       mtx_lock(&cache->lock);
       bool in_flight = entry->state == KK_ENTRY_COMPILING &&
                        kk_compile_origin == KK_COMPILE_ORIGIN_PREWARM;
-      bool waited = !lookup_only && !in_flight &&
-                    entry->state == KK_ENTRY_COMPILING;
+      bool waited =
+         !lookup_only && !in_flight && entry->state == KK_ENTRY_COMPILING;
       if (in_flight)
          kk_log_cache_pso(dev, "prewarm_in_flight", recipe, sizeof(*recipe));
       if (waited) {
@@ -1984,9 +1983,8 @@ kk_prewarm_execute(void *data, void *global_data, int thread_index)
       uint8_t *encoded = calloc(32, KK_RECIPE_ENCODED_SIZE);
       if (recipes && encoded) {
          int64_t history_start = os_time_get_nano();
-         unsigned count = kk_variant_history_load(job->dev->pso_cache.history,
-                                                  job->recipe.family,
-                                                  encoded, 32);
+         unsigned count = kk_variant_history_load(
+            job->dev->pso_cache.history, job->recipe.family, encoded, 32);
          kk_variant_trace(job->dev, KK_VARIANT_HISTORY_LOAD, job->recipe.family,
                           sizeof(job->recipe.family), history_start,
                           os_time_get_nano());
@@ -2149,8 +2147,8 @@ kk_schedule_recipe(struct kk_device *dev,
    }
    cache->pending_jobs++;
    cache->exact_jobs += exact;
-   cache->peak_pending_jobs = MAX2(cache->peak_pending_jobs,
-                                   cache->pending_jobs);
+   cache->peak_pending_jobs =
+      MAX2(cache->peak_pending_jobs, cache->pending_jobs);
    cache->peak_exact_jobs = MAX2(cache->peak_exact_jobs, cache->exact_jobs);
    mtx_unlock(&cache->lock);
    u_rwlock_wrunlock(&cache->index_lock);

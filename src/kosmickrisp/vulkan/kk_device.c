@@ -342,12 +342,13 @@ __THREAD_INITIAL_EXEC blake3_hash kk_variant_family_id;
 __THREAD_INITIAL_EXEC bool kk_variant_family_valid;
 
 static const char *const kk_variant_names[KK_VARIANT_COUNT] = {
-   "enqueue", "worker_start", "fs_prepare", "fs_wait", "raster_prepare",
-   "raster_wait", "pso_create", "pso_wait", "archive_lookup", "archive_load",
-   "native_create", "complete", "first_demand", "ready_hit", "failure",
-   "history_load", "ref_missing", "blob_missing", "archive_rejected",
-   "pipeline_absent", "queue_wait", "native_compile", "native_specialize",
-   "ref_uncacheable", "blob_corrupt",
+   "enqueue",        "worker_start",   "fs_prepare",        "fs_wait",
+   "raster_prepare", "raster_wait",    "pso_create",        "pso_wait",
+   "archive_lookup", "archive_load",   "native_create",     "complete",
+   "first_demand",   "ready_hit",      "failure",           "history_load",
+   "ref_missing",    "blob_missing",   "archive_rejected",  "pipeline_absent",
+   "queue_wait",     "native_compile", "native_specialize", "ref_uncacheable",
+   "blob_corrupt",
 };
 
 void
@@ -442,20 +443,18 @@ kk_variant_trace_finish(struct kk_device *dev)
       fprintf(dev->variant_stats,
               "{\"event\":\"queue_summary\","
               "\"peak_pending_jobs\":%u,\"peak_exact_jobs\":%u}\n",
-              dev->pso_cache.peak_pending_jobs,
-              dev->pso_cache.peak_exact_jobs);
-      fprintf(dev->variant_stats,
-              "{\"event\":\"cache_summary\",\"native\":%u,"
-              "\"native_ready\":%u,\"native_failed\":%u,\"recipes\":%u,"
-              "\"recipes_ready\":%u,\"families\":%u,\"entry_bytes\":%llu,"
-              "\"fs_variants_created\":%llu}\n",
-              dev->pso_cache.summary.native, dev->pso_cache.summary.native_ready,
-              dev->pso_cache.summary.native_failed,
-              dev->pso_cache.summary.recipes,
-              dev->pso_cache.summary.recipes_ready,
-              dev->pso_cache.summary.families,
-              (unsigned long long)dev->pso_cache.summary.bytes,
-              (unsigned long long)p_atomic_read(&dev->fs_variants_created));
+              dev->pso_cache.peak_pending_jobs, dev->pso_cache.peak_exact_jobs);
+      fprintf(
+         dev->variant_stats,
+         "{\"event\":\"cache_summary\",\"native\":%u,"
+         "\"native_ready\":%u,\"native_failed\":%u,\"recipes\":%u,"
+         "\"recipes_ready\":%u,\"families\":%u,\"entry_bytes\":%llu,"
+         "\"fs_variants_created\":%llu}\n",
+         dev->pso_cache.summary.native, dev->pso_cache.summary.native_ready,
+         dev->pso_cache.summary.native_failed, dev->pso_cache.summary.recipes,
+         dev->pso_cache.summary.recipes_ready, dev->pso_cache.summary.families,
+         (unsigned long long)dev->pso_cache.summary.bytes,
+         (unsigned long long)p_atomic_read(&dev->fs_variants_created));
       fclose(dev->variant_stats);
    }
    if (dev->variant_log)

@@ -181,8 +181,8 @@ main(int argc, char **argv)
           VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0);
    CHECK((fmt_props3.linearTilingFeatures &
           VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT) != 0);
-   CHECK((fmt_props3.linearTilingFeatures &
-          VK_FORMAT_FEATURE_2_BLIT_DST_BIT) != 0);
+   CHECK((fmt_props3.linearTilingFeatures & VK_FORMAT_FEATURE_2_BLIT_DST_BIT) !=
+         0);
 
    VkPhysicalDeviceImageFormatInfo2 img_fmt_info = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
@@ -206,8 +206,8 @@ main(int argc, char **argv)
       .tiling = VK_IMAGE_TILING_LINEAR,
       .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
    };
-   CHECK(fn_vkGetPhysicalDeviceImageFormatProperties2(
-            pdev, &ds_linear_info, &img_fmt_props) ==
+   CHECK(fn_vkGetPhysicalDeviceImageFormatProperties2(pdev, &ds_linear_info,
+                                                      &img_fmt_props) ==
          VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    /* Create logical device with dynamicRendering + dynamicRenderingLocalRead */
@@ -695,10 +695,9 @@ main(int argc, char **argv)
             {(int32_t)width, (int32_t)height, 1},
          },
    };
-   fn_vkCmdBlitImage(cmd_buf, opt_ia_image,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear_image,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit_region,
-                     VK_FILTER_NEAREST);
+   fn_vkCmdBlitImage(
+      cmd_buf, opt_ia_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear_image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit_region, VK_FILTER_NEAREST);
    CHECK(fn_vkEndCommandBuffer(cmd_buf) == VK_SUCCESS);
 
    CHECK(fn_vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) ==

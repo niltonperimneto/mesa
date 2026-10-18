@@ -19,11 +19,12 @@ test_vk_errorf(const void *object, VkResult error, const char *file, int line,
    return error;
 }
 
-#include <stdio.h>
 #include <ftw.h>
+#include <stdio.h>
 #include "util/disk_cache.h"
 
-#define KK_RECIPE_GOLDEN "5e3e2509b74c14ef536f4fd3faedd1d6167ae2bb36ee5a04c9c5b92e775b90b6"
+#define KK_RECIPE_GOLDEN                                                       \
+   "5e3e2509b74c14ef536f4fd3faedd1d6167ae2bb36ee5a04c9c5b92e775b90b6"
 
 #define CHECK(x) do { \
    if (!(x)) { \
@@ -119,16 +120,17 @@ void kk_log_cache_pso(struct kk_device *dev, const char *event,
 static unsigned queue_wait_count;
 static int64_t queue_wait_max_ns;
 
-void kk_variant_trace(struct kk_device *dev, enum kk_variant_phase phase,
-                       const void *key, size_t size, int64_t start,
-                       int64_t end)
+void
+kk_variant_trace(struct kk_device *dev, enum kk_variant_phase phase,
+                 const void *key, size_t size, int64_t start, int64_t end)
 {
    if (phase != KK_VARIANT_QUEUE_WAIT)
       return;
    p_atomic_inc(&queue_wait_count);
    int64_t wait = end - start;
    int64_t seen = p_atomic_read(&queue_wait_max_ns);
-   while (wait > seen && p_atomic_cmpxchg(&queue_wait_max_ns, seen, wait) != seen)
+   while (wait > seen &&
+          p_atomic_cmpxchg(&queue_wait_max_ns, seen, wait) != seen)
       seen = p_atomic_read(&queue_wait_max_ns);
 }
 void kk_variant_metal_event(void *data, const char *phase, const uint8_t *key,
@@ -908,15 +910,16 @@ test_recipe_codec(void)
    struct kk_variant_recipe padded = recipe;
    memset((uint8_t *)&padded + offsetof(struct kk_variant_recipe, input_blend) +
              sizeof(padded.input_blend),
-          0xaa, sizeof(padded) - offsetof(struct kk_variant_recipe, input_blend) -
-                   sizeof(padded.input_blend));
+          0xaa,
+          sizeof(padded) - offsetof(struct kk_variant_recipe, input_blend) -
+             sizeof(padded.input_blend));
    for (unsigned i = 0; i < MAX_DRAW_BUFFERS; ++i)
-      memset((uint8_t *)&padded.input_blend[i] +
-                offsetof(struct vk_color_blend_attachment_state, write_mask) + 1,
-             0xaa, offsetof(struct vk_color_blend_attachment_state,
-                            color_blend_op) -
-                   offsetof(struct vk_color_blend_attachment_state,
-                            write_mask) - 1);
+      memset(
+         (uint8_t *)&padded.input_blend[i] +
+            offsetof(struct vk_color_blend_attachment_state, write_mask) + 1,
+         0xaa,
+         offsetof(struct vk_color_blend_attachment_state, color_blend_op) -
+            offsetof(struct vk_color_blend_attachment_state, write_mask) - 1);
    uint8_t padded_encoded[KK_RECIPE_ENCODED_SIZE];
    kk_recipe_encode(&padded, padded_encoded);
    CHECK(!memcmp(padded_encoded, encoded, sizeof(encoded)));
@@ -943,8 +946,7 @@ test_recipe_codec(void)
 }
 
 static int
-remove_entry(const char *path, const struct stat *sb, int flag,
-             struct FTW *ftw)
+remove_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw)
 {
    return remove(path);
 }

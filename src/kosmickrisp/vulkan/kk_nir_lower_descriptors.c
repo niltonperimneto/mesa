@@ -646,16 +646,14 @@ lower_input_attachment_select(nir_builder *b, nir_tex_instr *tex, void *_data)
       return false;
 
    nir_deref_instr *deref = nir_get_tex_deref(tex, nir_tex_src_texture_deref);
-   if (!deref ||
-       glsl_get_sampler_dim(deref->type) != GLSL_SAMPLER_DIM_SUBPASS)
+   if (!deref || glsl_get_sampler_dim(deref->type) != GLSL_SAMPLER_DIM_SUBPASS)
       return false;
 
    b->cursor = nir_before_instr(&tex->instr);
 
    nir_def *array_id = load_resource_deref_desc(
       b, 1, 64, deref,
-      offsetof(struct kk_sampled_image_descriptor, image_gpu_resource_id),
-      ctx);
+      offsetof(struct kk_sampled_image_descriptor, image_gpu_resource_id), ctx);
 
    nir_tex_instr *tex_array =
       nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));

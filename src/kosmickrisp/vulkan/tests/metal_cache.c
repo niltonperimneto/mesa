@@ -739,8 +739,8 @@ test_single_oversized_pso(void)
    CHECK(!log_contains(path, "archive_limit_lowered"));
    CHECK(!log_has_drop(path, &big, "oversized_batch"));
    CHECK(compile_desc(cache, &big, &hit) && !hit);
-   CHECK(log_has_compile(path, &big, "ref_uncacheable",
-                         "uncaptured_uncacheable"));
+   CHECK(
+      log_has_compile(path, &big, "ref_uncacheable", "uncaptured_uncacheable"));
    mtx_lock(&mock.lock);
    CHECK(mock.call_count == 1 && mock.uncaptured_calls == 1);
    mtx_unlock(&mock.lock);
@@ -815,13 +815,13 @@ run_cold_users(struct kk_metal_cache *cache, struct mock_desc *descs,
    mtx_unlock(&mock.lock);
    thrd_t threads[8];
    for (unsigned i = 0; i < count; ++i) {
-      users[i] = (struct cold_user){ .cache = cache, .desc = &descs[i] };
+      users[i] = (struct cold_user){.cache = cache, .desc = &descs[i]};
       CHECK(thrd_create(&threads[i], run_cold_user, &users[i]) == thrd_success);
    }
    int64_t give_up = os_time_get_nano() + 5000000000ll;
    while (loading_users(cache) < count) {
       CHECK(os_time_get_nano() < give_up);
-      thrd_sleep(&(struct timespec){ .tv_nsec = 1000000 }, NULL);
+      thrd_sleep(&(struct timespec){.tv_nsec = 1000000}, NULL);
    }
    mtx_lock(&mock.lock);
    CHECK(mock.archive_gated && mock.archive_creates == 1);
@@ -837,7 +837,7 @@ test_concurrent_cold_archive(void)
 {
    struct mock_desc descs[4];
    for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
-      descs[i] = (struct mock_desc){ 6000 + i };
+      descs[i] = (struct mock_desc){6000 + i};
    persist_descs(descs, ARRAY_SIZE(descs));
 
    char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
@@ -874,7 +874,7 @@ test_ref_collision(void)
 {
    mock_reset(true);
    struct kk_metal_cache *cache = make_cache(0, 0);
-   struct mock_desc a = { 7000 }, b = { 7001 };
+   struct mock_desc a = {7000}, b = {7001};
    cache_key ka, kb;
    desc_key(&a, ka);
    for (;; b.id++) {
@@ -904,7 +904,7 @@ test_rejected_archive_waiters(void)
 {
    struct mock_desc descs[4];
    for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
-      descs[i] = (struct mock_desc){ 6100 + i };
+      descs[i] = (struct mock_desc){6100 + i};
    persist_descs(descs, ARRAY_SIZE(descs));
 
    char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
@@ -958,7 +958,7 @@ mock_blob_entry(void)
 static void
 test_damaged_blob(bool corrupt)
 {
-   struct mock_desc desc = { corrupt ? 6200 : 6201 };
+   struct mock_desc desc = {corrupt ? 6200 : 6201};
    persist_descs(&desc, 1);
    char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
    int fd = mkstemp(path);
@@ -980,8 +980,8 @@ test_damaged_blob(bool corrupt)
    CHECK(compile_desc(cache, &desc, &hit) && !hit);
    const char *reason = corrupt ? "blob_corrupt" : "blob_missing";
    CHECK(log_has_compile(path, &desc, reason, "captured"));
-   CHECK(log_contains(path, corrupt ? "\"outcome\":\"blob_corrupt\"" :
-                                      "\"outcome\":\"blob_missing\""));
+   CHECK(log_contains(path, corrupt ? "\"outcome\":\"blob_corrupt\""
+                                    : "\"outcome\":\"blob_missing\""));
    mtx_lock(&mock.lock);
    unsigned gets = mock.disk_gets;
    mtx_unlock(&mock.lock);
@@ -1007,7 +1007,7 @@ test_shutdown_drain_respects_limit(void)
    struct mock_desc descs[5];
    mtx_lock(&cache->mutex);
    for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
-      descs[i] = (struct mock_desc){ 8000 + i };
+      descs[i] = (struct mock_desc){8000 + i};
       defer_locked(cache, &descs[i]);
    }
    mtx_unlock(&cache->mutex);
@@ -1038,7 +1038,7 @@ test_final_flush_failure(void)
    struct mock_desc descs[3];
    bool hit;
    for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
-      descs[i] = (struct mock_desc){ 8100 + i };
+      descs[i] = (struct mock_desc){8100 + i};
       CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
    }
    mtx_lock(&mock.lock);
@@ -1067,7 +1067,7 @@ test_closing_compiles_uncached(void)
    mock_reset(true);
    struct kk_metal_cache *cache = make_cache(0, 0);
    kk_metal_cache_close(cache);
-   struct mock_desc desc = { 8200 };
+   struct mock_desc desc = {8200};
    bool hit = true;
    CHECK(compile_desc(cache, &desc, &hit) && !hit);
    mtx_lock(&mock.lock);
