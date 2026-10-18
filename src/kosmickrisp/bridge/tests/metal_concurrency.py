@@ -5,13 +5,14 @@ import os
 from pathlib import Path
 import subprocess
 
-COMPILATIONS = {'library', 'compute', 'render'}
-CAPTURED_PIPELINES = {'compute', 'render'}
+COMPILATIONS = {'library', 'compute', 'render', 'specialize'}
+CAPTURED_PIPELINES = {'compute', 'render', 'specialize'}
 ARCHIVES = {'archive_compute', 'archive_render'}
 PHASE_OPERATIONS = COMPILATIONS | ARCHIVES | {
     'serialize', 'compiler_read_lock', 'compiler_write_lock',
     'recipe_prepare', 'recipe_wait', 'fs_generate', 'fs_variant_wait',
-    'pso_wait', 'native_pipeline', 'archive_load', 'serialization_wait',
+    'pso_wait', 'native_pipeline', 'native_lookup', 'native_specialize',
+    'archive_load', 'recapture', 'serialization_wait',
     'serialization_drain', 'serialization_bypass', 'uncaptured_session',
 }
 

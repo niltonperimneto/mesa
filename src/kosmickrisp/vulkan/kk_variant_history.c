@@ -60,7 +60,7 @@ static void
 kk_history_disk_key(struct kk_variant_history *history,
                     struct kk_history_family *family, cache_key key)
 {
-   static const char label[] = "kosmickrisp-exact-variant-history-v2";
+   static const char label[] = "kosmickrisp-exact-variant-history-v3";
    uint8_t data[sizeof(label) + 32 + 4];
    memcpy(data, label, sizeof(label));
    memcpy(data + sizeof(label), family->key, 32);
@@ -150,8 +150,8 @@ kk_history_load_locked(struct kk_variant_history *history,
    uint8_t *data = disk_cache_get(history->disk, key, &size);
    unsigned count = 0;
    bool valid = data && size >= KK_HISTORY_HEADER &&
-                !memcmp(data, "KKVHIST2", 8) &&
-                kk_history_read(data + 8, 4) == 2 &&
+                !memcmp(data, "KKVHIST3", 8) &&
+                kk_history_read(data + 8, 4) == 3 &&
                 kk_history_read(data + 12, 4) == history->recipe_size &&
                 kk_history_read(data + 20, 4) == 0;
    if (valid) {
@@ -201,8 +201,8 @@ kk_history_flush_locked(struct kk_variant_history *history,
       cnd_broadcast(&history->cond);
       return;
    }
-   memcpy(data, "KKVHIST2", 8);
-   kk_history_write(data + 8, 2, 4);
+   memcpy(data, "KKVHIST3", 8);
+   kk_history_write(data + 8, 3, 4);
    kk_history_write(data + 12, history->recipe_size, 4);
    kk_history_write(data + 16, family->count, 4);
    for (unsigned i = 0; i < family->count; i++) {

@@ -26,7 +26,7 @@ class TraceTests(unittest.TestCase):
         self.assertFalse(report['serialization_violations'])
 
     def test_serializer_exclusion(self):
-        for operation in ['compute', 'render', 'serialize']:
+        for operation in ['compute', 'render', 'specialize', 'serialize']:
             with self.subTest(operation=operation):
                 report = self.report([event(operation, 0, 10, 1), event('serialize', 5, 15, 2)])
                 self.assertEqual(len(report['serialization_violations']), 1)
@@ -51,6 +51,20 @@ class TraceTests(unittest.TestCase):
                               event('serialize', 0, 10, 2, 'a', 2), end])
         self.assertFalse(report['serialization_violations'])
         self.assertEqual(report['uncaptured_serialization_overlap_ns'], 5)
+
+    def test_driver_phase_operations(self):
+        operations = ['native_lookup', 'native_pipeline', 'native_specialize',
+                      'recapture', 'specialize', 'archive_load']
+        records = []
+        for index, operation in enumerate(operations, 1):
+            records.append(dict(phase='begin', operation=operation, operation_id=index,
+                                pid=1, thread_id=2, time_ns=index * 10, object='a'))
+            records.append(dict(phase='end', operation_id=index, pid=1,
+                                time_ns=index * 10 + 5, success=True))
+        records.append(event('specialize', 0, 5, 2))
+        report = self.report(records)
+        self.assertEqual(report['phase_operations'], {o: 1 for o in operations})
+        self.assertEqual(report['operations'], {'specialize': 1})
 
     def test_phases_and_legacy_records(self):
         begin = dict(phase='begin', operation='render', operation_id=1,

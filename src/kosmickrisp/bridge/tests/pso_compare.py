@@ -156,10 +156,47 @@ def diagnostics(directory):
     result['compiler'] = {'counts': dict(counts), 'duration_ns': dict(durations),
                           'draw_counts': dict(draw_counts), 'truncated_last_record': truncated}
     lines, truncated = complete_lines(directory / 'cache.jsonl')
-    outcomes = Counter(record.get('outcome') for record in map(json.loads, lines)
+    records = [json.loads(line) for line in lines if line.strip()]
+    outcomes = Counter(record.get('outcome') for record in records
                        if record.get('event') == 'pso')
     result['cache'] = {'outcomes': dict(outcomes), 'truncated_last_record': truncated}
+    result['persistence'] = persistence([r for r in records if r.get('event') == 'persistence'])
+    stats = directory / 'variant-stats.jsonl'
+    result['variant'] = variant_stats(stats) if stats.exists() else None
     return result
+
+
+def persistence(records):
+    compiles = [r for r in records if r.get('outcome') == 'native_compile']
+    reason_ns = Counter()
+    for record in compiles:
+        if record.get('duration_ns', 0) < 0:
+            raise ValueError('negative native compile duration')
+        reason_ns[record['reason']] += record.get('duration_ns', 0)
+    return {'outcomes': dict(Counter(r.get('outcome') for r in records)),
+            'native_compile_reasons': dict(Counter(r['reason'] for r in compiles)),
+            'native_compile_routes': dict(Counter(r['route'] for r in compiles)),
+            'native_compile_duration_ns': dict(reason_ns),
+            'native_compile_failures': sum(not r.get('success', True) for r in compiles),
+            'dropped': dict(Counter(r['reason'] for r in records
+                                    if r.get('outcome') == 'persist_dropped')),
+            'summary': next(({k: v for k, v in r.items() if k not in ('event', 'outcome')}
+                             for r in reversed(records) if r.get('outcome') == 'cache_summary'),
+                            None)}
+
+
+def variant_stats(path):
+    lines, truncated = complete_lines(path)
+    phases, queue, cache = {}, None, None
+    for record in map(json.loads, (line for line in lines if line.strip())):
+        if record.get('event') == 'variant_summary':
+            phases[record['phase']] = {key: record[key] for key in
+                                       ('count', 'duration_ns', 'draw_count', 'draw_duration_ns')}
+        elif record.get('event') == 'queue_summary':
+            queue = {key: value for key, value in record.items() if key != 'event'}
+        elif record.get('event') == 'cache_summary':
+            cache = {key: value for key, value in record.items() if key != 'event'}
+    return {'phases': phases, 'queue': queue, 'cache': cache, 'truncated_last_record': truncated}
 
 
 def environment(workload, cache, directory, diagnostic):
@@ -175,7 +212,8 @@ def environment(workload, cache, directory, diagnostic):
     if diagnostic:
         env.update({'MESA_KK_METAL_CONCURRENCY_LOG': str(directory / 'metal.jsonl'),
                     'MESA_KK_COMPILE_LOG': str(directory / 'compiler.csv'),
-                    'MESA_KK_CACHE_LOG': str(directory / 'cache.jsonl')})
+                    'MESA_KK_CACHE_LOG': str(directory / 'cache.jsonl'),
+                    'MESA_KK_VARIANT_STATS': str(directory / 'variant-stats.jsonl')})
     return env
 
 

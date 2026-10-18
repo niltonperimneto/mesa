@@ -298,6 +298,27 @@ if with_tests
   endif
   if host_machine.system() == 'darwin'
     test(
+      'kk-linear-attachment',
+      executable(
+        'kk-linear-attachment-test',
+        'tests/linear_attachment.c',
+        include_directories : [inc_include, inc_src],
+        dependencies : [
+          idep_nir,
+          idep_mesautil,
+          idep_vulkan_util,
+          idep_vulkan_runtime_headers,
+          idep_vulkan_wsi_headers,
+          idep_libkk_shaders_h.partial_dependency(includes : true, sources : true),
+        ],
+        link_args : ['-Wl,-dead_strip'],
+      ),
+      args : [libvulkan_kosmickrisp.full_path()],
+      depends : [libvulkan_kosmickrisp],
+      suite : ['kosmickrisp'],
+      timeout : 30,
+    )
+    test(
       'kk-msl-helpers',
       executable(
         'kk-msl-helpers-test',

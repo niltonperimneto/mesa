@@ -195,6 +195,7 @@ struct kk_render_pending {
    cnd_t ready;
    bool compiling;
    bool queued;
+   bool started;
    bool native_primitive_id;
    struct kk_pso_key key;
    mtl_library *vertex_library;
@@ -302,6 +303,8 @@ bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
 
 /* Indicates that the sampler should be overridden to clamp to 0 instead of 1 */
 #define KK_TEXTURE_FLAG_CLAMP_TO_0 (1 << 0)
+/* Input attachment read already split into its array and 2D reads */
+#define KK_TEXTURE_FLAG_INPUT_SELECTED (1 << 1)
 
 bool kk_nir_lower_custom_border(nir_shader *nir);
 bool kk_nir_lower_image_view_min_lod(nir_shader *nir);

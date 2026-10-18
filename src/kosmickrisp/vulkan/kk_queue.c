@@ -325,11 +325,6 @@ kk_QueueWaitIdle(VkQueue _queue)
 
    VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
    struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
-   struct kk_device *dev = kk_queue_device(queue);
-   if (util_queue_is_initialized(&dev->pso_cache.prewarm_queue))
-      util_queue_finish(&dev->pso_cache.prewarm_queue);
-   if (util_queue_is_initialized(&dev->pso_cache.exact_queue))
-      util_queue_finish(&dev->pso_cache.exact_queue);
-   kk_metal_cache_flush(dev->metal_cache);
+   kk_metal_cache_request_flush(kk_queue_device(queue)->metal_cache);
    return VK_SUCCESS;
 }

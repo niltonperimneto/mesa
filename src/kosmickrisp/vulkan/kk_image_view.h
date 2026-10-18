@@ -47,6 +47,7 @@ struct kk_image_view {
       uint64_t sampled_gpu_resource_id;
       uint64_t storage_gpu_resource_id;
       uint64_t input_gpu_resource_id;
+      uint64_t input_2d_gpu_resource_id;
    } planes[3];
 };
 

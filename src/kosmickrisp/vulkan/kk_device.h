@@ -103,6 +103,11 @@ enum kk_variant_phase {
    KK_VARIANT_BLOB_MISSING,
    KK_VARIANT_ARCHIVE_REJECTED,
    KK_VARIANT_PIPELINE_ABSENT,
+   KK_VARIANT_QUEUE_WAIT,
+   KK_VARIANT_NATIVE_COMPILE,
+   KK_VARIANT_NATIVE_SPECIALIZE,
+   KK_VARIANT_REF_UNCACHEABLE,
+   KK_VARIANT_BLOB_CORRUPT,
    KK_VARIANT_COUNT,
 };
 
@@ -127,6 +132,7 @@ struct kk_device {
    FILE *variant_stats;
    bool variant_trace_enabled;
    struct kk_variant_counter variant_counters[KK_VARIANT_COUNT];
+   uint64_t fs_variants_created;
    struct kk_metal_cache *metal_cache;
    struct disk_cache *metal_disk;
 

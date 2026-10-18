@@ -3892,6 +3892,7 @@ kk_shader_get_fs_variant(struct kk_device *dev, struct kk_shader *fs,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    mtx_unlock(&fs->variants_lock);
+   p_atomic_inc(&dev->fs_variants_created);
 
    struct kk_fs_variant variant = {0};
    int64_t start = os_time_get_nano();

@@ -178,8 +178,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view_layout.array_len = subres_layout.layers;
       }
 
-      if (view->vk.usage &
-          (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
+      if (view->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
          view->planes[view_plane].mtl_handle_sampled =
             mtl_new_texture_view_with(mtl_handle, &view_layout);
          view->planes[view_plane].sampled_gpu_resource_id =
@@ -200,38 +199,64 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
                view->planes[view_plane].mtl_handle_storage);
       }
 
-      if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      if (view->vk.usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
          bool requires_type_change =
             view_layout.view_type != VK_IMAGE_VIEW_TYPE_3D &&
             view_layout.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY;
          bool requires_format_change = view->vk.format != image->vk.format;
-         VkImageViewType original_type = view_layout.view_type;
 
          /* Required so sampling from input attachments actually return (d, 0,
           * 0, 1) for d/s attachments and render targets cannot have swizzle
           * according to Metal...
           */
-         if (requires_type_change || requires_format_change) {
-            view_layout.view_type = requires_type_change
-                                       ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-                                       : original_type;
+         if ((view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
+             plane->layout.linear) {
+            /* Metal can't view linear textures as arrays. Input attachment
+             * reads of them take the 2D ID (see kk_nir_lower_descriptors.c).
+             * Always a view: the image's texture has no swizzle.
+             */
+            VkImageViewType original_type = view_layout.view_type;
+            view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D;
             view->planes[view_plane].mtl_handle_input =
                mtl_new_texture_view_with(mtl_handle, &view_layout);
-         } else
-            view->planes[view_plane].mtl_handle_input = mtl_retain(mtl_handle);
-         view->planes[view_plane].input_gpu_resource_id =
-            mtl_texture_get_gpu_resource_id(
-               view->planes[view_plane].mtl_handle_input);
+            view->planes[view_plane].input_2d_gpu_resource_id =
+               mtl_texture_get_gpu_resource_id(
+                  view->planes[view_plane].mtl_handle_input);
+            view_layout.view_type = original_type;
+         } else if (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
+            VkImageViewType original_type = view_layout.view_type;
+            if (requires_type_change || requires_format_change) {
+               view_layout.view_type = requires_type_change
+                                          ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                          : original_type;
+               view->planes[view_plane].mtl_handle_input =
+                  mtl_new_texture_view_with(mtl_handle, &view_layout);
+            } else
+               view->planes[view_plane].mtl_handle_input =
+                  mtl_retain(mtl_handle);
+            view->planes[view_plane].input_gpu_resource_id =
+               mtl_texture_get_gpu_resource_id(
+                  view->planes[view_plane].mtl_handle_input);
+            view_layout.view_type = original_type;
+         }
 
          /* Handle mutable formats */
-         view->planes[view_plane].render_is_view = requires_format_change;
-         if (requires_format_change) {
-            view_layout.view_type = original_type;
-            view->planes[view_plane].mtl_handle_render =
-               mtl_new_texture_view_with_no_swizzle(mtl_handle, &view_layout);
-         } else /* Subresource indices will be set in attachment descriptor */
-            view->planes[view_plane].mtl_handle_render = mtl_retain(mtl_handle);
+         if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            view->planes[view_plane].render_is_view = requires_format_change;
+            if (requires_format_change) {
+               /* Metal can't view linear textures as arrays */
+               if (plane->layout.linear)
+                  view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D;
+               view->planes[view_plane].mtl_handle_render =
+                  mtl_new_texture_view_with_no_swizzle(mtl_handle,
+                                                       &view_layout);
+            } else /* Subresource indices will be set in attachment descriptor */
+               view->planes[view_plane].mtl_handle_render =
+                  mtl_retain(mtl_handle);
+         }
       }
    }
 

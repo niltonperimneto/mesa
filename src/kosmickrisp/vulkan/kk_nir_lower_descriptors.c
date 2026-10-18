@@ -572,6 +572,10 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
    {
       unsigned offs =
          offsetof(struct kk_sampled_image_descriptor, image_gpu_resource_id);
+      if ((tex->backend_flags & KK_TEXTURE_FLAG_INPUT_SELECTED) &&
+          !tex->is_array)
+         offs = offsetof(struct kk_sampled_image_descriptor,
+                         input_2d_gpu_resource_id);
 
       nir_def *resource_addr = load_resource_addr(
          b, 1, 64, nir_src_as_deref(nir_src_for_ssa(texture)),
@@ -625,6 +629,53 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       nir_tex_instr_add_src(tex, nir_tex_src_max_lod_kk, lod_max);
    }
 
+   return true;
+}
+
+/* Input attachments read as textures are 2D arrays, but Metal can't view
+ * linear textures as arrays. Their descriptors have no array ID and a 2D one
+ * instead, so read whichever the descriptor has.
+ */
+static bool
+lower_input_attachment_select(nir_builder *b, nir_tex_instr *tex, void *_data)
+{
+   const struct lower_descriptors_ctx *ctx = _data;
+
+   if (tex->op != nir_texop_txf || !tex->is_array || tex->is_shadow ||
+       (tex->backend_flags & KK_TEXTURE_FLAG_INPUT_SELECTED))
+      return false;
+
+   nir_deref_instr *deref = nir_get_tex_deref(tex, nir_tex_src_texture_deref);
+   if (!deref || glsl_get_sampler_dim(deref->type) != GLSL_SAMPLER_DIM_SUBPASS)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *array_id = load_resource_deref_desc(
+      b, 1, 64, deref,
+      offsetof(struct kk_sampled_image_descriptor, image_gpu_resource_id), ctx);
+
+   nir_tex_instr *tex_array =
+      nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+   tex_array->backend_flags |= KK_TEXTURE_FLAG_INPUT_SELECTED;
+
+   nir_tex_instr *tex_2d =
+      nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+   tex_2d->backend_flags |= KK_TEXTURE_FLAG_INPUT_SELECTED;
+   tex_2d->is_array = false;
+   tex_2d->coord_components = 2;
+   int coord = nir_tex_instr_src_index(tex_2d, nir_tex_src_coord);
+   /* Not inserted yet, so its sources aren't on any use list. */
+   tex_2d->src[coord].src =
+      nir_src_for_ssa(nir_trim_vector(b, tex->src[coord].src.ssa, 2));
+
+   nir_push_if(b, nir_ine_imm(b, array_id, 0));
+   nir_builder_instr_insert(b, &tex_array->instr);
+   nir_push_else(b, NULL);
+   nir_builder_instr_insert(b, &tex_2d->instr);
+   nir_pop_if(b, NULL);
+
+   nir_def_replace(&tex->def, nir_if_phi(b, &tex_array->def, &tex_2d->def));
    return true;
 }
 
@@ -824,13 +875,16 @@ kk_nir_lower_descriptors(nir_shader *nir,
     * TODO: See if we can unify this, not sure if the fast path matters on
     * Apple. This is inherited from NVK.
     */
+   bool pass_input_select = nir_shader_tex_pass(
+      nir, lower_input_attachment_select, nir_metadata_none, &ctx);
+
    bool pass_lower_descriptors = nir_shader_instructions_pass(
       nir, try_lower_descriptors_instr, nir_metadata_control_flow, &ctx);
 
    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);
 
-   return pass_lower_descriptors || pass_lower_ssbo;
+   return pass_input_select || pass_lower_descriptors || pass_lower_ssbo;
 }
 
 static bool
