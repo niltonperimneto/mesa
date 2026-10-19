@@ -11,6 +11,7 @@
 #include "kk_device_memory.h"
 #include "kk_private.h"
 #include "kk_pso_cache.h"
+#include "kk_shader_nir.h"
 
 #include "kosmickrisp/bridge/mtl_format.h"
 
@@ -218,6 +219,8 @@ struct kk_shader {
    struct kk_fs_variant fast;
    struct kk_fs_variant fast_points;
    struct msl_compile_data msl_points;
+   struct kk_shader_nir rast_point_nir;
+   struct kk_shader_nir point_nir;
 
    mtl_compute_pipeline_state *so_cs;
    struct msl_compile_data msl_emu;

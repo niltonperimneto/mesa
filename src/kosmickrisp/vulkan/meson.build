@@ -117,6 +117,8 @@ kk_files = files(
   'kk_variant_history.h',
   'kk_pso_cache.h',
   'kk_shader.c',
+  'kk_shader_nir.c',
+  'kk_shader_nir.h',
   'kk_sync.h',
   'kk_sync.c',
   'kk_wsi.h',
@@ -213,6 +215,21 @@ kosmickrisp_icd = custom_target(
 devenv.append('VK_DRIVER_FILES', kosmickrisp_icd.full_path())
 
 if with_tests
+  test(
+    'kk-shader-nir',
+    executable(
+      'kk-shader-nir-test',
+      ['tests/shader_nir.c', 'kk_shader_nir.c'],
+      include_directories : [inc_include, inc_src],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_vulkan_util,
+        idep_vulkan_runtime_headers,
+      ],
+      link_args : host_machine.system() == 'darwin' ? ['-Wl,-dead_strip'] : ld_args_gc_sections,
+    ),
+    suite : ['kosmickrisp'],
+    timeout : 30,
+  )
   test(
     'kk-vbo',
     executable(

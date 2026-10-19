@@ -1151,6 +1151,8 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
    }
    mtx_destroy(&shader->variants_lock);
    free(shader->nir_blob);
+   free(shader->point_nir.data);
+   free(shader->rast_point_nir.data);
    ralloc_free((void *)shader->gs_count.entrypoint_name);
    ralloc_free((void *)shader->gs_count.code);
    ralloc_free((void *)shader->pre_gs.entrypoint_name);
@@ -1536,7 +1538,6 @@ kk_compile_point_emu(struct kk_physical_device *pdev, struct kk_shader *shader,
       NIR_PASS(_, nir, poly_nir_lower_sw_vs);
 
    kk_compile_msl(pdev, nir, NULL, true, &shader->point_emu, NULL);
-   shader->point.has_emu = true;
    return gs;
 }
 
@@ -1582,8 +1583,32 @@ kk_compile_point_variant(struct kk_device *dev, struct kk_shader *shader,
    memset(&gs->info.cs, 0, sizeof(gs->info.cs));
    gs->xfb_info = NULL;
    kk_compile_msl(pdev, gs, state, true, &shader->point_gs_main, NULL);
+}
 
-   shader->info.point_variant = true;
+static bool
+kk_prepare_point_variant_locked(struct kk_device *dev, struct kk_shader *shader)
+{
+   if (shader->point_failed)
+      return false;
+   if (shader->point_rast.code)
+      return true;
+   struct vk_graphics_pipeline_state state = {0};
+   struct vk_vertex_input_state vi = {0};
+   struct vk_pipeline_robustness_state robustness = {0};
+   nir_shader *nir = kk_shader_nir_load(&shader->point_nir, &kk_nir_options,
+                                        &state, &vi, &robustness);
+   if (!nir || nir->info.stage != shader->info.stage) {
+      ralloc_free(nir);
+      shader->point_failed = true;
+      return false;
+   }
+   int64_t start = os_time_get_nano();
+   kk_compile_point_variant(dev, shader, nir, &robustness, &state);
+   kk_log_compile(dev, "point_variant_source", start);
+   shader->point_failed = !shader->point_rast.code ||
+                          !shader->point_gs_main.code ||
+                          (shader->point.has_emu && !shader->point_emu.code);
+   return !shader->point_failed;
 }
 
 static VkResult
@@ -1647,9 +1672,17 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
    shader->info.partial = partition;
    gather_shader_info(shader, nir, state);
 
-   nir_shader *point_nir = NULL;
-   if (kk_wants_point_variant(nir, state, partition))
-      point_nir = nir_shader_clone(NULL, nir);
+   if (kk_wants_point_variant(nir, state, partition)) {
+      if (!kk_shader_nir_store(
+             &shader->point_nir, nir, kk_vi_is_static(state) ? state->vi : NULL,
+             robustness, kk_is_possible_both_depth_clip_clamp(state, false))) {
+         ralloc_free(nir);
+         kk_shader_destroy(&dev->vk, shader, pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      shader->info.point_variant = true;
+      shader->point.has_emu = stage != MESA_SHADER_GEOMETRY;
+   }
    shader->info.rast_num_cull_distances = shader->info.num_cull_distances;
 
    if (partition && stage == MESA_SHADER_FRAGMENT) {
@@ -1785,11 +1818,14 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
    if (rast && stage == MESA_SHADER_VERTEX &&
        kk_topology_is_unknown(state, partition)) {
       shader->info.rast_point_variant = true;
-      nir_shader *points = nir_shader_clone(NULL, nir);
+      if (!kk_shader_nir_store(&shader->rast_point_nir, nir, NULL, NULL,
+                               false)) {
+         ralloc_free(nir);
+         kk_shader_destroy(&dev->vk, shader, pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
       nir_shader_intrinsics_pass(nir, msl_nir_vs_remove_point_size_write,
                                  nir_metadata_control_flow, NULL);
-      kk_compile_msl(pdev, points, state, partition, &shader->msl_points,
-                     NULL);
    }
 
    kk_compile_msl(pdev, nir,
@@ -1798,9 +1834,6 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   stage == MESA_SHADER_GEOMETRY ? &shader->gs_main
                                                 : &shader->msl_data[stage],
                   rast ? &shader->info.rast_outputs_written : NULL);
-
-   if (point_nir)
-      kk_compile_point_variant(dev, shader, point_nir, robustness, state);
 
    result = kk_upload_gs_indices(dev, shader);
    if (result != VK_SUCCESS) {
@@ -2422,7 +2455,7 @@ kk_shader_variant_identity(struct kk_shader *shader, blake3_hash output)
       if (!p_atomic_read(&shader->variant_identity_ready)) {
          struct mesa_blake3 hash;
          _mesa_blake3_init(&hash);
-         kk_identity_scalar(&hash, 1);
+         kk_identity_scalar(&hash, 2);
          _mesa_blake3_update(&hash, shader->fast.hash, sizeof(blake3_hash));
          kk_identity_scalar(&hash, shader->nir_blob_size);
          if (shader->nir_blob_size)
@@ -2430,11 +2463,15 @@ kk_shader_variant_identity(struct kk_shader *shader, blake3_hash output)
          for (unsigned i = 0; i < MESA_SHADER_STAGES; i++)
             kk_identity_msl(&hash, &shader->msl_data[i]);
          kk_identity_msl(&hash, &shader->gs_main);
-         kk_identity_msl(&hash, &shader->msl_points);
+         kk_identity_scalar(&hash, shader->rast_point_nir.size);
+         if (shader->rast_point_nir.size)
+            _mesa_blake3_update(&hash, shader->rast_point_nir.data,
+                                shader->rast_point_nir.size);
          kk_identity_msl(&hash, &shader->msl_emu);
-         kk_identity_msl(&hash, &shader->point_emu);
-         kk_identity_msl(&hash, &shader->point_gs_main);
-         kk_identity_msl(&hash, &shader->point_rast);
+         kk_identity_scalar(&hash, shader->point_nir.size);
+         if (shader->point_nir.size)
+            _mesa_blake3_update(&hash, shader->point_nir.data,
+                                shader->point_nir.size);
          const struct kk_shader_info *info = &shader->info;
          kk_identity_scalar(&hash, info->stage);
          kk_identity_scalar(&hash, info->uses_per_draw_data);
@@ -2569,6 +2606,22 @@ kk_shader_get_rast(struct kk_device *dev, struct kk_shader *vs, bool points)
       mtx_lock(&vs->variants_lock);
    }
    if (vs->fast_points.fn == NULL) {
+      if (!vs->msl_points.code) {
+         struct vk_graphics_pipeline_state state = {0};
+         struct vk_vertex_input_state vi = {0};
+         struct vk_pipeline_robustness_state robustness = {0};
+         nir_shader *nir = kk_shader_nir_load(
+            &vs->rast_point_nir, &kk_nir_options, &state, &vi, &robustness);
+         if (!nir || nir->info.stage != MESA_SHADER_VERTEX) {
+            ralloc_free(nir);
+            mtx_unlock(&vs->variants_lock);
+            return NULL;
+         }
+         int64_t start = os_time_get_nano();
+         kk_compile_msl(kk_device_physical(dev), nir, NULL, true,
+                        &vs->msl_points, NULL);
+         kk_log_compile(dev, "rast_points_source", start);
+      }
       int64_t start = os_time_get_nano();
       mtl_library *lib = NULL;
       mtl_function_descriptor *fn = NULL;
@@ -2904,7 +2957,8 @@ kk_shader_get_point_gs(struct kk_device *dev, struct kk_shader *shader)
       return NULL;
 
    mtx_lock(&shader->variants_lock);
-   if (shader->point_gs == NULL && !shader->point_failed) {
+   if (shader->point_gs == NULL &&
+       kk_prepare_point_variant_locked(dev, shader)) {
       shader->point_gs = kk_create_point_gs(dev, shader);
       shader->point_failed = shader->point_gs == NULL;
    }
@@ -2921,7 +2975,8 @@ kk_shader_get_point_cs(struct kk_device *dev, struct kk_shader *shader)
       return NULL;
 
    mtx_lock(&shader->variants_lock);
-   if (shader->point_cs == NULL && !shader->point_failed) {
+   if (shader->point_cs == NULL &&
+       kk_prepare_point_variant_locked(dev, shader)) {
       int64_t start = os_time_get_nano();
       VkResult result = kk_compile_compute_pipeline(
          dev, &shader->point_emu, KK_POLY_WG_SIZE, &shader->point_cs);
@@ -3443,17 +3498,13 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
       kk_msl_serialize(&shader->pre_gs, blob);
 
    if (shader->info.rast_point_variant)
-      kk_msl_serialize(&shader->msl_points, blob);
+      kk_shader_nir_write(blob, &shader->rast_point_nir);
 
    if (shader->info.so_hw && shader->info.so_emu)
       kk_msl_serialize(&shader->msl_emu, blob);
 
    if (shader->info.point_variant) {
-      blob_write_bytes(blob, &shader->point, sizeof(shader->point));
-      if (shader->point.has_emu)
-         kk_msl_serialize(&shader->point_emu, blob);
-      kk_msl_serialize(&shader->point_gs_main, blob);
-      kk_msl_serialize(&shader->point_rast, blob);
+      kk_shader_nir_write(blob, &shader->point_nir);
    }
 
    if (shader->info.partial && shader->info.stage == MESA_SHADER_FRAGMENT) {
@@ -3566,7 +3617,7 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    }
 
    if (info.rast_point_variant) {
-      result = kk_msl_deserialize(blob, &shader->msl_points);
+      result = kk_shader_nir_read(blob, &shader->rast_point_nir);
       if (result != VK_SUCCESS)
          goto fail;
    }
@@ -3578,24 +3629,14 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    }
 
    if (info.point_variant) {
-      blob_copy_bytes(blob, &shader->point, sizeof(shader->point));
-      if (blob->overrun || !info.partial ||
-          (info.stage != MESA_SHADER_VERTEX &&
-           info.stage != MESA_SHADER_TESS_EVAL &&
-           info.stage != MESA_SHADER_GEOMETRY) ||
-          shader->point.has_emu != (info.stage != MESA_SHADER_GEOMETRY)) {
+      if (!info.partial || (info.stage != MESA_SHADER_VERTEX &&
+                            info.stage != MESA_SHADER_TESS_EVAL &&
+                            info.stage != MESA_SHADER_GEOMETRY)) {
          result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
          goto fail;
       }
-      if (shader->point.has_emu) {
-         result = kk_msl_deserialize(blob, &shader->point_emu);
-         if (result != VK_SUCCESS)
-            goto fail;
-      }
-      result = kk_msl_deserialize(blob, &shader->point_gs_main);
-      if (result != VK_SUCCESS)
-         goto fail;
-      result = kk_msl_deserialize(blob, &shader->point_rast);
+      shader->point.has_emu = info.stage != MESA_SHADER_GEOMETRY;
+      result = kk_shader_nir_read(blob, &shader->point_nir);
       if (result != VK_SUCCESS)
          goto fail;
    }
