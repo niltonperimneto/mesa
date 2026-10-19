@@ -88,6 +88,7 @@ kk_metal_trace_event(const char *phase, const uint8_t key[CACHE_KEY_SIZE],
 #define KK_METAL_RECAPTURE_BATCH 8
 #define KK_METAL_RECAPTURE_ATTEMPTS 2
 #define KK_METAL_FINAL_FLUSH_ATTEMPTS 3
+#define KK_METAL_SHUTDOWN_MS_DEFAULT 3000
 #define KK_METAL_REF_CAPACITY 4096
 
 struct kk_metal_ref {
@@ -115,6 +116,16 @@ struct kk_metal_capture_group {
    struct kk_metal_capture_group *next;
 };
 
+struct kk_metal_buffer {
+   mtl_compiler *compiler;
+   struct kk_metal_cache_key *pending;
+   unsigned pending_count;
+   unsigned captured_compiles;
+   struct kk_metal_capture_group *capture_groups;
+   bool capture_conflict;
+   int64_t oldest_pending_ns;
+};
+
 struct kk_metal_recapture {
    cache_key key;
    void *descriptor;
@@ -138,13 +149,13 @@ struct kk_metal_loaded_archive {
 struct kk_metal_cache {
    struct disk_cache *disk;
    mtl_device *device;
-   mtl_compiler *compiler;
    mtl_compiler *uncaptured;
+   mtl_compiler *owned_compiler;
+   struct kk_metal_buffer buffers[2];
+   unsigned buffer_count;
+   unsigned active;
    mtx_t mutex;
-   struct kk_metal_capture_group *capture_groups;
-   bool capture_conflict;
    bool bypass_disabled;
-   unsigned captured_compiles;
    unsigned uncaptured_compiles;
    unsigned bypassed_compiles;
    unsigned recaptured_compiles;
@@ -163,10 +174,9 @@ struct kk_metal_cache {
    unsigned retry_seconds;
    bool serializing;
    int64_t last_compile_ns;
-   int64_t oldest_pending_ns;
    int64_t quiet_ns;
    int64_t max_age_ns;
-   unsigned pending_count;
+   int64_t shutdown_ns;
    unsigned max_pending;
    uint64_t blob_budget;
    struct list_head link;
@@ -176,7 +186,6 @@ struct kk_metal_cache {
    uint64_t flush_completed;
    bool stopping;
    char identity[256];
-   struct kk_metal_cache_key *pending;
    struct kk_metal_loaded_archive *archives[KK_METAL_ARCHIVE_CAPACITY];
    struct kk_metal_loaded_archive *archive_head;
    struct kk_metal_loaded_archive *archive_tail;
@@ -487,70 +496,109 @@ kk_metal_mark_uncacheable(struct kk_metal_cache *cache,
    kk_metal_log_miss("archive_uncacheable", key, 0);
 }
 
-static void
-kk_metal_capture_groups_clear(struct kk_metal_cache *cache)
+static struct kk_metal_buffer *
+kk_metal_active(struct kk_metal_cache *cache)
 {
-   while (cache->capture_groups) {
-      struct kk_metal_capture_group *next = cache->capture_groups->next;
-      free(cache->capture_groups);
-      cache->capture_groups = next;
-   }
-   cache->capture_conflict = false;
+   return &cache->buffers[cache->active];
 }
 
 static bool
-kk_metal_capture_admit_locked(struct kk_metal_cache *cache,
+kk_metal_buffer_dirty(const struct kk_metal_buffer *buffer)
+{
+   return buffer->pending || buffer->capture_groups;
+}
+
+static bool
+kk_metal_dirty_locked(struct kk_metal_cache *cache)
+{
+   for (unsigned i = 0; i < cache->buffer_count; ++i)
+      if (kk_metal_buffer_dirty(&cache->buffers[i]))
+         return true;
+   return false;
+}
+
+static unsigned
+kk_metal_captured_locked(struct kk_metal_cache *cache)
+{
+   unsigned captured = 0;
+   for (unsigned i = 0; i < cache->buffer_count; ++i)
+      captured += cache->buffers[i].captured_compiles;
+   return captured;
+}
+
+static void
+kk_metal_capture_groups_clear(struct kk_metal_buffer *buffer)
+{
+   while (buffer->capture_groups) {
+      struct kk_metal_capture_group *next = buffer->capture_groups->next;
+      free(buffer->capture_groups);
+      buffer->capture_groups = next;
+   }
+   buffer->capture_conflict = false;
+}
+
+static bool
+kk_metal_capture_admit_locked(struct kk_metal_buffer *buffer,
                               const struct kk_metal_capture_key *key)
 {
    if (!key)
       return true;
-   for (struct kk_metal_capture_group *group = cache->capture_groups; group;
+   for (struct kk_metal_capture_group *group = buffer->capture_groups; group;
         group = group->next) {
       if (!memcmp(group->key.vertex, key->vertex, CACHE_KEY_SIZE)) {
          bool compatible =
             !memcmp(group->key.fragment, key->fragment, CACHE_KEY_SIZE);
-         cache->capture_conflict |= !compatible;
+         buffer->capture_conflict |= !compatible;
          return compatible;
       }
    }
    struct kk_metal_capture_group *group = malloc(sizeof(*group));
    if (!group)
       return false;
+   if (!kk_metal_buffer_dirty(buffer))
+      buffer->oldest_pending_ns = os_time_get_nano();
    group->key = *key;
-   group->next = cache->capture_groups;
-   cache->capture_groups = group;
+   group->next = buffer->capture_groups;
+   buffer->capture_groups = group;
    return true;
 }
 
 static bool
-kk_metal_flush_locked(struct kk_metal_cache *cache)
+kk_metal_flush_buffer_locked(struct kk_metal_cache *cache, unsigned target)
 {
-   if (!cache->pending && !cache->capture_groups)
+   unsigned other = (target + 1) % cache->buffer_count;
+   struct kk_metal_buffer *buffer = &cache->buffers[target];
+   if (!kk_metal_buffer_dirty(buffer) && !buffer->captured_compiles)
       return true;
-   cache->serializing = true;
+   if (target == cache->active && other != target)
+      cache->active = other;
+   bool blocking = target == cache->active;
+   if (blocking)
+      cache->serializing = true;
    cache->bypassed_compiles = 0;
    struct mtl_compile_phase phase =
       kk_metal_phase_begin(cache, "serialization_drain", NULL);
-   while (cache->captured_compiles)
+   while (buffer->captured_compiles)
       cnd_wait(&cache->cond, &cache->mutex);
    mtl_compile_phase_end(phase, true);
-   struct kk_metal_cache_key *pending = cache->pending;
-   unsigned count = cache->pending_count;
+   struct kk_metal_cache_key *pending = buffer->pending;
+   unsigned count = buffer->pending_count;
    unsigned limit = cache->max_pending;
    unsigned recaptured = cache->recaptured_compiles;
    struct kk_metal_drops dropped = kk_metal_take_drops_locked(cache);
-   cache->pending = NULL;
-   cache->pending_count = 0;
+   buffer->pending = NULL;
+   buffer->pending_count = 0;
    cache->recaptured_compiles = 0;
-   int64_t oldest = cache->oldest_pending_ns;
+   int64_t oldest = buffer->oldest_pending_ns;
    mtx_unlock(&cache->mutex);
 
    size_t size = 0;
-   void *data = mtl_compiler_serialize(cache->compiler, &size);
+   void *data = mtl_compiler_serialize(buffer->compiler, &size);
    mtx_lock(&cache->mutex);
    if (data && size)
-      kk_metal_capture_groups_clear(cache);
-   cache->serializing = false;
+      kk_metal_capture_groups_clear(buffer);
+   if (blocking)
+      cache->serializing = false;
    unsigned bypassed = cache->bypassed_compiles;
    cnd_broadcast(&cache->cond);
    mtx_unlock(&cache->mutex);
@@ -561,17 +609,26 @@ kk_metal_flush_locked(struct kk_metal_cache *cache)
       struct kk_metal_cache_key **tail = &pending;
       while (*tail)
          tail = &(*tail)->next;
-      *tail = cache->pending;
-      cache->pending = pending;
-      cache->pending_count += count;
+      *tail = buffer->pending;
+      buffer->pending = pending;
+      buffer->pending_count += count;
       cache->recaptured_compiles += recaptured;
       kk_metal_restore_drops_locked(cache, dropped);
-      cache->oldest_pending_ns = oldest;
+      buffer->oldest_pending_ns = oldest;
       cache->retry_seconds = cache->retry_seconds ?
          MIN2(cache->retry_seconds * 2, 60) : 1;
       cache->retry_after_ns = os_time_get_nano() +
                              cache->retry_seconds * 1000000000ll;
       return false;
+   }
+   if (!count) {
+      free(data);
+      kk_metal_log_flush("archive_discarded", size, 0, limit, bypassed,
+                         recaptured, dropped);
+      mtx_lock(&cache->mutex);
+      cache->retry_seconds = 0;
+      cache->retry_after_ns = 0;
+      return true;
    }
    bool oversized = cache->blob_budget && size > cache->blob_budget;
    bool uncacheable = oversized && count == 1;
@@ -612,56 +669,99 @@ kk_metal_flush_locked(struct kk_metal_cache *cache)
 }
 
 static bool
+kk_metal_flush_locked(struct kk_metal_cache *cache)
+{
+   unsigned target = cache->active;
+   unsigned other = (cache->active + 1) % cache->buffer_count;
+   if (other != target && kk_metal_buffer_dirty(&cache->buffers[other]))
+      target = other;
+   return kk_metal_flush_buffer_locked(cache, target);
+}
+
+static bool
 kk_metal_flush_due_locked(struct kk_metal_cache *cache, int64_t now)
 {
    if (cache->flush_requested != cache->flush_completed)
       return true;
-   if ((!cache->pending && !cache->capture_groups) ||
-       now < cache->retry_after_ns)
+   bool dirty = false, conflict = false;
+   int64_t oldest = INT64_MAX;
+   for (unsigned i = 0; i < cache->buffer_count; ++i) {
+      const struct kk_metal_buffer *buffer = &cache->buffers[i];
+      if (kk_metal_buffer_dirty(buffer)) {
+         dirty = true;
+         oldest = MIN2(oldest, buffer->oldest_pending_ns);
+      }
+      conflict |= buffer->capture_conflict;
+   }
+   if (!dirty || now < cache->retry_after_ns)
       return false;
-   if (cache->capture_conflict)
+   if (conflict)
       return true;
    if (!cache->uncaptured || cache->bypass_disabled)
       return false;
-   if (cache->pending_count >= cache->max_pending)
+   if (kk_metal_active(cache)->pending_count >= cache->max_pending)
       return true;
-   if (!cache->captured_compiles && !cache->uncaptured_compiles &&
+   if (!kk_metal_captured_locked(cache) && !cache->uncaptured_compiles &&
        now - cache->last_compile_ns >= cache->quiet_ns)
       return true;
-   return now - cache->oldest_pending_ns >= cache->max_age_ns;
+   return now - oldest >= cache->max_age_ns;
 }
 
 static bool
 kk_metal_batch_full_locked(struct kk_metal_cache *cache)
 {
-   return cache->pending_count + cache->captured_compiles >= cache->max_pending;
+   const struct kk_metal_buffer *buffer = kk_metal_active(cache);
+   return buffer->pending_count + buffer->captured_compiles >=
+          cache->max_pending;
 }
 
-static void kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain);
+static void kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain,
+                                      int64_t deadline);
 
 static void
 kk_metal_shutdown_drain_locked(struct kk_metal_cache *cache)
 {
+   int64_t deadline = os_time_get_nano() + cache->shutdown_ns;
    unsigned failures = 0;
-   while (cache->pending || cache->capture_groups || cache->recapture) {
-      kk_metal_recapture_locked(cache, true);
+   bool expired = false;
+   while (kk_metal_dirty_locked(cache) || cache->recapture) {
+      kk_metal_recapture_locked(cache, true, deadline);
       if (kk_metal_flush_locked(cache))
          failures = 0;
       else if (++failures >= KK_METAL_FINAL_FLUSH_ATTEMPTS)
          break;
+      if (os_time_get_nano() >= deadline) {
+         expired = true;
+         break;
+      }
    }
-   if (!cache->pending && !cache->recapture)
+   bool pending = false;
+   for (unsigned i = 0; i < cache->buffer_count; ++i)
+      pending |= cache->buffers[i].pending != NULL;
+   if (!pending && !cache->recapture)
       return;
-   unsigned lost = 0;
-   for (struct kk_metal_cache_key *entry = cache->pending; entry;
-        entry = entry->next, ++lost)
-      kk_metal_log_drop("final_flush_failed", entry->key);
+   unsigned lost = 0, skipped = 0;
+   for (unsigned i = 0; i < cache->buffer_count; ++i)
+      for (struct kk_metal_cache_key *entry = cache->buffers[i].pending; entry;
+           entry = entry->next, ++lost)
+         kk_metal_log_drop("final_flush_failed", entry->key);
    for (struct kk_metal_recapture *entry = cache->recapture; entry;
-        entry = entry->next, ++lost)
-      kk_metal_log_drop("final_flush_failed", entry->key);
-   char fields[32];
-   snprintf(fields, sizeof(fields), ",\"keys\":%u", lost);
-   kk_metal_log_event("final_flush_failed", fields);
+        entry = entry->next) {
+      kk_metal_log_drop(expired ? "shutdown_budget" : "final_flush_failed",
+                        entry->key);
+      lost += !expired;
+      skipped += expired;
+   }
+   char fields[64];
+   if (lost) {
+      snprintf(fields, sizeof(fields), ",\"keys\":%u", lost);
+      kk_metal_log_event("final_flush_failed", fields);
+   }
+   if (skipped) {
+      snprintf(fields, sizeof(fields), ",\"keys\":%u,\"budget_ms\":%lld",
+               skipped, (long long)(cache->shutdown_ns / 1000000));
+      kk_metal_log_event("shutdown_budget_expired", fields);
+   }
 }
 
 static int
@@ -671,7 +771,7 @@ kk_metal_worker(void *arg)
    mtx_lock(&cache->mutex);
    while (!cache->stopping) {
       bool due = kk_metal_flush_due_locked(cache, os_time_get_nano());
-      if (!due && (!cache->recapture || cache->capture_conflict ||
+      if (!due && (!cache->recapture || kk_metal_active(cache)->capture_conflict ||
                    kk_metal_batch_full_locked(cache))) {
          struct timespec deadline;
          clock_gettime(CLOCK_REALTIME, &deadline);
@@ -687,11 +787,18 @@ kk_metal_worker(void *arg)
       }
       if (due) {
          uint64_t requested = cache->flush_requested;
-         kk_metal_flush_locked(cache);
+         if (requested != cache->flush_completed) {
+            unsigned first = (cache->active + 1) % cache->buffer_count;
+            for (unsigned i = 0; i < cache->buffer_count; ++i)
+               kk_metal_flush_buffer_locked(cache,
+                                             (first + i) % cache->buffer_count);
+         } else {
+            kk_metal_flush_locked(cache);
+         }
          cache->flush_completed = requested;
          cnd_broadcast(&cache->cond);
       }
-      kk_metal_recapture_locked(cache, false);
+      kk_metal_recapture_locked(cache, false, 0);
    }
    while (cache->active_operations)
       cnd_wait(&cache->cond, &cache->mutex);
@@ -801,7 +908,8 @@ kk_metal_cache_create(struct disk_cache *disk_cache, mtl_device *device,
       return NULL;
    cache->disk = disk_cache;
    cache->device = device;
-   cache->compiler = compiler;
+   cache->buffers[0].compiler = compiler;
+   cache->buffer_count = 1;
    cache->bypass_disabled =
       debug_get_bool_option("MESA_KK_PSO_CACHE_BYPASS_DISABLE", false);
    cache->uncaptured = mtl_new_uncaptured_compiler(device);
@@ -810,10 +918,23 @@ kk_metal_cache_create(struct disk_cache *disk_cache, mtl_device *device,
       free(cache);
       return NULL;
    }
+   if (debug_get_bool_option("MESA_KK_PSO_CACHE_DOUBLE_BUFFER", true)) {
+      mtl_compiler *second = mtl_new_compiler(device);
+      if (second && mtl_compiler_has_serializer(second)) {
+         cache->owned_compiler = second;
+         cache->buffers[1].compiler = second;
+         cache->buffer_count = 2;
+      } else {
+         mtl_release(second);
+         kk_metal_log_failure("double_buffer_unavailable");
+      }
+   }
    cache->quiet_ns = kk_metal_timing_option("MESA_KK_PSO_CACHE_QUIET_MS",
                                             KK_METAL_QUIET_MS_DEFAULT);
    cache->max_age_ns = kk_metal_timing_option("MESA_KK_PSO_CACHE_MAX_AGE_MS",
                                               KK_METAL_MAX_AGE_MS_DEFAULT);
+   cache->shutdown_ns = kk_metal_timing_option("MESA_KK_PSO_CACHE_SHUTDOWN_MS",
+                                               KK_METAL_SHUTDOWN_MS_DEFAULT);
    cache->max_pending = kk_metal_count_option("MESA_KK_PSO_CACHE_MAX_PENDING",
                                               KK_METAL_MAX_PENDING_DEFAULT);
    cache->blob_budget = blob_budget;
@@ -844,6 +965,7 @@ fail_cond:
 fail_mutex:
    mtx_destroy(&cache->mutex);
 fail:
+   mtl_release(cache->owned_compiler);
    mtl_release(cache->uncaptured);
    free(cache);
    return NULL;
@@ -927,10 +1049,14 @@ kk_metal_cache_destroy(struct kk_metal_cache *cache)
    kk_metal_log_summary(cache);
    cnd_destroy(&cache->cond);
    mtx_destroy(&cache->mutex);
-   while (cache->pending) {
-      struct kk_metal_cache_key *next = cache->pending->next;
-      free(cache->pending);
-      cache->pending = next;
+   for (unsigned i = 0; i < cache->buffer_count; ++i) {
+      struct kk_metal_buffer *buffer = &cache->buffers[i];
+      while (buffer->pending) {
+         struct kk_metal_cache_key *next = buffer->pending->next;
+         free(buffer->pending);
+         buffer->pending = next;
+      }
+      kk_metal_capture_groups_clear(buffer);
    }
    while (cache->recapture) {
       struct kk_metal_recapture *next = cache->recapture->next;
@@ -944,7 +1070,7 @@ kk_metal_cache_destroy(struct kk_metal_cache *cache)
       free(cache->archive_head);
       cache->archive_head = next;
    }
-   kk_metal_capture_groups_clear(cache);
+   mtl_release(cache->owned_compiler);
    mtl_release(cache->uncaptured);
    free(cache);
 }
@@ -1184,16 +1310,18 @@ static bool
 kk_metal_pending_locked(struct kk_metal_cache *cache,
                         const uint8_t key[CACHE_KEY_SIZE])
 {
-   for (struct kk_metal_cache_key *entry = cache->pending;
-        entry; entry = entry->next)
-      if (!memcmp(entry->key, key, CACHE_KEY_SIZE))
-         return true;
+   for (unsigned i = 0; i < cache->buffer_count; ++i)
+      for (struct kk_metal_cache_key *entry = cache->buffers[i].pending; entry;
+           entry = entry->next)
+         if (!memcmp(entry->key, key, CACHE_KEY_SIZE))
+            return true;
    return false;
 }
 
 static void
 kk_metal_capture_locked(struct kk_metal_cache *cache,
-                         const uint8_t key[CACHE_KEY_SIZE])
+                        struct kk_metal_buffer *buffer,
+                        const uint8_t key[CACHE_KEY_SIZE])
 {
    if (kk_metal_pending_locked(cache, key))
       return;
@@ -1204,11 +1332,11 @@ kk_metal_capture_locked(struct kk_metal_cache *cache,
       return;
    }
    memcpy(entry->key, key, CACHE_KEY_SIZE);
-   if (!cache->pending)
-      cache->oldest_pending_ns = os_time_get_nano();
-   entry->next = cache->pending;
-   cache->pending = entry;
-   cache->pending_count++;
+   if (!kk_metal_buffer_dirty(buffer))
+      buffer->oldest_pending_ns = os_time_get_nano();
+   entry->next = buffer->pending;
+   buffer->pending = entry;
+   buffer->pending_count++;
 }
 
 static bool
@@ -1250,10 +1378,12 @@ kk_metal_recapture_pop_locked(struct kk_metal_cache *cache)
 }
 
 static void
-kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain)
+kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain,
+                          int64_t deadline)
 {
    unsigned budget = KK_METAL_RECAPTURE_BATCH;
    while (cache->recapture && !kk_metal_batch_full_locked(cache) &&
+          (!deadline || os_time_get_nano() < deadline) &&
           (drain || (budget && !cache->stopping &&
                      cache->flush_requested == cache->flush_completed))) {
       struct kk_metal_recapture *entry = kk_metal_recapture_pop_locked(cache);
@@ -1262,9 +1392,10 @@ kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain)
          free(entry);
          continue;
       }
+      struct kk_metal_buffer *buffer = kk_metal_active(cache);
       if (!kk_metal_capture_admit_locked(
-             cache, entry->linked_vertex ? &entry->capture_key : NULL)) {
-         if (cache->capture_conflict) {
+             buffer, entry->linked_vertex ? &entry->capture_key : NULL)) {
+         if (buffer->capture_conflict) {
             entry->next = cache->recapture;
             cache->recapture = entry;
             if (!cache->recapture_tail)
@@ -1281,24 +1412,24 @@ kk_metal_recapture_locked(struct kk_metal_cache *cache, bool drain)
       budget -= !!budget;
       entry->attempts++;
       cache->recapturing = entry;
-      cache->captured_compiles++;
+      buffer->captured_compiles++;
       cache->last_compile_ns = os_time_get_nano();
       mtx_unlock(&cache->mutex);
       struct mtl_compile_phase phase =
          kk_metal_phase_begin(cache, "recapture", entry->key);
       void *pipeline = entry->compute ?
-         (void *)mtl_new_compute_pipeline_state(cache->compiler,
+         (void *)mtl_new_compute_pipeline_state(buffer->compiler,
                                                 entry->descriptor,
                                                 entry->max_threads) :
-         (void *)mtl_new_render_pipeline(cache->compiler, entry->descriptor);
+         (void *)mtl_new_render_pipeline(buffer->compiler, entry->descriptor);
       mtl_compile_phase_end(phase, pipeline != NULL);
       mtl_release(pipeline);
       mtx_lock(&cache->mutex);
       cache->recapturing = NULL;
-      cache->captured_compiles--;
+      buffer->captured_compiles--;
       cnd_broadcast(&cache->cond);
       if (pipeline) {
-         kk_metal_capture_locked(cache, entry->key);
+         kk_metal_capture_locked(cache, buffer, entry->key);
          cache->recaptured_compiles++;
       } else if (entry->attempts < KK_METAL_RECAPTURE_ATTEMPTS) {
          kk_metal_recapture_push_locked(cache, entry);
@@ -1347,7 +1478,8 @@ static mtl_compiler *
 kk_metal_begin_compile(struct kk_metal_cache *cache,
                        const uint8_t key[CACHE_KEY_SIZE],
                        enum kk_metal_route *route, bool capture,
-                       const struct kk_metal_capture_key *capture_key)
+                       const struct kk_metal_capture_key *capture_key,
+                       unsigned *buffer_index)
 {
    mtx_lock(&cache->mutex);
    cache->last_compile_ns = os_time_get_nano();
@@ -1372,30 +1504,34 @@ kk_metal_begin_compile(struct kk_metal_cache *cache,
    while (cache->serializing)
       cnd_wait(&cache->cond, &cache->mutex);
    mtl_compile_phase_end(phase, true);
-   if (capture && !kk_metal_capture_admit_locked(cache, capture_key)) {
+   struct kk_metal_buffer *buffer = kk_metal_active(cache);
+   if (capture && !kk_metal_capture_admit_locked(buffer, capture_key)) {
       cache->uncaptured_compiles++;
       *route = KK_METAL_ROUTE_CAPTURE_CONFLICT;
       mtx_unlock(&cache->mutex);
       return cache->uncaptured;
    }
-   cache->captured_compiles++;
+   buffer->captured_compiles++;
+   *buffer_index = cache->active;
    mtx_unlock(&cache->mutex);
    *route = KK_METAL_ROUTE_CAPTURED;
-   return cache->compiler;
+   return buffer->compiler;
 }
 
 static void
 kk_metal_end_compile(struct kk_metal_cache *cache,
                      const uint8_t key[CACHE_KEY_SIZE],
-                     enum kk_metal_route route, bool persist, void *descriptor,
-                     bool compute, uint64_t max_threads,
+                     enum kk_metal_route route, unsigned buffer_index,
+                     bool persist, void *descriptor, bool compute,
+                     uint64_t max_threads,
                      const struct kk_metal_capture_key *capture_key)
 {
    mtx_lock(&cache->mutex);
    if (route == KK_METAL_ROUTE_CAPTURED) {
+      struct kk_metal_buffer *buffer = &cache->buffers[buffer_index];
       if (persist)
-         kk_metal_capture_locked(cache, key);
-      cache->captured_compiles--;
+         kk_metal_capture_locked(cache, buffer, key);
+      buffer->captured_compiles--;
    } else {
       if (persist)
          kk_metal_defer_recapture_locked(cache, key, descriptor, compute,
@@ -1429,7 +1565,7 @@ kk_metal_operation_end(struct kk_metal_cache *cache)
 static mtl_compiler *
 kk_metal_closed_compiler(struct kk_metal_cache *cache)
 {
-   return cache->uncaptured ? cache->uncaptured : cache->compiler;
+   return cache->uncaptured ? cache->uncaptured : cache->buffers[0].compiler;
 }
 
 static mtl_render_pipeline_state *
@@ -1492,16 +1628,18 @@ kk_metal_cache_new_render_pipeline(
    if (!pipeline) {
       bool uncacheable = miss == KK_METAL_MISS_UNCACHEABLE;
       enum kk_metal_route route;
-      mtl_compiler *compiler =
-         kk_metal_begin_compile(cache, key, &route, !uncacheable, capture_key);
+      unsigned buffer = 0;
+      mtl_compiler *compiler = kk_metal_begin_compile(
+         cache, key, &route, !uncacheable, capture_key, &buffer);
       int64_t start = kk_metal_trace_time();
       int64_t log_start = os_time_get_nano();
       pipeline = mtl_new_render_pipeline(compiler, descriptor);
       kk_metal_trace_event("native_compile", key, start);
       kk_metal_log_compile("render", key, miss, route, log_start,
                            pipeline != NULL);
-      kk_metal_end_compile(cache, key, route, pipeline != NULL && !uncacheable,
-                           descriptor, false, 0, capture_key);
+      kk_metal_end_compile(cache, key, route, buffer,
+                           pipeline != NULL && !uncacheable, descriptor, false,
+                           0, capture_key);
    }
    kk_metal_operation_end(cache);
    return pipeline;
@@ -1516,13 +1654,15 @@ kk_metal_cache_specialize_render_pipeline(
       return mtl_specialize_render_pipeline(kk_metal_closed_compiler(cache),
                                             descriptor, base);
    enum kk_metal_route route;
+   unsigned buffer = 0;
    mtl_compiler *compiler =
-      kk_metal_begin_compile(cache, key, &route, false, NULL);
+      kk_metal_begin_compile(cache, key, &route, false, NULL, &buffer);
    int64_t start = kk_metal_trace_time();
    mtl_render_pipeline_state *pipeline =
       mtl_specialize_render_pipeline(compiler, descriptor, base);
    kk_metal_trace_event("native_specialize", key, start);
-   kk_metal_end_compile(cache, key, route, false, descriptor, false, 0, NULL);
+   kk_metal_end_compile(cache, key, route, buffer, false, descriptor, false, 0,
+                        NULL);
    kk_metal_operation_end(cache);
    return pipeline;
 }
@@ -1563,8 +1703,9 @@ kk_metal_cache_new_compute_pipeline(struct kk_metal_cache *cache,
    if (!pipeline) {
       bool uncacheable = miss == KK_METAL_MISS_UNCACHEABLE;
       enum kk_metal_route route;
-      mtl_compiler *compiler =
-         kk_metal_begin_compile(cache, key, &route, !uncacheable, NULL);
+      unsigned buffer = 0;
+      mtl_compiler *compiler = kk_metal_begin_compile(
+         cache, key, &route, !uncacheable, NULL, &buffer);
       int64_t start = kk_metal_trace_time();
       int64_t log_start = os_time_get_nano();
       pipeline =
@@ -1572,8 +1713,9 @@ kk_metal_cache_new_compute_pipeline(struct kk_metal_cache *cache,
       kk_metal_trace_event("native_compile", key, start);
       kk_metal_log_compile("compute", key, miss, route, log_start,
                            pipeline != NULL);
-      kk_metal_end_compile(cache, key, route, pipeline != NULL && !uncacheable,
-                           function, true, max_threads, NULL);
+      kk_metal_end_compile(cache, key, route, buffer,
+                           pipeline != NULL && !uncacheable, function, true,
+                           max_threads, NULL);
    }
    kk_metal_operation_end(cache);
    return pipeline;

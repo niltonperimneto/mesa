@@ -2,6 +2,7 @@
 #define mtl_specialize_render_pipeline mock_specialize_render_pipeline
 #define mtl_new_compute_pipeline_state mock_new_compute_pipeline_state
 #define mtl_new_uncaptured_compiler mock_new_uncaptured_compiler
+#define mtl_new_compiler mock_new_compiler
 #define mtl_compiler_has_serializer mock_compiler_has_serializer
 #define mtl_compiler_serialize mock_compiler_serialize
 #define mtl_pipeline_cache_identity mock_pipeline_cache_identity
@@ -58,7 +59,8 @@ struct mock_entry {
    size_t size;
 };
 
-static int captured_compiler, uncaptured_compiler, device, pipeline;
+static int captured_compiler, captured_compiler2, uncaptured_compiler, device,
+   pipeline;
 
 static struct {
    mtx_t lock;
@@ -71,6 +73,12 @@ static struct {
    uint32_t captured_vertex[MAX_KEYS];
    uint32_t captured_fragment[MAX_KEYS];
    unsigned captured_count;
+   uint32_t captured2[MAX_KEYS];
+   uint32_t captured2_vertex[MAX_KEYS];
+   uint32_t captured2_fragment[MAX_KEYS];
+   unsigned captured2_count;
+   bool serialize_gate;
+   bool serialize_blocked;
    size_t key_bytes;
    unsigned serializes;
    int first_serialize_queue;
@@ -87,6 +95,7 @@ static struct {
    unsigned disk_gets;
    unsigned serialize_failures;
    unsigned max_batch;
+   unsigned delay_ms;
    struct mock_entry disk[MAX_DISK];
    unsigned disk_count;
 } mock;
@@ -147,6 +156,12 @@ mock_release(void *object)
 }
 
 mtl_compiler *
+mock_new_compiler(mtl_device *dev)
+{
+   return (mtl_compiler *)&captured_compiler2;
+}
+
+mtl_compiler *
 mock_new_uncaptured_compiler(mtl_device *dev)
 {
    return (mtl_compiler *)&uncaptured_compiler;
@@ -186,16 +201,25 @@ mock_compile(mtl_compiler *compiler, void *descriptor)
    bool fail = desc->failures > 0;
    if (fail)
       desc->failures--;
-   if (!fail && compiler == (mtl_compiler *)&captured_compiler) {
-      CHECK(mock.captured_count < MAX_KEYS);
-      for (unsigned i = 0; i < mock.captured_count; ++i)
-         CHECK(!desc->vertex || desc->vertex != mock.captured_vertex[i] ||
-               desc->fragment == mock.captured_fragment[i]);
-      mock.captured_vertex[mock.captured_count] = desc->vertex;
-      mock.captured_fragment[mock.captured_count] = desc->fragment;
-      mock.captured[mock.captured_count++] = desc->id;
+   bool second = compiler == (mtl_compiler *)&captured_compiler2;
+   if (!fail && (second || compiler == (mtl_compiler *)&captured_compiler)) {
+      uint32_t *ids = second ? mock.captured2 : mock.captured;
+      uint32_t *vertex = second ? mock.captured2_vertex : mock.captured_vertex;
+      uint32_t *fragment =
+         second ? mock.captured2_fragment : mock.captured_fragment;
+      unsigned *count = second ? &mock.captured2_count : &mock.captured_count;
+      CHECK(*count < MAX_KEYS);
+      for (unsigned i = 0; i < *count; ++i)
+         CHECK(!desc->vertex || desc->vertex != vertex[i] ||
+               desc->fragment == fragment[i]);
+      vertex[*count] = desc->vertex;
+      fragment[*count] = desc->fragment;
+      ids[(*count)++] = desc->id;
    }
+   unsigned delay = mock.delay_ms;
    mtx_unlock(&mock.lock);
+   if (delay)
+      thrd_sleep(&(struct timespec){ .tv_nsec = delay * 1000000l }, NULL);
    return fail ? NULL : &pipeline;
 }
 
@@ -229,22 +253,29 @@ mock_compiler_serialize(mtl_compiler *compiler, size_t *size)
    int queued = mock.cache->recapture_count;
    mtx_unlock(&mock.cache->mutex);
    mtx_lock(&mock.lock);
+   mock.serialize_blocked = mock.serialize_gate;
+   cnd_broadcast(&mock.cond);
+   while (mock.serialize_gate)
+      cnd_wait(&mock.cond, &mock.lock);
+   mock.serialize_blocked = false;
    if (mock.serialize_failures) {
       mock.serialize_failures--;
       mtx_unlock(&mock.lock);
       *size = 0;
       return NULL;
    }
-   mock.max_batch = MAX2(mock.max_batch, mock.captured_count);
+   bool second = compiler == (mtl_compiler *)&captured_compiler2;
+   uint32_t *ids = second ? mock.captured2 : mock.captured;
+   unsigned *count = second ? &mock.captured2_count : &mock.captured_count;
+   mock.max_batch = MAX2(mock.max_batch, *count);
    if (!mock.serializes++)
       mock.first_serialize_queue = queued;
-   *size = sizeof(uint32_t) * (2 + mock.captured_count) +
-           mock.key_bytes * mock.captured_count;
+   *size = sizeof(uint32_t) * (2 + *count) + mock.key_bytes * *count;
    uint32_t *data = calloc(1, *size);
    data[0] = mock.serializes;
-   data[1] = mock.captured_count;
-   memcpy(data + 2, mock.captured, mock.captured_count * sizeof(uint32_t));
-   mock.captured_count = 0;
+   data[1] = *count;
+   memcpy(data + 2, ids, *count * sizeof(uint32_t));
+   *count = 0;
    mtx_unlock(&mock.lock);
    return data;
 }
@@ -375,6 +406,8 @@ mock_reset(bool clear_disk)
 {
    mtx_lock(&mock.lock);
    mock.call_count = mock.uncaptured_calls = mock.captured_count = 0;
+   mock.captured2_count = 0;
+   mock.serialize_gate = mock.serialize_blocked = false;
    mock.serializes = 0;
    mock.first_serialize_queue = -1;
    mock.block_id = 0;
@@ -388,7 +421,7 @@ mock_reset(bool clear_disk)
    mock.archives = NULL;
    mock.archive_count = mock.archives_dead = 0;
    mock.archive_creates = mock.disk_gets = 0;
-   mock.serialize_failures = mock.max_batch = 0;
+   mock.serialize_failures = mock.max_batch = mock.delay_ms = 0;
    mock.archive_gate = mock.archive_gated = mock.archive_reject = false;
    if (clear_disk) {
       for (unsigned i = 0; i < mock.disk_count; ++i)
@@ -457,7 +490,7 @@ wait_recapture_idle(struct kk_metal_cache *cache)
       mtx_lock(&cache->mutex);
       cnd_broadcast(&cache->cond);
       bool idle = !cache->recapture && !cache->recapturing &&
-                  !cache->captured_compiles;
+                  !kk_metal_captured_locked(cache);
       mtx_unlock(&cache->mutex);
       if (idle)
          return;
@@ -486,7 +519,7 @@ test_recapture_order_and_dedup(void)
    cache_key key;
    desc_key(&c, key);
    mtx_lock(&cache->mutex);
-   kk_metal_capture_locked(cache, key);
+   kk_metal_capture_locked(cache, kk_metal_active(cache), key);
    defer_locked(cache, &a);
    defer_locked(cache, &a);
    defer_locked(cache, &b);
@@ -615,7 +648,7 @@ test_recapture_failures(void)
                       "recapture_capacity"));
    CHECK(!log_has_drop(path, &many[0], "recapture_capacity"));
    mtx_lock(&cache->mutex);
-   CHECK(!cache->dropped_capacity && !cache->dropped_failed && !cache->pending);
+   CHECK(!cache->dropped_capacity && !cache->dropped_failed && !kk_metal_dirty_locked(cache));
    mtx_unlock(&cache->mutex);
    kk_metal_cache_destroy(cache);
    unsetenv("MESA_KK_CACHE_LOG");
@@ -773,7 +806,7 @@ test_single_oversized_pso(void)
    cache = make_cache(4500, 0);
    CHECK(compile_desc(cache, &big, &hit) && !hit);
    mtx_lock(&cache->mutex);
-   CHECK(!cache->recapture && !cache->pending);
+   CHECK(!cache->recapture && !kk_metal_dirty_locked(cache));
    mtx_unlock(&cache->mutex);
    mock.key_bytes = 100;
    CHECK(compile_desc(cache, &small, &hit) && !hit);
@@ -1097,11 +1130,235 @@ test_closing_compiles_uncached(void)
    mtx_unlock(&mock.lock);
    CHECK(log_has_compile(path, &desc, "none", "closing"));
    mtx_lock(&cache->mutex);
-   CHECK(!cache->pending && !cache->recapture && !cache->active_operations);
+   CHECK(!kk_metal_dirty_locked(cache) && !cache->recapture && !cache->active_operations);
    mtx_unlock(&cache->mutex);
    kk_metal_cache_destroy(cache);
    unsetenv("MESA_KK_CACHE_LOG");
    unlink(path);
+}
+
+static void
+test_capture_group_age(void)
+{
+   struct kk_metal_cache cache = {
+      .buffer_count = 1,
+      .uncaptured = (void *)&uncaptured_compiler,
+      .last_compile_ns = os_time_get_nano(),
+      .quiet_ns = 1500000000ll,
+      .max_age_ns = 60000000000ll,
+      .max_pending = 32,
+   };
+   struct kk_metal_buffer *buffer = kk_metal_active(&cache);
+   struct kk_metal_capture_key group = {.vertex = {1}, .fragment = {1}};
+   for (unsigned i = 0; i < 2; ++i) {
+      CHECK(kk_metal_capture_admit_locked(buffer, &group));
+      buffer->captured_compiles = 1;
+      CHECK(!kk_metal_flush_due_locked(&cache, os_time_get_nano()));
+      buffer->captured_compiles = 0;
+      kk_metal_capture_groups_clear(buffer);
+      buffer->oldest_pending_ns = os_time_get_nano() - 120000000000ll;
+   }
+}
+
+static void
+test_groups_only_flush_discarded(void)
+{
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(4, 0);
+   unsigned limit = cache_limit(cache);
+   struct mock_desc failing = {
+      .id = 14000, .failures = 1, .vertex = 1, .fragment = 1,
+   };
+   bool hit;
+   CHECK(!compile_desc(cache, &failing, &hit) && !hit);
+   mtx_lock(&cache->mutex);
+   CHECK(kk_metal_active(cache)->capture_groups &&
+         !kk_metal_active(cache)->pending &&
+         kk_metal_active(cache)->oldest_pending_ns);
+   mtx_unlock(&cache->mutex);
+   mtx_lock(&mock.lock);
+   unsigned disk = mock.disk_count;
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_flush(cache);
+   mtx_lock(&mock.lock);
+   CHECK(mock.serializes == 1 && mock.disk_count == disk);
+   mtx_unlock(&mock.lock);
+   mtx_lock(&cache->mutex);
+   CHECK(!kk_metal_dirty_locked(cache) &&
+         !kk_metal_active(cache)->capture_conflict);
+   mtx_unlock(&cache->mutex);
+   CHECK(cache_limit(cache) == limit);
+   CHECK(log_contains(path, "\"outcome\":\"archive_discarded\""));
+   CHECK(!log_contains(path, "\"outcome\":\"archive_flushed\""));
+   CHECK(!log_contains(path, "\"outcome\":\"archive_oversized\""));
+   CHECK(!log_contains(path, "archive_limit_lowered"));
+   kk_metal_cache_destroy(cache);
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
+static void
+test_shutdown_budget(void)
+{
+   char path[] = "/tmp/kk-metal-cache-log-XXXXXX";
+   int fd = mkstemp(path);
+   CHECK(fd >= 0);
+   close(fd);
+   setenv("MESA_KK_CACHE_LOG", path, 1);
+   setenv("MESA_KK_PSO_CACHE_SHUTDOWN_MS", "60", 1);
+   mock_reset(true);
+   mock.delay_ms = 20;
+   struct kk_metal_cache *cache = make_cache(0, 0);
+   static struct mock_desc descs[24];
+   mtx_lock(&cache->mutex);
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+      descs[i] = (struct mock_desc){ .id = 15000 + i };
+      defer_locked(cache, &descs[i]);
+   }
+   mtx_unlock(&cache->mutex);
+   int64_t start = os_time_get_nano();
+   kk_metal_cache_destroy(cache);
+   int64_t elapsed = os_time_get_nano() - start;
+   CHECK(elapsed < 350000000ll);
+   mtx_lock(&mock.lock);
+   unsigned compiled = mock.call_count;
+   CHECK(compiled > 0 && compiled < ARRAY_SIZE(descs) && mock.serializes >= 1);
+   for (unsigned i = 0; i < compiled; ++i)
+      CHECK(mock.calls[i] == descs[i].id);
+   mock.delay_ms = 0;
+   mtx_unlock(&mock.lock);
+   unsigned skipped = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
+      bool dropped = log_has_drop(path, &descs[i], "shutdown_budget");
+      CHECK(dropped == (i >= compiled));
+      skipped += dropped;
+   }
+   CHECK(skipped == ARRAY_SIZE(descs) - compiled);
+   CHECK(log_contains(path, "\"outcome\":\"shutdown_budget_expired\""));
+   CHECK(!log_contains(path, "\"outcome\":\"final_flush_failed\""));
+
+   mock_reset(false);
+   cache = make_cache(0, 0);
+   bool hit;
+   CHECK(compile_desc(cache, &descs[0], &hit) && hit);
+   CHECK(compile_desc(cache, &descs[compiled - 1], &hit) && hit);
+   CHECK(compile_desc(cache, &descs[ARRAY_SIZE(descs) - 1], &hit) && !hit);
+   kk_metal_cache_destroy(cache);
+   unsetenv("MESA_KK_PSO_CACHE_SHUTDOWN_MS");
+   unsetenv("MESA_KK_CACHE_LOG");
+   unlink(path);
+}
+
+static void
+test_flush_both_buffers(void)
+{
+   setenv("MESA_KK_PSO_CACHE_DOUBLE_BUFFER", "true", 1);
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 4);
+   struct mock_desc descs[7];
+   mtx_lock(&mock.lock);
+   mock.serialize_gate = true;
+   mock.serialize_failures = 1;
+   mtx_unlock(&mock.lock);
+   bool hit;
+   for (unsigned i = 0; i < 4; ++i) {
+      descs[i] = (struct mock_desc){.id = 17000 + i};
+      CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+   }
+   int64_t give_up = os_time_get_nano() + 5000000000ll;
+   mtx_lock(&mock.lock);
+   while (!mock.serialize_blocked) {
+      mtx_unlock(&mock.lock);
+      CHECK(os_time_get_nano() < give_up);
+      thrd_sleep(&(struct timespec){.tv_nsec = 1000000}, NULL);
+      mtx_lock(&mock.lock);
+   }
+   mtx_unlock(&mock.lock);
+   for (unsigned i = 4; i < ARRAY_SIZE(descs); ++i) {
+      descs[i] = (struct mock_desc){.id = 17000 + i};
+      CHECK(compile_desc(cache, &descs[i], &hit) && !hit);
+   }
+   mtx_lock(&mock.lock);
+   mock.serialize_gate = false;
+   cnd_broadcast(&mock.cond);
+   mtx_unlock(&mock.lock);
+   for (;;) {
+      mtx_lock(&cache->mutex);
+      bool failed = cache->retry_after_ns != 0;
+      mtx_unlock(&cache->mutex);
+      if (failed)
+         break;
+      CHECK(os_time_get_nano() < give_up);
+      thrd_sleep(&(struct timespec){.tv_nsec = 1000000}, NULL);
+   }
+   kk_metal_cache_flush(cache);
+   mtx_lock(&cache->mutex);
+   CHECK(!kk_metal_dirty_locked(cache));
+   mtx_unlock(&cache->mutex);
+   for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i)
+      CHECK(compile_desc(cache, &descs[i], &hit) && hit);
+   kk_metal_cache_destroy(cache);
+   setenv("MESA_KK_PSO_CACHE_DOUBLE_BUFFER", "false", 1);
+}
+
+static void
+test_double_buffer(bool enabled, bool fail)
+{
+   setenv("MESA_KK_PSO_CACHE_DOUBLE_BUFFER", enabled ? "true" : "false", 1);
+   mock_reset(true);
+   struct kk_metal_cache *cache = make_cache(0, 4);
+   CHECK(cache->buffer_count == (enabled ? 2u : 1u));
+   static struct mock_desc first[4], second[3];
+   mtx_lock(&mock.lock);
+   mock.serialize_gate = true;
+   mock.serialize_failures = fail ? 1 : 0;
+   mtx_unlock(&mock.lock);
+   bool hit;
+   for (unsigned i = 0; i < ARRAY_SIZE(first); ++i) {
+      first[i] = (struct mock_desc){ .id = 16000 + i };
+      CHECK(compile_desc(cache, &first[i], &hit) && !hit);
+   }
+   int64_t give_up = os_time_get_nano() + 5000000000ll;
+   mtx_lock(&mock.lock);
+   while (!mock.serialize_blocked) {
+      mtx_unlock(&mock.lock);
+      CHECK(os_time_get_nano() < give_up);
+      thrd_sleep(&(struct timespec){ .tv_nsec = 1000000 }, NULL);
+      mtx_lock(&mock.lock);
+   }
+   mtx_unlock(&mock.lock);
+   for (unsigned i = 0; i < ARRAY_SIZE(second); ++i) {
+      second[i] = (struct mock_desc){ .id = 16100 + i };
+      CHECK(compile_desc(cache, &second[i], &hit) && !hit);
+   }
+   mtx_lock(&mock.lock);
+   if (enabled)
+      CHECK(mock.uncaptured_calls == 0 &&
+            mock.captured2_count == ARRAY_SIZE(second));
+   else
+      CHECK(mock.uncaptured_calls == ARRAY_SIZE(second));
+   mock.serialize_gate = false;
+   cnd_broadcast(&mock.cond);
+   mtx_unlock(&mock.lock);
+   wait_recapture_idle(cache);
+   kk_metal_cache_destroy(cache);
+
+   mock_reset(false);
+   cache = make_cache(0, 0);
+   for (unsigned i = 0; i < ARRAY_SIZE(first); ++i)
+      CHECK(compile_desc(cache, &first[i], &hit) && hit);
+   for (unsigned i = 0; i < ARRAY_SIZE(second); ++i)
+      CHECK(compile_desc(cache, &second[i], &hit) && hit);
+   mtx_lock(&mock.lock);
+   CHECK(mock.call_count == 0 && mock.uncaptured_calls == 0);
+   mtx_unlock(&mock.lock);
+   kk_metal_cache_destroy(cache);
+   setenv("MESA_KK_PSO_CACHE_DOUBLE_BUFFER", "false", 1);
 }
 
 struct hit_loop {
@@ -1307,6 +1564,7 @@ int
 main(void)
 {
    setenv("MESA_KK_PSO_CACHE_EXIT_FLUSH", "false", 1);
+   setenv("MESA_KK_PSO_CACHE_DOUBLE_BUFFER", "false", 1);
    setenv("MESA_KK_PSO_CACHE_QUIET_MS", "1000000000", 1);
    setenv("MESA_KK_PSO_CACHE_MAX_AGE_MS", "1000000000", 1);
    CHECK(mtx_init(&mock.lock, mtx_plain) == thrd_success);
@@ -1314,6 +1572,12 @@ main(void)
    for (unsigned i = 0; i < 8; ++i)
       test_linked_vertex_batches(i & 1, i & 2, i & 4);
    test_linked_vertex_inflight();
+   test_capture_group_age();
+   test_groups_only_flush_discarded();
+   test_shutdown_budget();
+   test_flush_both_buffers();
+   for (unsigned i = 0; i < 4; ++i)
+      test_double_buffer(i & 1, i & 2);
    test_recapture_order_and_dedup();
    test_recapture_failures();
    test_recapture_yields_to_flush();

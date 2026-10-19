@@ -58,7 +58,8 @@ static void
 test_specialization(bool uncaptured, bool serializing, bool fail)
 {
    struct kk_metal_cache cache = {
-      .compiler = (void *)&captured_compiler,
+      .buffers = { { .compiler = (void *)&captured_compiler } },
+      .buffer_count = 1,
       .uncaptured = uncaptured ? (void *)&uncaptured_compiler : NULL,
       .serializing = serializing,
    };
@@ -97,7 +98,7 @@ test_specialization(bool uncaptured, bool serializing, bool fail)
    mtx_lock(&cache.mutex);
    CHECK(cache.active_operations == 1);
    CHECK(cache.uncaptured_compiles == (unsigned)uncaptured);
-   CHECK(cache.captured_compiles == (unsigned)!uncaptured);
+   CHECK(cache.buffers[0].captured_compiles == (unsigned)!uncaptured);
    CHECK(cache.bypassed_compiles == (unsigned)(uncaptured && serializing));
    cache.closing = true;
    mtx_unlock(&cache.mutex);
@@ -107,8 +108,8 @@ test_specialization(bool uncaptured, bool serializing, bool fail)
    mtx_unlock(&mock.lock);
    CHECK(thrd_join(thread, NULL) == thrd_success);
    CHECK(demand.result == (fail ? NULL : (void *)&child_pipeline));
-   CHECK(!cache.active_operations && !cache.captured_compiles &&
-         !cache.uncaptured_compiles && !cache.pending && !cache.recapture);
+   CHECK(!cache.active_operations && !cache.buffers[0].captured_compiles &&
+         !cache.uncaptured_compiles && !cache.buffers[0].pending && !cache.recapture);
    mock.compiler = NULL;
    cache_key key = {0};
    mtl_render_pipeline_state *closed =
@@ -117,8 +118,8 @@ test_specialization(bool uncaptured, bool serializing, bool fail)
    CHECK(closed == (fail ? NULL : (void *)&child_pipeline));
    CHECK(mock.compiler == (uncaptured ? (void *)&uncaptured_compiler
                                       : (void *)&captured_compiler));
-   CHECK(!cache.active_operations && !cache.captured_compiles &&
-         !cache.uncaptured_compiles && !cache.pending && !cache.recapture);
+   CHECK(!cache.active_operations && !cache.buffers[0].captured_compiles &&
+         !cache.uncaptured_compiles && !cache.buffers[0].pending && !cache.recapture);
    cnd_destroy(&cache.cond);
    mtx_destroy(&cache.mutex);
 }
