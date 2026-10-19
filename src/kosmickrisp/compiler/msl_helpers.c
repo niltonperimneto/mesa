@@ -206,6 +206,7 @@ msl_tex_coord_components(enum glsl_sampler_dim dim, bool read)
 
 static const char *const float_vec[] = {"float", "float2", "float3", "float4"};
 static const char *const uint_vec[] = {"uint", "uint2", "uint3", "uint4"};
+static const char *const int_vec[] = {"int", "int2", "int3", "int4"};
 
 static const char *
 atomic_method(nir_atomic_op op)
@@ -288,9 +289,12 @@ msl_tex_helper_valid(const struct msl_tex_group *group,
          return false;
       if (op->min_lod && op->lod == MSL_TEX_HELPER_LOD_LEVEL)
          return false;
+      if (op->offset && group->dim == GLSL_SAMPLER_DIM_CUBE)
+         return false;
       return true;
    case MSL_TEX_HELPER_GATHER:
-      if (!group_samples(group) || group->dim == GLSL_SAMPLER_DIM_3D)
+      if (!group_samples(group) || group->dim == GLSL_SAMPLER_DIM_3D ||
+          (op->offset && group->dim == GLSL_SAMPLER_DIM_CUBE))
          return false;
       return group->depth ? op->compare : !op->compare && op->component < 4;
    case MSL_TEX_HELPER_READ:
@@ -384,6 +388,8 @@ msl_tex_helper_signature(const struct msl_tex_group *group,
       }
       if (op->min_lod)
          add_param(sig, "float");
+      if (op->offset)
+         add_param(sig, int_vec[coords - 1]);
       break;
    case MSL_TEX_HELPER_GATHER:
       sig->ret = vec4;
@@ -391,6 +397,8 @@ msl_tex_helper_signature(const struct msl_tex_group *group,
       add_coord_params(sig, group, false);
       if (op->compare)
          add_param(sig, "float");
+      if (op->offset)
+         add_param(sig, int_vec[coords - 1]);
       break;
    case MSL_TEX_HELPER_READ:
       sig->ret = texel;
@@ -443,15 +451,17 @@ msl_print_tex_helper_name(struct _mesa_string_buffer *buf, uint32_t group_id,
    _mesa_string_buffer_printf(buf, "kk_t_%03x_", group_id);
    switch (op->kind) {
    case MSL_TEX_HELPER_SAMPLE:
-      _mesa_string_buffer_printf(buf, "s%s%s%s", op->compare ? "c" : "",
+      _mesa_string_buffer_printf(buf, "s%s%s%s%s", op->compare ? "c" : "",
                                  (const char *[]){"", "b", "l", "g"}[op->lod],
-                                 op->min_lod ? "m" : "");
+                                 op->min_lod ? "m" : "", op->offset ? "o" : "");
       break;
    case MSL_TEX_HELPER_GATHER:
       if (op->compare)
          _mesa_string_buffer_append(buf, "gc");
       else
          _mesa_string_buffer_printf(buf, "g%c", "xyzw"[op->component]);
+      if (op->offset)
+         _mesa_string_buffer_append(buf, "o");
       break;
    case MSL_TEX_HELPER_READ:
       _mesa_string_buffer_append(buf, "read");
@@ -566,6 +576,8 @@ print_definition(struct _mesa_string_buffer *buf,
       }
       if (op->min_lod)
          _mesa_string_buffer_printf(buf, ", min_lod_clamp(p%u)", p++);
+      if (op->offset)
+         _mesa_string_buffer_printf(buf, ", p%u", p++);
       _mesa_string_buffer_append(buf, ");\n");
       break;
    }
@@ -573,7 +585,10 @@ print_definition(struct _mesa_string_buffer *buf,
       _mesa_string_buffer_printf(buf, "return t.%s(p0, ",
                                  op->compare ? "gather_compare" : "gather");
       print_args(buf, 1, coord_params + op->compare);
-      if (!cube)
+      if (op->offset)
+         _mesa_string_buffer_printf(buf, ", p%u",
+                                    1 + coord_params + op->compare);
+      else if (!cube)
          _mesa_string_buffer_append(buf, ", int2(0)");
       if (!op->compare)
          _mesa_string_buffer_printf(buf, ", component::%c",
@@ -658,20 +673,27 @@ print_group_catalogue(struct _mesa_string_buffer *buf,
    for (unsigned compare = 0; compare < 2; compare++) {
       for (unsigned lod = 0; lod < 4; lod++) {
          for (unsigned min_lod = 0; min_lod < 2; min_lod++) {
-            ops[n++] = (struct msl_tex_helper){
-               .kind = MSL_TEX_HELPER_SAMPLE,
-               .compare = compare,
-               .lod = lod,
-               .min_lod = min_lod,
-            };
+            for (unsigned offset = 0; offset < 2; offset++) {
+               ops[n++] = (struct msl_tex_helper){
+                  .kind = MSL_TEX_HELPER_SAMPLE,
+                  .compare = compare,
+                  .lod = lod,
+                  .min_lod = min_lod,
+                  .offset = offset,
+               };
+            }
          }
       }
    }
-   for (unsigned c = 0; c < 4; c++)
-      ops[n++] =
-         (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER, .component = c};
-   ops[n++] =
-      (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER, .compare = true};
+   for (unsigned offset = 0; offset < 2; offset++) {
+      for (unsigned c = 0; c < 4; c++)
+         ops[n++] = (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER,
+                                            .component = c,
+                                            .offset = offset};
+      ops[n++] = (struct msl_tex_helper){.kind = MSL_TEX_HELPER_GATHER,
+                                         .compare = true,
+                                         .offset = offset};
+   }
    for (unsigned i = 0; i < ARRAY_SIZE(atomics); i++)
       ops[n++] = (struct msl_tex_helper){.kind = MSL_TEX_HELPER_ATOMIC,
                                          .atomic = atomics[i]};

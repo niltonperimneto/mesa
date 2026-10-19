@@ -54,6 +54,7 @@ struct msl_tex_helper {
    enum msl_tex_helper_lod lod;
    bool compare;
    bool min_lod;
+   bool offset;
    uint8_t component;
    nir_atomic_op atomic;
 };

@@ -1091,6 +1091,7 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
    nir_src *ddx = nir_tex_get_src(tex, nir_tex_src_ddx);
    nir_src *ddy = nir_tex_get_src(tex, nir_tex_src_ddy);
    nir_src *min_lod = nir_tex_get_src(tex, nir_tex_src_min_lod);
+   nir_src *offset = nir_tex_get_src(tex, nir_tex_src_offset);
    uint64_t allowed = BITFIELD64_BIT(nir_tex_src_texture_handle) |
                       BITFIELD64_BIT(nir_tex_src_sampler_handle);
    bool same_type =
@@ -1110,10 +1111,12 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
          BITFIELD64_BIT(nir_tex_src_comparator) |
          BITFIELD64_BIT(nir_tex_src_bias) | BITFIELD64_BIT(nir_tex_src_lod) |
          BITFIELD64_BIT(nir_tex_src_ddx) | BITFIELD64_BIT(nir_tex_src_ddy) |
-         BITFIELD64_BIT(nir_tex_src_min_lod);
+         BITFIELD64_BIT(nir_tex_src_min_lod) |
+         BITFIELD64_BIT(nir_tex_src_offset);
       op->kind = MSL_TEX_HELPER_SAMPLE;
       op->compare = comparator;
       op->min_lod = min_lod;
+      op->offset = offset;
       if (!!bias + !!lod + !!ddx > 1 || !ddx != !ddy)
          return false;
       op->lod = bias  ? MSL_TEX_HELPER_LOD_BIAS
@@ -1125,7 +1128,8 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
           !src_is_scalar(bias) || !src_is_scalar(lod) ||
           !src_is_scalar(min_lod) ||
           (ddx && (ddx->ssa->num_components != sample_coords ||
-                   ddy->ssa->num_components != sample_coords)))
+                   ddy->ssa->num_components != sample_coords)) ||
+          (offset && offset->ssa->num_components != sample_coords))
          return false;
       break;
    case nir_texop_txf:
@@ -1156,6 +1160,7 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
       break;
    }
    case nir_texop_query_levels:
+      allowed |= BITFIELD64_BIT(nir_tex_src_lod);
       op->kind = MSL_TEX_HELPER_LEVELS;
       break;
    case nir_texop_texture_samples:
@@ -1163,12 +1168,15 @@ tex_helper_for_tex(nir_tex_instr *tex, struct msl_tex_group *group,
       break;
    case nir_texop_tg4:
       allowed |= BITFIELD64_BIT(nir_tex_src_coord) |
-                 BITFIELD64_BIT(nir_tex_src_comparator);
+                 BITFIELD64_BIT(nir_tex_src_comparator) |
+                 BITFIELD64_BIT(nir_tex_src_offset);
       op->kind = MSL_TEX_HELPER_GATHER;
       op->compare = comparator;
+      op->offset = offset;
       op->component = comparator ? 0 : tex->component;
       if (!same_type || !sampler || !coord ||
-          coord_components != sample_coords || !src_is_scalar(comparator))
+          coord_components != sample_coords || !src_is_scalar(comparator) ||
+          (offset && offset->ssa->num_components != sample_coords))
          return false;
       break;
    case nir_texop_lod: {
@@ -2308,6 +2316,9 @@ tex_helper_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       if (op.min_lod)
          helper_arg(ctx, &sig, &param,
                     nir_tex_get_src(tex, nir_tex_src_min_lod));
+      if (op.offset)
+         helper_arg(ctx, &sig, &param,
+                    nir_tex_get_src(tex, nir_tex_src_offset));
       P(ctx, ");\n");
       break;
    case nir_texop_txf:
@@ -2349,6 +2360,9 @@ tex_helper_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       if (op.compare)
          helper_arg(ctx, &sig, &param,
                     nir_tex_get_src(tex, nir_tex_src_comparator));
+      if (op.offset)
+         helper_arg(ctx, &sig, &param,
+                    nir_tex_get_src(tex, nir_tex_src_offset));
       P(ctx, ");\n");
       break;
    case nir_texop_lod:
