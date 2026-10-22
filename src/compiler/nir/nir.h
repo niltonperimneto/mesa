@@ -2616,6 +2616,10 @@ typedef enum nir_tex_src_type {
    /** Second backend-specific vec4 tex src argument, see nir_tex_src_backend1. */
    nir_tex_src_backend2,
 
+   /** Used for panfrost VAR_* texturing forms */
+   nir_tex_src_var_handle_pan,
+   nir_tex_src_var_buf_offset_pan,
+
    /** VK_QCOM_image_processing sources */
    nir_tex_src_ref_coord,
    nir_tex_src_texture_2_deref,
@@ -2693,6 +2697,8 @@ typedef enum nir_texop {
    nir_texop_tex_type_nv,
    /** Maps to TXQ.SAMPLER_POS */
    nir_texop_sample_pos_nv,
+   /** Maps to TEX_DUAL */
+   nir_texop_dual_pan,
    /** Maps to TEX_GRADIENT */
    nir_texop_gradient_pan,
    /**
@@ -2715,6 +2721,11 @@ typedef enum nir_texop {
    */
    nir_texop_block_match_sad_qcom,
    nir_texop_block_match_ssd_qcom,
+   /** txs at LOD0 in .xyz
+    *
+    * This avoids undefined behavior related to min LOD clamping HW behavior.
+    */
+   nir_texop_txs_lod0_intel,
    /** txs in .xyz and query_levels in .w */
    nir_texop_resinfo_intel,
 
@@ -3373,6 +3384,23 @@ NIR_DEFINE_SRC_AS_CONST(bool, bool)
 NIR_DEFINE_SRC_AS_CONST(double, float)
 
 #undef NIR_DEFINE_SRC_AS_CONST
+
+static inline void
+nir_instr_set_speculated(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+   if (nir_intrinsic_has_access(intrin) &&
+       (nir_intrinsic_access(intrin) & ACCESS_CAN_SPECULATE)) {
+      nir_intrinsic_set_access(intrin,
+                               (enum gl_access_qualifier)(
+                                  nir_intrinsic_access(intrin) |
+                                  ACCESS_IS_SPECULATED));
+   }
+}
 
 static inline bool
 nir_src_is_zero(nir_src src)
@@ -6609,6 +6637,15 @@ typedef struct nir_lower_tex_options {
    bool lower_tg4_shadow_to_16bit;
 
    /**
+    * This callback will be use if non NULL, otherwise nir_get_texture_size()
+    * will be used.
+    *
+    * This is useful for HW with undefined behavior in some cases (like min
+    * LOD clamping).
+    */
+   nir_def *(*build_txs_lod0)(nir_builder *b, nir_tex_instr *tex, void *data);
+
+   /**
     * Payload data to be sent to callback / filter functions.
     */
    void *callback_data;
@@ -7077,6 +7114,8 @@ bool nir_opt_generate_bfi(nir_shader *shader);
 bool nir_opt_idiv_const(nir_shader *shader, unsigned min_bit_size);
 
 bool nir_opt_mqsad(nir_shader *shader);
+
+bool nir_opt_uadd_carry(nir_shader *shader, unsigned bit_sizes);
 
 typedef enum {
    nir_opt_if_optimize_phi_true_false = (1 << 0),

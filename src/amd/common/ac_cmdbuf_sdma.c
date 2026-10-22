@@ -13,6 +13,41 @@
 
 #include "util/u_math.h"
 
+static const uint32_t ac_sdma_t2t_alignment_2d_and_planar[][3] = {
+   {16, 16, 1}, /* 1 bpp */
+   {16, 8, 1},  /* 2 bpp */
+   {8, 8, 1},   /* 4 bpp */
+   {8, 4, 1},   /* 8 bpp */
+   {4, 4, 1},   /* 16 bpp */
+};
+
+static const uint32_t ac_sdma_t2t_alignment_3d[][3] = {
+   {8, 4, 8}, /* 1 bpp */
+   {4, 4, 8}, /* 2 bpp */
+   {4, 4, 4}, /* 4 bpp */
+   {4, 2, 4}, /* 8 bpp */
+   {2, 2, 4}, /* 16 bpp */
+};
+
+static const uint32_t ac_sdma_t2t_thick_z_alignment_sdma2[] = {
+   1, /* LINEAR_GENERAL */
+   1, /* LINEAR_ALIGNED */
+   1, /* 1D_TILED_THIN1 */
+   4, /* 1D_TILED_THICK */
+   1, /* 2D_TILED_THIN1 */
+   1, /* PRT_TILED_THIN1 */
+   1, /* PRT_2D_TILED_THIN1 */
+   4, /* 2D_TILED_THICK */
+   8, /* 2D_TILED_XTHICK */
+   4, /* PRT_TILED_THICK */
+   4, /* PRT_2D_TILED_THICK */
+   1, /* PRT_3D_TILED_THIN1 */
+   1, /* 3D_TILED_THIN1 */
+   4, /* 3D_TILED_THICK */
+   8, /* 3D_TILED_XTHICK */
+   4, /* PRT_3D_TILED_THICK */
+};
+
 static bool
 ac_sdma_5_2_uses_cpv(enum sdma_version sdma_ip_version)
 {
@@ -51,7 +86,7 @@ ac_sdma_7_0_get_mall_policy(enum sdma_version sdma_ip_version, bool is_copy)
    return 0;
 }
 
-static uint32_t
+uint32_t
 ac_sdma_max_img_extent(const enum sdma_version ver)
 {
    if (ver >= SDMA_7_0)
@@ -244,7 +279,8 @@ ac_sdma_check_pitches(enum sdma_version sdma_ip_version, uint32_t pitch,
    assert(util_is_aligned(pitch, pitch_alignment));
 
    if (uses_depth) {
-      ASSERTED const uint32_t slice_pitch_alignment = 4;
+      ASSERTED const uint32_t slice_pitch_alignment =
+         sdma_ip_version >= SDMA_5_0 ? MAX2(1, 4 / bpp) : 4;
       assert(slice_pitch);
       assert(slice_pitch <= (1 << 28));
       assert(util_is_aligned(slice_pitch, slice_pitch_alignment));
@@ -586,8 +622,10 @@ ac_emit_sdma_copy_t2t_sub_window(struct ac_cmdbuf *cs, const struct radeon_info 
    const uint32_t src_info_dword = ac_sdma_get_tiled_info_dword(info, src);
    const uint32_t dst_info_dword = ac_sdma_get_tiled_info_dword(info, dst);
 
-   /* On GFX10+ this supports DCC, but cannot copy a compressed surface to another compressed surface. */
-   assert(!src->is_compressed || !dst->is_compressed);
+   /* On SDMA 5-6.1, DCC is supported but cannot copy a compressed surface to
+    * another compressed surface.
+    */
+   assert(sdma_ip_version >= SDMA_7_0 || !src->is_compressed || !dst->is_compressed);
 
    if (sdma_ip_version < SDMA_5_0) {
       /* SDMA v2-v4 doesn't support mip_id selection in the T2T copy packet. */
@@ -692,4 +730,195 @@ ac_emit_sdma_copy_t2t_sub_window(struct ac_cmdbuf *cs, const struct radeon_info 
    }
 
    ac_cmdbuf_end();
+}
+
+static bool
+ac_sdma_check_t2t_alignment(const struct radeon_info *const info,
+                            const struct ac_sdma_surf *const src,
+                            const struct ac_sdma_surf *const dst,
+                            const uint32_t width,
+                            const uint32_t height,
+                            const uint32_t depth)
+{
+   const enum sdma_version ver = info->sdma_ip_version;
+   const unsigned log2bpp = util_logbase2(src->bpp);
+   uint32_t x_alignment = 1;
+   uint32_t y_alignment = 1;
+   uint32_t z_alignment = 1;
+
+   if (ver >= SDMA_4_0) {
+      bool needs_3d_alignment = src->surf->u.gfx9.resource_type == RADEON_RESOURCE_3D;
+
+      /* Only for 3D standard/displayable swizzle modes. */
+      if (ver < SDMA_7_0)
+         needs_3d_alignment &= (src->surf->micro_tile_mode == RADEON_MICRO_MODE_DISPLAY ||
+                                src->surf->micro_tile_mode == RADEON_MICRO_MODE_STANDARD);
+
+      x_alignment = needs_3d_alignment
+                    ? ac_sdma_t2t_alignment_3d[log2bpp][0]
+                    : ac_sdma_t2t_alignment_2d_and_planar[log2bpp][0];
+      y_alignment = needs_3d_alignment
+                    ? ac_sdma_t2t_alignment_3d[log2bpp][1]
+                    : ac_sdma_t2t_alignment_2d_and_planar[log2bpp][1];
+      z_alignment = needs_3d_alignment
+                    ? ac_sdma_t2t_alignment_3d[log2bpp][2]
+                    : ac_sdma_t2t_alignment_2d_and_planar[log2bpp][2];
+   } else {
+      const uint32_t src_tile_index = ac_surface_get_legacy_tiling_index(src->surf, src->first_level, src->is_stencil);
+      const uint32_t src_tile_mode = info->si_tile_mode_array[src_tile_index];
+      const uint32_t src_array_mode = G_009910_ARRAY_MODE(src_tile_mode);
+
+      x_alignment = 8;
+      y_alignment = 8;
+
+      if (G_009910_MICRO_TILE_MODE_NEW(src_tile_mode) == V_009910_ADDR_SURF_THICK_MICRO_TILING)
+         z_alignment = ac_sdma_t2t_thick_z_alignment_sdma2[src_array_mode];
+   }
+
+   return util_is_aligned(width, x_alignment) &&
+          util_is_aligned(height, y_alignment) &&
+          util_is_aligned(depth, z_alignment) &&
+          util_is_aligned(src->offset.x, x_alignment) &&
+          util_is_aligned(src->offset.y, y_alignment) &&
+          util_is_aligned(src->offset.z, z_alignment) &&
+          util_is_aligned(dst->offset.x, x_alignment) &&
+          util_is_aligned(dst->offset.y, y_alignment) &&
+          util_is_aligned(dst->offset.z, z_alignment);
+}
+
+/**
+ * The SDMA has severe limitations on every AMD GPU generation
+ * when copying a tiled image to another tiled image.
+ *
+ * When the HW requirements are met, we can use the built-in
+ * SDMA T2T subwindow copy packet which should be the
+ * most optimal.
+ *
+ * When the limitations are NOT met, we must use a workaround:
+ * Copy the tiled image to a temporary linear buffer,
+ * then copy the linear buffer to the destination image.
+ * This is done by small chunks ("scanlines") so that
+ * the temporary buffer doesn't have to be arbitrarily big.
+ * The workaround is called a T2T scanline copy.
+ *
+ * Return true if the T2T scanline copy workaround is required.
+ * Return false if the T2T subwindow packet can be used.
+ */
+bool
+ac_sdma_use_t2t_scanline_copy(const struct radeon_info *const info,
+                              const struct ac_sdma_surf *const src,
+                              const struct ac_sdma_surf *const dst,
+                              const uint32_t width,
+                              const uint32_t height,
+                              const uint32_t depth)
+{
+   /* These need a linear-to-linear / linear-to-tiled copy. */
+   if (src->surf->is_linear || dst->surf->is_linear)
+      return false;
+
+   /* SDMA can't do format conversion. */
+   assert(src->bpp == dst->bpp);
+
+   const enum sdma_version ver = info->sdma_ip_version;
+   if (ver < SDMA_5_0) {
+      /* SDMA v4.x and older doesn't support proper mip level selection. */
+      if (src->num_levels > 1 || dst->num_levels > 1)
+         return true;
+   }
+
+   /* Before SDMA 7, the T2T subwindow copy packet only has fields for one metadata configuration.
+    * It can either compress or decompress, or copy uncompressed images, but it can't copy from a
+    * compressed image to another.
+    */
+   if (ver < SDMA_7_0 && src->is_compressed && dst->is_compressed)
+      return true;
+
+   if (ver >= SDMA_7_0) {
+      /* No support for tiling format transformation at all. */
+      if (src->surf->u.gfx9.swizzle_mode != dst->surf->u.gfx9.swizzle_mode)
+         return true;
+   } else {
+      /* The two images can have a different block size, but must have the same swizzle mode. */
+      if (src->surf->micro_tile_mode != dst->surf->micro_tile_mode)
+         return true;
+   }
+
+   if (!ac_sdma_check_t2t_alignment(info, src, dst, width, height, depth))
+      return true;
+
+   if (ver < SDMA_6_0 &&
+       ((src->img_format == PIPE_FORMAT_S8_UINT && dst->is_color) ||
+        (src->is_color && dst->img_format == PIPE_FORMAT_S8_UINT))) {
+      /* Color<->stencil only T2T subwindow copies don't work on SDMA5 and older.
+       * Fallback to scanline copies as a workaround.
+       */
+      return true;
+   }
+
+   return false;
+}
+
+/**
+ * The SDMA has some alignment requirements on
+ * L2T (linear to tiled, ie. buffer to image) and
+ * T2L (tiled to linear, ie. image to buffer) copies.
+ *
+ * When the HW requirements are met, we can use a
+ * single tiled subwindow copy packet to perform the copy,
+ * which performs best.
+ *
+ * When the HW requirements are NOT met, we must use a workaround.
+ * The workaround is to do an aligned copy to a temporary buffer first,
+ * and another aligned copy from the temporary to the destination.
+ *
+ * Return true if the unaligned copy workaround is required.
+ * Return false if a single tiled subwindow packet can be used.
+ */
+bool
+ac_sdma_use_unaligned_buffer_image_copy(const struct radeon_info *const info,
+                                        const struct ac_sdma_surf *const buf,
+                                        const struct ac_sdma_surf *const img,
+                                        const uint32_t width,
+                                        const uint32_t height,
+                                        const uint32_t depth)
+{
+   const enum sdma_version ver = info->sdma_ip_version;
+
+   if (ver < SDMA_4_0) {
+      /* SDMA2-3 seems to access memory before the linear buffer's VA
+       * when the image is tiled and the offset isn't aligned to
+       * microtile width (8 pixels) or 16 bytes, causing page faults.
+       * This issue isn't documented or acknowledged by AMD.
+       */
+      if (!img->surf->is_linear &&
+          !(util_is_aligned(img->offset.x, 8) ||
+            util_is_aligned(img->offset.x * img->bpp, 16)))
+         return true;
+
+      /* SDMA2-3 HW requirements for L2L/L2T/T2L copies:
+       * Tiled surface must be 256-byte aligned.
+       * Linear surface needs to be dword-aligned.
+       * Linear pitch (and slice pitch) needs to be dword-aligned.
+       * Linear and tiled offset X need to be dword-aligned
+       * (multiple of 4 for 8 bits per pixel, multiple of 2 for 16 bits per pixel).
+       */
+      return !util_is_aligned(img->offset.x * img->bpp, 4) ||
+             !util_is_aligned(buf->va, 4) ||
+             !util_is_aligned(buf->pitch, 4) ||
+             !util_is_aligned(buf->slice_pitch, 4) ||
+             !util_is_aligned(width * img->bpp, 4);
+   }
+
+   const uint32_t required_pitch_alignment = ver >= SDMA_5_0 ? MAX2(1, 4 / img->bpp) : 4;
+
+   if (!util_is_aligned(buf->pitch, required_pitch_alignment))
+      return true;
+
+   const bool uses_depth = img->offset.z != 0 || depth != 1;
+   if (!img->surf->is_linear && uses_depth) {
+      if (!util_is_aligned(buf->slice_pitch, required_pitch_alignment))
+         return true;
+   }
+
+   return false;
 }

@@ -81,8 +81,8 @@ radv_use_tc_compat_htile_for_image(struct radv_device *device, const struct radv
    /* Do not enable TC-compatible HTILE if the image isn't readable by a
     * shader because no texture fetches will happen.
     */
-   if (!(image->vk.usage &
-         (VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR | VK_IMAGE_USAGE_2_INPUT_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR)))
+   if (!(image->vk.usage & (VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR | VK_IMAGE_USAGE_2_INPUT_ATTACHMENT_BIT_KHR |
+                            VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR)))
       return false;
 
    if (pdev->info.gfx_level < GFX9) {
@@ -383,8 +383,8 @@ radv_use_tc_compat_cmask_for_image(struct radv_device *device, struct radv_image
    /* Do not enable TC-compatible if the image isn't readable by a shader
     * because no texture fetches will happen.
     */
-   if (!(image->vk.usage &
-         (VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR | VK_IMAGE_USAGE_2_INPUT_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR)))
+   if (!(image->vk.usage & (VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR | VK_IMAGE_USAGE_2_INPUT_ATTACHMENT_BIT_KHR |
+                            VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR)))
       return false;
 
    /* If the image doesn't have FMASK, it can't be fetchable. */
@@ -596,7 +596,8 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
    }
 
    if (image->vk.image_type == VK_IMAGE_TYPE_3D) {
-      if ((image->vk.usage & VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR) && !(image->vk.usage & VK_IMAGE_USAGE_2_STORAGE_BIT_KHR)) {
+      if ((image->vk.usage & VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR) &&
+          !(image->vk.usage & VK_IMAGE_USAGE_2_STORAGE_BIT_KHR)) {
          /* Select a 2D swizzle mode for 3D CB render targets because it's optimal regardless of the
           * access pattern (CB prefers thin tiling). This optimization isn't applied to images that
           * can be used as storage because it mostly depends on the access pattern, and it's really
@@ -647,19 +648,21 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
        vk_format_get_blocksizebits(image_format) == 128 && vk_format_is_compressed(image_format))
       flags |= RADEON_SURF_NO_RENDER_TARGET;
 
-   if (!radv_use_dcc_for_image_early(device, image, pCreateInfo, image_format, &image->dcc_sign_reinterpret))
+   if (pdev->info.gfx_level < GFX12 &&
+       !radv_use_dcc_for_image_early(device, image, pCreateInfo, image_format, &image->dcc_sign_reinterpret))
       flags |= RADEON_SURF_DISABLE_DCC;
 
    if (!radv_use_fmask_for_image(device, image))
       flags |= RADEON_SURF_NO_FMASK;
 
    if (image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_RESIDENCY_BIT_KHR) {
-      flags |= RADEON_SURF_PRT | RADEON_SURF_NO_FMASK | RADEON_SURF_NO_HTILE | RADEON_SURF_DISABLE_DCC;
+      flags |= RADEON_SURF_PRT | RADEON_SURF_NO_FMASK | RADEON_SURF_NO_HTILE |
+               (pdev->info.gfx_level < GFX12 ? RADEON_SURF_DISABLE_DCC : 0);
    }
 
    /* Disable DCC for VRS rate images because the hw can't handle compression. */
    if (image->vk.usage & VK_IMAGE_USAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
-      flags |= RADEON_SURF_VRS_RATE | RADEON_SURF_DISABLE_DCC;
+      flags |= RADEON_SURF_VRS_RATE | (pdev->info.gfx_level < GFX12 ? RADEON_SURF_DISABLE_DCC : 0);
    if (!(image->vk.usage & (VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR | VK_IMAGE_USAGE_2_STORAGE_BIT_KHR)))
       flags |= RADEON_SURF_NO_TEXTURE;
    if (image->vk.usage & (VK_IMAGE_USAGE_2_VIDEO_DECODE_DPB_BIT_KHR | VK_IMAGE_USAGE_2_VIDEO_ENCODE_DPB_BIT_KHR) &&
@@ -682,8 +685,9 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
       bool is_4k_capable;
 
       if (!vk_format_is_depth_or_stencil(image_format)) {
-         is_4k_capable = !(image->vk.usage & VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR) &&
-                         (flags & RADEON_SURF_DISABLE_DCC) && (flags & RADEON_SURF_NO_FMASK);
+         is_4k_capable =
+            !(image->vk.usage & VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR) &&
+            (pdev->info.gfx_level >= GFX12 || ((flags & RADEON_SURF_DISABLE_DCC) && (flags & RADEON_SURF_NO_FMASK)));
       } else {
          /* Depth-stencil format without DEPTH_STENCIL usage does not work either. */
          is_4k_capable = false;
@@ -696,7 +700,8 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
    }
 
    if (image->vk.usage & VK_IMAGE_USAGE_2_HOST_TRANSFER_BIT_KHR)
-      flags |= RADEON_SURF_HOST_TRANSFER | RADEON_SURF_NO_FMASK | RADEON_SURF_NO_HTILE | RADEON_SURF_DISABLE_DCC;
+      flags |= RADEON_SURF_HOST_TRANSFER | RADEON_SURF_NO_FMASK | RADEON_SURF_NO_HTILE |
+               (pdev->info.gfx_level < GFX12 ? RADEON_SURF_DISABLE_DCC : 0);
 
    return flags;
 }
@@ -889,7 +894,8 @@ radv_image_is_l2_coherent(const struct radv_device *device, const struct radv_im
       return !radv_image_is_pipe_misaligned(image, range);
    } else if (pdev->info.gfx_level == GFX9) {
       if (image->vk.samples == 1 &&
-          (image->vk.usage & (VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_2_DEPTH_STENCIL_ATTACHMENT_BIT_KHR)) &&
+          (image->vk.usage &
+           (VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_2_DEPTH_STENCIL_ATTACHMENT_BIT_KHR)) &&
           !vk_format_has_stencil(image->vk.format)) {
          /* Single-sample color and single-sample depth
           * (not stencil) are coherent with shaders on
@@ -1702,10 +1708,10 @@ radv_layout_fmask_compression(const struct radv_device *device, const struct rad
    switch (layout) {
    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-      /* Don't compress images but no need to expand FMASK. */
+      /* FMASK is in a decompressed state (after FMASK_DECOMPRESS). */
       return RADV_FMASK_COMPRESSION_PARTIAL;
    case VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT:
-      /* Don't compress images that are in feedback loops. */
+      /* FMASK is in an expanded state (identity mapping). */
       return RADV_FMASK_COMPRESSION_NONE;
    default:
       /* Don't compress images that are concurrent. */
@@ -1724,12 +1730,20 @@ radv_image_queue_family_mask(const struct radv_image *image, enum radv_queue_fam
 }
 
 bool
-radv_image_is_renderable(const struct radv_image *image)
+radv_image_is_renderable(const struct radv_physical_device *pdev, const struct radv_image *image)
 {
    if (vk_format_is_96bit(image->vk.format))
       return false;
 
    if (image->planes[0].surface.flags & RADEON_SURF_NO_RENDER_TARGET)
+      return false;
+
+   /* TODO: investigate Fiji.
+    * GFX copy/clear on sparse images sometimes causes page faults on Fiji.
+    * Note that this issue is not documented or acknowledged by AMD.
+    * Prefer the compute shader code path until this is better investigated.
+    */
+   if (pdev->info.family == CHIP_FIJI && (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT))
       return false;
 
    return true;

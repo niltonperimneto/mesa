@@ -1112,27 +1112,6 @@ radv_pipeline_init_dynamic_state(const struct radv_device *device, struct radv_g
    pipeline->dynamic_state.mask = states;
 }
 
-struct radv_shader *
-radv_get_shader(struct radv_shader *const *shaders, mesa_shader_stage stage)
-{
-   if (stage == MESA_SHADER_VERTEX) {
-      if (shaders[MESA_SHADER_VERTEX])
-         return shaders[MESA_SHADER_VERTEX];
-      if (shaders[MESA_SHADER_TESS_CTRL])
-         return shaders[MESA_SHADER_TESS_CTRL];
-      if (shaders[MESA_SHADER_GEOMETRY])
-         return shaders[MESA_SHADER_GEOMETRY];
-   } else if (stage == MESA_SHADER_TESS_EVAL) {
-      if (!shaders[MESA_SHADER_TESS_CTRL])
-         return NULL;
-      if (shaders[MESA_SHADER_TESS_EVAL])
-         return shaders[MESA_SHADER_TESS_EVAL];
-      if (shaders[MESA_SHADER_GEOMETRY])
-         return shaders[MESA_SHADER_GEOMETRY];
-   }
-   return shaders[stage];
-}
-
 static bool
 radv_should_export_multiview(const struct radv_shader_stage *stage, const struct radv_graphics_state_key *gfx_state)
 {
@@ -2109,7 +2088,8 @@ radv_create_gs_copy_shader(const struct radv_compiler_info *compiler_info, struc
                                                        .wave_size = 64,
                                                        .workgroup_size = 64,
                                                        .use_llvm = compiler_info->key.use_llvm});
-   NIR_PASS(_, nir, radv_nir_lower_abi, compiler_info->ac->gfx_level, &gs_copy_stage, gfx_state, compiler_info->hw.address32_hi);
+   NIR_PASS(_, nir, radv_nir_lower_abi, compiler_info->ac->gfx_level, &gs_copy_stage, gfx_state,
+            compiler_info->hw.address32_hi);
 
    NIR_PASS(_, nir, ac_nir_lower_global_access, compiler_info->ac->gfx_level);
    NIR_PASS(_, nir, nir_lower_int64);
@@ -2884,10 +2864,9 @@ radv_generate_graphics_pipeline_state(struct radv_device *device, const VkGraphi
       }
    }
 
-   result = vk_graphics_pipeline_state_fill(&device->vk, &gfx_state->vk, pCreateInfo,
-                                            NULL /* driver_mv */, NULL /* driver_rp */,
-                                            0, NULL, NULL,
-                                            VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, &gfx_state->vk_data);
+   result = vk_graphics_pipeline_state_fill(&device->vk, &gfx_state->vk, pCreateInfo, NULL /* driver_mv */,
+                                            NULL /* driver_rp */, 0, NULL, NULL, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
+                                            &gfx_state->vk_data);
    if (result != VK_SUCCESS)
       goto fail;
 
@@ -3412,9 +3391,8 @@ radv_graphics_lib_pipeline_init(struct radv_graphics_lib_pipeline *pipeline, str
       }
    }
 
-   result = vk_graphics_pipeline_state_fill(&device->vk, state, pCreateInfo,
-                                            NULL /* driver_mv */, NULL /* driver_rp */, 0, NULL, NULL,
-                                            VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, &pipeline->state_data);
+   result = vk_graphics_pipeline_state_fill(&device->vk, state, pCreateInfo, NULL /* driver_mv */, NULL /* driver_rp */,
+                                            0, NULL, NULL, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, &pipeline->state_data);
    if (result != VK_SUCCESS)
       return result;
 

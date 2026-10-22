@@ -705,6 +705,8 @@ etna_create_shader_state(struct pipe_context *pctx,
    if (ctx->mag_switchover_half)
       gather_tex_lod_samplers(shader->nir, &shader->tex_lod_samplers);
 
+   shader->textures_used = shader->nir->info.textures_used[0];
+
    etna_disk_cache_init_shader_key(screen, shader);
 
    if (initial_variants_synchronous(ctx)) {
@@ -759,8 +761,7 @@ etna_set_max_shader_compiler_threads(struct pipe_screen *pscreen,
 {
    struct etna_screen *screen = etna_screen(pscreen);
 
-   util_queue_adjust_num_threads(&screen->shader_compiler_queue, max_threads,
-                                 false);
+   util_queue_adjust_num_threads(&screen->shader_compiler_queue, max_threads);
 }
 
 static bool

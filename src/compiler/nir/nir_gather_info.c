@@ -736,6 +736,7 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
    case nir_intrinsic_load_is_indexed_draw:
    case nir_intrinsic_load_base_instance:
    case nir_intrinsic_load_draw_id:
+   case nir_intrinsic_load_draw_id_offset_ir3:
    case nir_intrinsic_load_invocation_id:
    case nir_intrinsic_load_frag_coord:
    case nir_intrinsic_load_pixel_coord:
@@ -1005,6 +1006,7 @@ gather_tex_info(nir_tex_instr *instr, nir_shader *shader)
    case nir_texop_txs:
    case nir_texop_query_levels:
    case nir_texop_texture_samples:
+   case nir_texop_resinfo_intel:
       shader->info.uses_resource_info_query = true;
       break;
    default:

@@ -26,6 +26,7 @@
 
 #include "etnaviv_clear_blit.h"
 
+#include "layout/eil_format.h"
 #include "hw/common.xml.h"
 
 #include "etnaviv_blt.h"
@@ -435,7 +436,8 @@ etna_copy_resource_box(struct pipe_context *pctx, struct pipe_resource *dst,
 
    ctx->blit_rb_swap = rb_swap;
 
-   enum pipe_format format = translate_emulated_format_z32f(dst->format);
+   /* Get format that is used as replacement if format is emulated */
+   enum pipe_format format = eil_format_emulated(dst->format);
 
    struct pipe_blit_info blit = {};
    blit.mask = util_format_get_mask(format);
@@ -483,7 +485,7 @@ etna_clear_blit_init(struct pipe_context *pctx)
    pctx->resource_copy_region = etna_resource_copy_region;
    pctx->flush_resource = etna_flush_resource;
 
-   if (screen->specs.use_blt)
+   if (VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE))
       etna_clear_blit_blt_init(pctx);
    else
       etna_clear_blit_rs_init(pctx);

@@ -267,7 +267,7 @@ estimate_block_cycles(jay_function *f, jay_block *block)
 
       if (0) {
          printf("%4u: ", cycle);
-         jay_print_inst(stdout, f, I);
+         jay_print_inst(stderr, f, I);
       }
 
       unsigned ready_cycle = cycle + jay_latency(shader, I, false);
@@ -298,11 +298,10 @@ estimate_block_cycles(jay_function *f, jay_block *block)
 unsigned
 jay_estimate_cycles(jay_function *f)
 {
-   unsigned cycles = 0;
+   float cycles = 0;
 
    jay_foreach_block(f, block) {
-      /* TODO: Scale by block repetition */
-      cycles += estimate_block_cycles(f, block);
+      cycles += block->weight * (float) estimate_block_cycles(f, block);
    }
 
    return cycles;

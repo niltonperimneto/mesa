@@ -88,8 +88,8 @@ struct gfxstream_vk_instance {
 
     struct gfxstream_vk_object_common common;
 
-    uint32_t api_version;
-    bool init_failed;
+    uint32_t api_version = 0;
+    bool init_failed = false;
 };
 VK_DEFINE_HANDLE_CASTS(gfxstream_vk_instance, base.base, VkInstance, VK_OBJECT_TYPE_INSTANCE)
 GFXSTREAM_DECLARE_VK_OBJECT(gfxstream_vk_instance, VkInstance)
@@ -102,7 +102,6 @@ struct gfxstream_vk_physical_device {
 
     struct wsi_device wsi_device;
     const struct vk_sync_type* sync_types[2];
-    struct gfxstream_vk_instance* instance;
     bool doImageDrmFormatModifierEmulation;
 };
 VK_DEFINE_HANDLE_CASTS(gfxstream_vk_physical_device, base.base, VkPhysicalDevice,
@@ -121,6 +120,8 @@ struct gfxstream_vk_device {
     /* unique queue family indices in which to create the device queues */
     uint32_t* queue_families;
     uint32_t queue_family_count;
+
+    uint32_t api_version = 0;
 };
 VK_DEFINE_HANDLE_CASTS(gfxstream_vk_device, base.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 GFXSTREAM_DECLARE_VK_OBJECT(gfxstream_vk_device, VkDevice)
@@ -247,10 +248,26 @@ struct gfxstream_vk_device_memory {
     // Must be first member.
     struct vk_object_base base;
     struct gfxstream_vk_object_common common;
+    void* mapped = nullptr;
+    uint64_t mapped_size = 0;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(gfxstream_vk_device_memory, base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
 GFXSTREAM_DECLARE_VK_OBJECT(gfxstream_vk_device_memory, VkDeviceMemory)
+
+static inline uint8_t* gfxstream_vk_device_memory_get_ptr(VkDeviceMemory memory) {
+    VK_FROM_HANDLE(gfxstream_vk_device_memory, gfxstream_memory, memory);
+    if (!gfxstream_memory) return nullptr;
+
+    return static_cast<uint8_t*>(gfxstream_memory->mapped);
+}
+
+static inline VkDeviceSize gfxstream_vk_device_memory_get_ptr_size(VkDeviceMemory memory) {
+    VK_FROM_HANDLE(gfxstream_vk_device_memory, gfxstream_memory, memory);
+    if (!gfxstream_memory) return 0;
+
+    return gfxstream_memory->mapped_size;
+}
 
 struct gfxstream_vk_image {
     // Must be first member.

@@ -1494,7 +1494,6 @@ generate_fs_loop(struct gallivm_state *gallivm,
  *
  * @param type            fragment shader type (4x or 8x float)
  * @param num_fs          number of fs_src
- * @param is_1d           whether we're outputting to a 1d resource
  * @param dst_channels    number of output channels
  * @param fs_src          output from fragment shader
  * @param dst             pointer to store result
@@ -1800,6 +1799,30 @@ store_unswizzled_block(struct gallivm_state *gallivm,
    }
 }
 
+
+
+/**
+ * Byte-swap each element of 'width' bits in a block of pixels in the memory
+ * layout of a format.
+ */
+static LLVMValueRef
+bswap_unswizzled_block(struct gallivm_state *gallivm,
+                       LLVMValueRef block,
+                       unsigned width)
+{
+   LLVMBuilderRef builder = gallivm->builder;
+   LLVMTypeRef block_type = LLVMTypeOf(block);
+   LLVMTypeRef int_type = LLVMIntTypeInContext(gallivm->context, width);
+   char intr_str[256];
+
+   if (LLVMGetTypeKind(block_type) == LLVMVectorTypeKind)
+      int_type = LLVMVectorType(int_type, LLVMGetVectorSize(block_type));
+
+   block = LLVMBuildBitCast(builder, block, int_type, "");
+   lp_format_intrinsic(intr_str, sizeof(intr_str), "llvm.bswap", int_type);
+   block = lp_build_intrinsic_unary(builder, intr_str, int_type, block);
+   return LLVMBuildBitCast(builder, block, block_type, "");
+}
 
 
 /**
@@ -3083,6 +3106,11 @@ generate_unswizzled_blend(struct gallivm_state *gallivm,
     * It seems some cleanup could be done here (like skipping conversion/blend
     * when not needed).
     */
+   if (out_format_desc->is_byte_swapped) {
+      for (unsigned i = 0; i < src_count; ++i)
+         dst[i] = bswap_unswizzled_block(gallivm, dst[i], dst_type.width);
+   }
+
    convert_to_blend_type(gallivm, block_size, out_format_desc, dst_type,
                          row_type, dst, src_count);
 
@@ -3112,6 +3140,11 @@ generate_unswizzled_blend(struct gallivm_state *gallivm,
 
    convert_from_blend_type(gallivm, block_size, out_format_desc,
                            row_type, dst_type, dst, src_count);
+
+   if (out_format_desc->is_byte_swapped) {
+      for (unsigned i = 0; i < src_count; ++i)
+         dst[i] = bswap_unswizzled_block(gallivm, dst[i], dst_type.width);
+   }
 
    /* Split the blend rows back to memory rows */
    if (dst_count > src_count) {

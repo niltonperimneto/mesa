@@ -45,6 +45,7 @@
 #include "util/u_transfer.h"
 #include "util/u_transfer_helper.h"
 
+#include "layout/eil_format.h"
 #include "hw/common_3d.xml.h"
 
 #include "drm-uapi/drm_fourcc.h"
@@ -276,7 +277,7 @@ etna_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
          /* map buffer object */
          if (rsc->layout == ETNA_LAYOUT_TILED) {
             for (unsigned z = 0; z < ptrans->box.depth; z++) {
-               if (format_is_128bit(rsc->base.format)) {
+               if (eil_format_is_emulated_128bit(rsc->base.format)) {
                   etna_texture_tile_rgba32f(
                      trans->mapped + (ptrans->box.z + z) * res_level->layer_stride,
                      trans->staging + z * ptrans->layer_stride,
@@ -398,7 +399,7 @@ etna_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc,
       rsc = etna_resource(rsc->texture);
    } else if (etna_resource_level_ts_valid(res_level) ||
               (rsc->layout != ETNA_LAYOUT_LINEAR &&
-               etna_format_hw_tileable(screen->specs.use_blt, rsc->internal_format) &&
+               etna_format_hw_tileable(VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE), rsc->internal_format) &&
                /* HALIGN 4 resources are incompatible with the resolve engine,
                 * so fall back to using software to detile this resource. */
                rsc->halign != TEXTURE_HALIGN_FOUR)) {
@@ -414,7 +415,7 @@ etna_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc,
          return NULL;
       }
 
-      if (!screen->specs.use_blt) {
+      if (!VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE)) {
          /* Need to align the transfer region to satisfy RS restrictions, as we
           * really want to hit the RS blit path here.
           */
@@ -553,7 +554,7 @@ etna_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc,
       if (usage & PIPE_MAP_READ) {
          if (rsc->layout == ETNA_LAYOUT_TILED) {
             for (unsigned z = 0; z < ptrans->box.depth; z++) {
-               if (format_is_128bit(rsc->base.format)) {
+               if (eil_format_is_emulated_128bit(rsc->base.format)) {
                   etna_texture_untile_rgba32f(trans->staging + z * ptrans->layer_stride,
                                     trans->mapped + (ptrans->box.z + z) * res_level->layer_stride,
                                     ptrans->box.x, ptrans->box.y, res_level->stride,

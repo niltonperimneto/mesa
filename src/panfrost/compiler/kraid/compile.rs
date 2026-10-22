@@ -4,7 +4,7 @@
 use crate::data_type::NumericType;
 use crate::debug::*;
 use crate::ir::*;
-use crate::model::model_for_gpu_id;
+use crate::model::model_for_arch;
 use crate::ops::OpNop;
 use compiler::bindings::*;
 use compiler::memstream::MemStream;
@@ -57,8 +57,6 @@ fn nir_opts(arch: u8, merge_wg: bool) -> nir_shader_compiler_options {
             | nir_lower_shift64
             | nir_lower_imul_2x32_64),
         lower_fisnormal: true,
-        lower_uadd_carry: true,
-        lower_usub_borrow: true,
 
         has_ldexp: true,
         has_isub: true,
@@ -269,7 +267,8 @@ pub extern "C" fn kraid_compile_nir(
     info: &mut pan_shader_info,
     idvs: kraid_idvs_mode,
 ) {
-    let model = model_for_gpu_id(inputs.gpu_id, inputs.gpu_variant).unwrap();
+    let model =
+        model_for_arch(inputs.arch.try_into().unwrap(), inputs.model).unwrap();
 
     if DEBUG.contains(DebugFlags::PRINT) {
         eprint!("{}", nir.to_string().unwrap());
@@ -281,9 +280,13 @@ pub extern "C" fn kraid_compile_nir(
     pass!(s.remat_constants());
     pass!(s.widen_alu_ops());
     pass!(s.legalize_src_swizzles());
-    pass!(s.opt_copy_prop());
-    while pass!(s.opt_dst_mod_prop()) {
+
+    let mut progress = true;
+    while progress {
+        progress = false;
         pass!(s.opt_copy_prop());
+        progress |= pass!(s.opt_dst_mod_prop());
+        progress |= pass!(s.opt_fuse());
     }
     pass!(s.lower_mkvec_swz());
     pass!(s.opt_var());
@@ -334,11 +337,13 @@ pub extern "C" fn kraid_compile_nir(
         }
         stats
     } else {
+        let va_stats = valhall_stats {
+            threads: model.max_threads(0).into(),
+            ..Default::default()
+        };
         pan_stats {
             isa: PAN_STAT_VALHALL,
-            __bindgen_anon_1: pan_stats__bindgen_ty_1 {
-                valhall: valhall_stats::default(),
-            },
+            __bindgen_anon_1: pan_stats__bindgen_ty_1 { valhall: va_stats },
         }
     };
 
@@ -349,7 +354,7 @@ pub extern "C" fn kraid_compile_nir(
     }
 
     write_back_info(model.as_ref(), &s.info, nir, info, idvs);
-    unsafe { pan_shader_update_info(info, nir, inputs) };
+    unsafe { pan_shader_update_info(info, nir, model.arch().into()) };
 
     if DEBUG.contains(DebugFlags::STATS) {
         let mut stream = MemStream::new().expect("Failed to open memstream");
@@ -358,20 +363,17 @@ pub extern "C" fn kraid_compile_nir(
             // Both binding crates generate their own stdio FILE, those are the
             // same type underneath
             let f = stream.c_file() as *mut kraid_bindings::FILE;
-            let prefix =
-                kraid_shader_stage_name(nir.info.stage(), inputs.is_blend);
-
-            pan_stats_verbose_prologue(
-                f,
-                prefix,
-                inputs.gpu_id,
-                inputs.gpu_variant,
-                model.arch().into(),
+            let prefix = kraid_shader_stage_name(
+                nir.info.stage(),
+                inputs.is_blend,
+                idvs,
             );
+
+            pan_stats_verbose_prologue(f, prefix, inputs.arch, inputs.model);
             // TODO: min/max statistics
             pan_valhall_stats_verbose(
                 f,
-                &info.stats.__bindgen_anon_1.valhall,
+                &stats.__bindgen_anon_1.valhall,
                 std::ptr::null(),
                 std::ptr::null(),
                 info.tls_size,

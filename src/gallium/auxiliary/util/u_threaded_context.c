@@ -37,6 +37,10 @@
 #include "util/thread_sched.h"
 #include "compiler/shader_info.h"
 
+#if !DETECT_OS_WINDOWS
+#include <sys/mman.h>
+#endif
+
 #if TC_DEBUG >= 1
 #define tc_assert assert
 #else
@@ -879,7 +883,7 @@ tc_add_shader_bindings_to_buffer_list(struct threaded_context *tc,
                                       mesa_shader_stage shader)
 {
    tc_add_bindings_to_buffer_list(buffer_list, tc->const_buffers[shader],
-                                  tc->max_const_buffers);
+                                  tc->num_const_buffers[shader]);
    if (tc->seen_shader_buffers[shader]) {
       tc_add_bindings_to_buffer_list(buffer_list, tc->shader_buffers[shader],
                                      tc->max_shader_buffers);
@@ -901,7 +905,7 @@ tc_rebind_shader_bindings(struct threaded_context *tc, uint32_t old_id,
    unsigned ubo = 0, ssbo = 0, img = 0, sampler = 0;
 
    ubo = tc_rebind_bindings(old_id, new_id, tc->const_buffers[shader],
-                            tc->max_const_buffers);
+                            tc->num_const_buffers[shader]);
    if (ubo)
       *rebind_mask |= BITFIELD64_BIT(TC_BINDING_UBO_VS) << shader;
    if (tc->seen_shader_buffers[shader]) {
@@ -1079,17 +1083,30 @@ tc_is_buffer_on_busy_list(const struct threaded_context *tc, const struct thread
 {
    uint32_t id_hash = tbuf->buffer_id_unique & TC_BUFFER_ID_MASK;
 
-   for (unsigned i = 0; i < TC_MAX_BUFFER_LISTS; i++) {
+   unsigned i = tc->next_buf_list;
+
+   for (unsigned n = 0; n < TC_MAX_BUFFER_LISTS; n++) {
       struct tc_buffer_list *buf_list = (void*)&tc->buffer_lists[i];
+
+      /* Buffer lists are used and flushed in ring order, so all lists which are older than
+       * a flushed one have been flushed too. */
+      if (util_queue_fence_is_signalled(&buf_list->driver_flushed_fence))
+         break;
 
       /* If the buffer is referenced by a batch that hasn't been flushed (by tc or the driver),
        * then the buffer is considered busy. */
-      if (!util_queue_fence_is_signalled(&buf_list->driver_flushed_fence) &&
-          BITSET_TEST(buf_list->buffer_list, id_hash))
+      if (BITSET_TEST(buf_list->buffer_list, id_hash))
          return true;
+
+      i = i ? i - 1 : TC_MAX_BUFFER_LISTS - 1;
    }
    return false;
 }
+
+/* The number of "busy" replies from is_resource_busy after which the driver isn't asked again until
+ * it flushes.
+ */
+#define TC_MAX_BUSY_REPLIES 8
 
 static bool
 tc_is_buffer_busy(struct threaded_context *tc, struct threaded_resource *tbuf,
@@ -1101,9 +1118,20 @@ tc_is_buffer_busy(struct threaded_context *tc, struct threaded_resource *tbuf,
    if (tc_is_buffer_on_busy_list(tc, tbuf))
       return true;
 
+   /* Asking the driver can cost a syscall per query. Once it has replied "busy" a few times, assume
+    * that buffers stay busy until the driver submits more work. A wrong "busy" only costs
+    * an invalidation or a synchronized mapping.
+    */
+   if (p_atomic_read_relaxed(&tc->num_busy_replies) >= TC_MAX_BUSY_REPLIES)
+      return true;
+
    /* The buffer isn't referenced by any unflushed batch: we can safely ask to the driver whether
     * this buffer is busy or not. */
-   return tc->options.is_resource_busy(tc->pipe->screen, tbuf->latest, map_usage);
+   if (!tc->options.is_resource_busy(tc->pipe->screen, tbuf->latest, map_usage))
+      return false;
+
+   p_atomic_inc(&tc->num_busy_replies);
+   return true;
 }
 
 /**
@@ -1123,6 +1151,12 @@ threaded_resource_init(struct pipe_resource *res, bool allow_cpu_storage)
    tres->pending_staging_uploads = 0;
    tres->last_batch_usage = -1;
    util_range_init(&tres->pending_staging_uploads_range);
+
+   tres->clientptr_storage = NULL;
+   tres->cpu_storage_map_count = 0;
+   tres->clientptr_heap_link.next = NULL;
+   tres->clientptr_heap_link.prev = NULL;
+   simple_mtx_init(&tres->cpu_storage_lock, mtx_plain);
 
    if (allow_cpu_storage &&
        !(res->flags & (PIPE_RESOURCE_FLAG_MAP_PERSISTENT |
@@ -1145,7 +1179,12 @@ threaded_resource_deinit(struct pipe_resource *res)
            pipe_resource_reference(&tres->latest, NULL);
    util_range_destroy(&tres->valid_buffer_range);
    util_range_destroy(&tres->pending_staging_uploads_range);
+
+   threaded_resource_free_clientptr_storage(tres);
+
    align_free(tres->cpu_storage);
+
+   simple_mtx_destroy(&tres->cpu_storage_lock);
 }
 
 struct pipe_context *
@@ -1774,6 +1813,7 @@ tc_set_constant_buffer(struct pipe_context *_pipe,
    if (buffer) {
       tc_bind_buffer(&tc->const_buffers[shader][index],
                      &tc->buffer_lists[tc->next_buf_list], buffer);
+      tc->num_const_buffers[shader] = MAX2(tc->num_const_buffers[shader], index + 1);
    } else {
       tc_unbind_buffer(&tc->const_buffers[shader][index]);
    }
@@ -2782,7 +2822,15 @@ tc_improve_map_buffer_flags(struct threaded_context *tc,
    if (usage & PIPE_MAP_UNSYNCHRONIZED) {
       usage &= ~PIPE_MAP_DISCARD_RANGE;
       usage |= TC_TRANSFER_MAP_THREADED_UNSYNC; /* notify the driver */
+
+      /* Allow driver to lock client pointer remaps on short lived unsynchronized calls */
+      if (tres->b.clientptr_heap && (usage & PIPE_MAP_SHORT_LIVED))
+         usage |= PIPE_MAP_THREAD_SAFE;
    }
+
+   /* If buffer_unmap is queued, SHORT_LIVED isn't valid */
+   if (!(usage & PIPE_MAP_THREAD_SAFE))
+      usage &= ~PIPE_MAP_SHORT_LIVED;
 
    return usage;
 }
@@ -2795,12 +2843,16 @@ tc_buffer_map(struct pipe_context *_pipe,
 {
    struct threaded_context *tc = threaded_context(_pipe);
    struct threaded_resource *tres = threaded_resource(resource);
+   struct tc_clientptr_heap *clientptr_heap = (struct tc_clientptr_heap *)tres->b.clientptr_heap;
    struct pipe_context *pipe = tc->pipe;
 
    /* PIPE_MAP_THREAD_SAFE is for glthread, which shouldn't use the CPU storage and
     * this shouldn't normally be necessary because glthread only uses large buffers.
+    *
+    * PIPE_MAP_THREAD_SAFE | PIPE_MAP_SHORT_LIVED on the other hand just means we're
+    * in the tc_buffer_subdata path for a client pointer resource
     */
-   if (usage & PIPE_MAP_THREAD_SAFE)
+   if (usage & PIPE_MAP_THREAD_SAFE && !(usage & PIPE_MAP_SHORT_LIVED))
       tc_buffer_disable_cpu_storage(resource);
 
    usage = tc_improve_map_buffer_flags(tc, tres, usage, box->x, box->width);
@@ -2809,6 +2861,12 @@ tc_buffer_map(struct pipe_context *_pipe,
    if (tres->allow_cpu_storage && !(usage & TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE)) {
       /* We can't let resource_copy_region disable the CPU storage. */
       assert(!(tres->b.flags & PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY));
+
+      /* usually cpu_storage locked to one context/thread, but clientptr_reclaim can be
+       * called from another context sharing the same heap to put cpu_storage back
+       * on the malloc allocation and free up client pointer space */
+      if (clientptr_heap)
+         simple_mtx_lock(&tres->cpu_storage_lock);
 
       if (!tres->cpu_storage) {
          tres->cpu_storage = align_malloc(resource->width0, tc->map_buffer_alignment);
@@ -2833,8 +2891,15 @@ tc_buffer_map(struct pipe_context *_pipe,
 
             tc_clear_driver_thread(tc);
          }
+
+         if (tres->cpu_storage && clientptr_heap) {
+            simple_mtx_lock(&clientptr_heap->cpu_storage_resources_lock);
+            list_addtail(&tres->clientptr_heap_link, &clientptr_heap->cpu_storage_resources);
+            simple_mtx_unlock(&clientptr_heap->cpu_storage_resources_lock);
+         }
       }
 
+      void *map = NULL;
       if (tres->cpu_storage) {
          struct threaded_transfer *ttrans = slab_zalloc(&tc->pool_transfers);
          ttrans->b.resource = resource;
@@ -2844,7 +2909,22 @@ tc_buffer_map(struct pipe_context *_pipe,
          ttrans->cpu_storage_mapped = true;
          *transfer = &ttrans->b;
 
-         return (uint8_t*)tres->cpu_storage + box->x;
+         map = (uint8_t*)tres->cpu_storage + box->x;
+
+         if (usage & PIPE_MAP_CLIENT_POINTER) {
+            map = PIPE_TRANSFER_CLIENT_POINTER;
+         } else if (clientptr_heap) { /* for subdata */
+            ttrans->clientptr_refcnt = 1;
+            ttrans->clientptr = map;
+            tres->cpu_storage_map_count++;
+         }
+      }
+
+      if (clientptr_heap)
+         simple_mtx_unlock(&tres->cpu_storage_lock);
+
+      if (map) {
+         return map;
       } else {
          tres->allow_cpu_storage = false;
       }
@@ -2857,13 +2937,30 @@ tc_buffer_map(struct pipe_context *_pipe,
       struct threaded_transfer *ttrans = slab_zalloc(&tc->pool_transfers);
       uint8_t *map;
 
-      u_upload_alloc_ref(tc->base.stream_uploader, 0,
+      if (usage & PIPE_MAP_CLIENT_POINTER) {
+         if (!tc->base.clientptr_uploader)
+            tc->base.clientptr_uploader = u_upload_clone_clientptr(&tc->base, tc->base.stream_uploader, resource->clientptr_heap);
+
+         u_upload_alloc_clientptr_ref(tc->base.clientptr_uploader,
                      box->width + (box->x % tc->map_buffer_alignment),
                      tc->map_buffer_alignment, &ttrans->b.offset,
-                     &ttrans->staging, (void**)&map);
-      if (!map) {
-         slab_free(&tc->pool_transfers, ttrans);
-         return NULL;
+                     &ttrans->staging, &ttrans->clientptr_upload);
+
+         if (!ttrans->clientptr_upload) {
+            slab_free(&tc->pool_transfers, ttrans);
+            return NULL;
+         }
+
+         map = PIPE_TRANSFER_CLIENT_POINTER;
+      } else {
+         u_upload_alloc_ref(tc->base.stream_uploader, 0,
+                        box->width + (box->x % tc->map_buffer_alignment),
+                        tc->map_buffer_alignment, &ttrans->b.offset,
+                        &ttrans->staging, (void**)&map);
+         if (!map) {
+            slab_free(&tc->pool_transfers, ttrans);
+            return NULL;
+         }
       }
 
       ttrans->b.resource = resource;
@@ -2880,6 +2977,10 @@ tc_buffer_map(struct pipe_context *_pipe,
       util_range_add(resource, &tres->pending_staging_uploads_range,
                      box->x, box->x + box->width);
 
+      if (map == PIPE_TRANSFER_CLIENT_POINTER) {
+         assert(usage & PIPE_MAP_CLIENT_POINTER);
+         return PIPE_TRANSFER_CLIENT_POINTER;
+      }
       return map + (box->x % tc->map_buffer_alignment);
    }
 
@@ -3066,11 +3167,21 @@ tc_call_buffer_unmap(struct pipe_context *pipe, void *call, struct tc_batch *bat
 }
 
 static void
+tc_transfer_unmap_clientptr_range(struct pipe_context *_pipe, struct pipe_transfer *transfer);
+
+static void
 tc_buffer_unmap(struct pipe_context *_pipe, struct pipe_transfer *transfer)
 {
    struct threaded_context *tc = threaded_context(_pipe);
    struct threaded_transfer *ttrans = threaded_transfer(transfer);
    struct threaded_resource *tres = threaded_resource(transfer->resource);
+
+   if (ttrans->cpu_storage_mapped &&
+       tres->b.clientptr_heap &&
+       !(ttrans->b.usage & PIPE_MAP_CLIENT_POINTER)) { /* subdata path */
+      tc_transfer_unmap_clientptr_range(_pipe, transfer);
+   }
+   assert(ttrans->clientptr_refcnt == 0);
 
    /* PIPE_MAP_THREAD_SAFE is only valid with UNSYNCHRONIZED. It can be
     * called from any thread and bypasses all multithreaded queues.
@@ -3190,6 +3301,250 @@ tc_texture_unmap(struct pipe_context *_pipe, struct pipe_transfer *transfer)
    }
 }
 
+/* clientptr_range for cpu_storage transfers */
+struct tc_clientptr_storage {
+   struct pipe_clientptr_range b;
+
+   /* holds the heap-allocated storage while clientptr_storage is active */
+   void *heap_storage;
+
+   struct list_head free_ranges_link;
+};
+
+void
+tc_clientptr_heap_init(struct tc_clientptr_heap *obj)
+{
+   list_inithead(&obj->cpu_storage_resources);
+   list_inithead(&obj->free_ranges);
+   simple_mtx_init(&obj->cpu_storage_resources_lock, mtx_plain);
+   simple_mtx_init(&obj->free_ranges_lock, mtx_plain);
+}
+
+void
+tc_clientptr_heap_deinit(struct tc_clientptr_heap *obj)
+{
+   struct pipe_clientptr_range range = {0};
+
+   while (tc_clientptr_reclaim(obj, true, &range)) {
+      fprintf(stderr, "leaked client pointer range %p-%p. freeing.", range.start, range.start + range.size);
+      #if !DETECT_OS_WINDOWS
+         munmap(range.start, range.size);
+      #else
+         UNREACHABLE("client ptr not supported on Windows");
+      #endif
+   }
+
+   simple_mtx_destroy(&obj->cpu_storage_resources_lock);
+   simple_mtx_destroy(&obj->free_ranges_lock);
+}
+
+static struct tc_clientptr_storage *
+threaded_resource_detach_clientptr_storage(struct threaded_resource *tres)
+{
+   simple_mtx_lock(&tres->cpu_storage_lock);
+
+   struct tc_clientptr_storage *clientptr_storage = tres->clientptr_storage;
+
+   if (!clientptr_storage || tres->cpu_storage_map_count > 0) {
+      simple_mtx_unlock(&tres->cpu_storage_lock);
+      return NULL;
+   }
+
+   assert(tres->cpu_storage == clientptr_storage->b.start);
+
+   tres->clientptr_storage = NULL;
+   memcpy(clientptr_storage->heap_storage, clientptr_storage->b.start, tres->b.width0);
+   tres->cpu_storage = clientptr_storage->heap_storage;
+   clientptr_storage->heap_storage = NULL;
+
+   simple_mtx_unlock(&tres->cpu_storage_lock);
+
+   return clientptr_storage;
+}
+
+void
+threaded_resource_free_clientptr_storage(struct threaded_resource *tres)
+{
+   struct tc_clientptr_heap *clientptr_heap = (struct tc_clientptr_heap *)tres->b.clientptr_heap;
+
+   if (!clientptr_heap) return;
+
+   struct tc_clientptr_storage *clientptr_storage = threaded_resource_detach_clientptr_storage(tres);
+   assert(!tres->clientptr_storage);
+
+   if (clientptr_storage) {
+      simple_mtx_lock(&clientptr_heap->free_ranges_lock);
+      list_addtail(&clientptr_storage->free_ranges_link, &clientptr_heap->free_ranges);
+      simple_mtx_unlock(&clientptr_heap->free_ranges_lock);
+   }
+
+   simple_mtx_lock(&clientptr_heap->cpu_storage_resources_lock);
+   if (list_is_linked(&tres->clientptr_heap_link)) {
+      list_del(&tres->clientptr_heap_link);
+   }
+   simple_mtx_unlock(&clientptr_heap->cpu_storage_resources_lock);
+}
+
+bool
+tc_clientptr_reclaim(struct tc_clientptr_heap *clientptr_heap,
+                                       bool release_all, struct pipe_clientptr_range *range)
+{
+   struct tc_clientptr_storage *clientptr_storage = NULL;
+
+   simple_mtx_lock(&clientptr_heap->free_ranges_lock);
+
+   if (!list_is_empty(&clientptr_heap->free_ranges)) {
+      clientptr_storage = list_first_entry(&clientptr_heap->free_ranges, struct tc_clientptr_storage, free_ranges_link);
+      list_del(&clientptr_storage->free_ranges_link);
+   }
+
+   simple_mtx_unlock(&clientptr_heap->free_ranges_lock);
+
+   if (clientptr_storage) {
+      *range = clientptr_storage->b;
+      FREE(clientptr_storage);
+      return true;
+   }
+
+   if (!release_all) return false;
+
+   simple_mtx_lock(&clientptr_heap->cpu_storage_resources_lock);
+
+   list_for_each_entry(struct threaded_resource, tres, &clientptr_heap->cpu_storage_resources, clientptr_heap_link) {
+      clientptr_storage = threaded_resource_detach_clientptr_storage(tres);
+      if (clientptr_storage) break;
+   }
+
+   simple_mtx_unlock(&clientptr_heap->cpu_storage_resources_lock);
+
+   if (clientptr_storage) {
+      *range = clientptr_storage->b;
+      FREE(clientptr_storage);
+      return true;
+   }
+
+   return false;
+}
+
+static void *
+tc_transfer_map_clientptr_range(struct pipe_context *_pipe, struct pipe_transfer *transfer,
+                             struct pipe_clientptr_range *clientptr_range, uint32_t *size)
+{
+   struct threaded_context *tc = threaded_context(_pipe);
+   struct threaded_transfer *ttrans = threaded_transfer(transfer);
+   struct pipe_context *pipe = tc->pipe;
+
+   if (!ttrans->clientptr) {
+      if (ttrans->cpu_storage_mapped) {
+         struct threaded_resource *tres = threaded_resource(transfer->resource);
+
+         /* clientptr_reclaim can be called from any context/thread sharing the same client pointer heap */
+         simple_mtx_lock(&tres->cpu_storage_lock);
+
+         assert(tres->cpu_storage);
+
+         if (!tres->clientptr_storage) {
+            uint64_t page_size;
+            os_get_page_size(&page_size);
+
+            if (!clientptr_range || clientptr_range->size != align(tres->b.width0, page_size)) {
+               simple_mtx_unlock(&tres->cpu_storage_lock);
+
+               *size = align(tres->b.width0, page_size);
+               return NULL;
+            }
+
+            /* covered by AddClientPointerRange's page-aligned requirement */
+            assert((uintptr_t)clientptr_range->start % tc->map_buffer_alignment == 0);
+
+            struct tc_clientptr_storage *new_storage = CALLOC_STRUCT(tc_clientptr_storage);
+            new_storage->b = *clientptr_range;
+            clientptr_range->start = NULL;
+            clientptr_range->size = 0;
+
+            memcpy(new_storage->b.start, tres->cpu_storage, tres->b.width0);
+            new_storage->heap_storage = tres->cpu_storage;
+
+            tres->clientptr_storage = new_storage;
+            tres->cpu_storage = new_storage->b.start;
+
+            tres->cpu_storage_map_count++;
+         }
+
+         ttrans->clientptr = (uint8_t*)tres->cpu_storage + ttrans->b.box.x;
+
+         simple_mtx_unlock(&tres->cpu_storage_lock);
+      } else if (ttrans->staging) {
+         ttrans->clientptr = pipe->transfer_map_clientptr_range(pipe,
+                                                                ttrans->clientptr_upload,
+                                                                clientptr_range,
+                                                                size);
+         if (!ttrans->clientptr) {
+            return NULL;
+         }
+
+         ttrans->clientptr += ttrans->b.offset + (ttrans->b.box.x % tc->map_buffer_alignment);
+      } else {
+         ttrans->clientptr = pipe->transfer_map_clientptr_range(pipe,
+                                                                transfer,
+                                                                clientptr_range,
+                                                                size);
+         if (!ttrans->clientptr) {
+            return NULL;
+         }
+      }
+   }
+
+   ttrans->clientptr_refcnt++;
+   return ttrans->clientptr;
+}
+
+struct tc_transfer_unmap_clientptr_range {
+   struct tc_call_base base;
+   struct pipe_transfer *transfer;
+};
+
+static uint16_t ALWAYS_INLINE
+tc_call_transfer_unmap_clientptr_range(struct pipe_context *pipe, void *call, struct tc_batch *batch)
+{
+   struct tc_transfer_unmap_clientptr_range *p = (struct tc_transfer_unmap_clientptr_range *)call;
+
+   pipe->transfer_unmap_clientptr_range(pipe, p->transfer);
+   return call_size(tc_transfer_unmap_clientptr_range);
+}
+
+static void
+tc_transfer_unmap_clientptr_range(struct pipe_context *_pipe, struct pipe_transfer *transfer)
+{
+   struct threaded_context *tc = threaded_context(_pipe);
+   struct threaded_transfer *ttrans = threaded_transfer(transfer);
+
+   assert(ttrans->clientptr_refcnt);
+   if (!(--ttrans->clientptr_refcnt)) {
+
+      if (ttrans->cpu_storage_mapped) {
+         struct threaded_resource *tres = threaded_resource(transfer->resource);
+
+         simple_mtx_lock(&tres->cpu_storage_lock);
+         tres->cpu_storage_map_count--;
+         ttrans->clientptr = NULL;
+         simple_mtx_unlock(&tres->cpu_storage_lock);
+
+         return;
+      }
+
+      struct tc_transfer_unmap_clientptr_range *p = tc_add_call(tc, TC_CALL_transfer_unmap_clientptr_range,
+                                                                tc_transfer_unmap_clientptr_range);
+
+      if (ttrans->staging) {
+         p->transfer = ttrans->clientptr_upload;
+      } else {
+         p->transfer = &ttrans->b;
+      }
+      ttrans->clientptr = NULL;
+   }
+}
+
 struct tc_buffer_subdata {
    struct tc_call_base base;
    unsigned usage, offset, size;
@@ -3233,7 +3588,7 @@ tc_buffer_subdata(struct pipe_context *_pipe,
    if (!size)
       return;
 
-   usage |= PIPE_MAP_WRITE;
+   usage |= PIPE_MAP_WRITE | PIPE_MAP_SHORT_LIVED;
 
    /* PIPE_MAP_DIRECTLY supresses implicit DISCARD_RANGE. */
    if (!(usage & PIPE_MAP_DIRECTLY))
@@ -3387,7 +3742,7 @@ tc_texture_subdata(struct pipe_context *_pipe,
           tc->options.parse_renderpass_info && tc->in_renderpass) {
          /* upload to staging buffer and then buf2img copy */
          struct pipe_resource *pres = pipe_buffer_create(pipe->screen, 0, PIPE_USAGE_STREAM, layer_stride * box->depth);
-         pipe->buffer_subdata(pipe, pres, unsync_usage, 0, layer_stride * box->depth, data);
+         tc->base.buffer_subdata(&tc->base, pres, 0, 0, size, data);
          tc->base.image_copy_buffer(&tc->base, resource, pres, 0, stride, layer_stride, level, box);
          pipe_resource_reference(&pres, NULL);
       } else {
@@ -3723,6 +4078,10 @@ tc_flush(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
    struct pipe_screen *screen = pipe->screen;
    bool async = flags & (PIPE_FLUSH_DEFERRED | PIPE_FLUSH_ASYNC);
    bool deferred = (flags & PIPE_FLUSH_DEFERRED) > 0;
+
+   /* Drivers that don't report their flushes are asked again after every flush request. */
+   if (!tc->options.driver_calls_flush_notify)
+      p_atomic_set(&tc->num_busy_replies, 0);
 
    if (!deferred || !fence) {
       tc->in_renderpass = false;
@@ -5514,12 +5873,12 @@ tc_batch_execute(void *job, UNUSED void *gdata, int thread_index)
       tc->signal_fences_next_flush[tc->num_signal_fences_next_flush++] = fence;
 
       /* Since our buffer lists are chained as a ring, we need to flush
-       * the context twice as we go around the ring to make the driver signal
-       * the buffer list fences, so that the producer thread can reuse the buffer
-       * list structures for the next batches without waiting.
+       * the context if the driver hasn't flushed on its own for a while to make
+       * the driver signal the buffer list fences, so that the producer thread
+       * can reuse the buffer list structures for the next batches without
+       * waiting.
        */
-      unsigned half_ring = TC_MAX_BUFFER_LISTS / 2;
-      if (batch->buffer_list_index % half_ring == half_ring - 1)
+      if (++tc->num_batches_since_driver_flush >= tc->options.driver_flush_interval)
          pipe->flush(pipe, NULL, PIPE_FLUSH_ASYNC | PIPE_FLUSH_INTERMEDIATE);
    } else {
       util_queue_fence_signal(fence);
@@ -5553,6 +5912,9 @@ tc_destroy(struct pipe_context *_pipe)
 
    if (tc->base.stream_uploader)
       u_upload_destroy(tc->base.stream_uploader);
+
+   if (tc->base.clientptr_uploader)
+      u_upload_destroy(tc->base.clientptr_uploader);
 
    tc_sync(tc);
 
@@ -5590,6 +5952,9 @@ void tc_driver_internal_flush_notify(struct threaded_context *tc)
     */
    if (!tc)
       return;
+
+   p_atomic_set(&tc->num_busy_replies, 0);
+   tc->num_batches_since_driver_flush = 0;
 
    /* Signal fences set by tc_batch_execute. */
    for (unsigned i = 0; i < tc->num_signal_fences_next_flush; i++)
@@ -5647,6 +6012,12 @@ threaded_context_create(struct pipe_context *pipe,
       tc->options = *options;
    }
 
+   STATIC_ASSERT(TC_DEFAULT_DRIVER_FLUSH_INTERVAL <= TC_MAX_DRIVER_FLUSH_INTERVAL);
+   if (!tc->options.driver_flush_interval)
+      tc->options.driver_flush_interval = TC_DEFAULT_DRIVER_FLUSH_INTERVAL;
+   tc->options.driver_flush_interval = MIN2(tc->options.driver_flush_interval,
+                                            TC_MAX_DRIVER_FLUSH_INTERVAL);
+
    pipe = trace_context_create_threaded(pipe->screen, pipe, &replace_buffer, &tc->options);
 
    /* The driver context isn't wrapped, so set its "priv" to NULL. */
@@ -5677,8 +6048,14 @@ threaded_context_create(struct pipe_context *pipe,
    /* The queue size is the number of batches "waiting". Batches are removed
     * from the queue before being executed, so keep one tc_batch slot for that
     * execution. Also, keep one unused slot for an unflushed batch.
+    *
+    * With renderpass info, the driver thread can wait in
+    * threaded_context_get_renderpass_info() until this thread flushes another
+    * batch, so this thread has to be woken as soon as a slot is free.
     */
-   if (!util_queue_init(&tc->queue, "gdrv", TC_MAX_BATCHES - 2, 1, 0, NULL))
+   if (!util_queue_init(&tc->queue, "gdrv", TC_MAX_BATCHES - 2, 1,
+                        tc->options.parse_renderpass_info ?
+                           0 : UTIL_QUEUE_INIT_WAKE_AT_HALF_EMPTY, NULL))
       goto fail;
 
    tc->last_completed = -1;
@@ -5703,8 +6080,6 @@ threaded_context_create(struct pipe_context *pipe,
 
    /* If you have different limits in each shader stage, set the maximum. */
    struct pipe_screen *screen = pipe->screen;;
-   tc->max_const_buffers =
-      screen->shader_caps[MESA_SHADER_FRAGMENT].max_const_buffers;
    tc->max_shader_buffers =
       screen->shader_caps[MESA_SHADER_FRAGMENT].max_shader_buffers;
    tc->max_images =
@@ -5805,6 +6180,8 @@ threaded_context_create(struct pipe_context *pipe,
    CTX_INIT(transfer_flush_region);
    CTX_INIT(buffer_unmap);
    CTX_INIT(texture_unmap);
+   CTX_INIT(transfer_map_clientptr_range);
+   CTX_INIT(transfer_unmap_clientptr_range);
    CTX_INIT(buffer_subdata);
    CTX_INIT(texture_subdata);
    CTX_INIT(texture_barrier);

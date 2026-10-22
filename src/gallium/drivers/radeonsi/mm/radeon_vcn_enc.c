@@ -60,7 +60,7 @@ static void radeon_vcn_enc_quality_modes(struct radeon_encoder *enc,
     * VCN 5.0.0, where only pre_encode_mode is enabled.
     */
    enc->enc_pic.quality_params.two_pass_search_center_map_mode =
-      (sscreen->info.vcn_ip_version < VCN_5_0_0 &&
+      (sscreen->info.vcn_ip_version != VCN_5_0_0 &&
          enc->enc_pic.quality_modes.pre_encode_mode &&
          !enc->enc_pic.spec_misc.b_picture_enabled) ? 1 : 0;
    enc->enc_pic.quality_params.vbaq_strength = 0;
@@ -1316,7 +1316,7 @@ static void pre_encode_size(struct radeon_encoder *enc,
          *offset += align((pre_size * 4 + full_size) * sizeof(uint32_t), enc->alignment);
       else if (!is_h264)
          *offset += align((pre_size * 52 + full_size) * sizeof(uint32_t), enc->alignment);
-   } else { /* only for vcn5.x rather than VCN5_0_0 */
+   } else if (sscreen->info.vcn_ip_version != VCN_5_0_0) {
       if (is_h264 && !has_b)
          *offset += align(full_size * 8, enc->alignment);
       else if (!is_h264)
@@ -1858,18 +1858,19 @@ static void radeon_enc_encode_bitstream(struct pipe_video_codec *encoder,
    if (enc->error)
       return;
 
+   struct si_resource *fb_buf = si_vid_create_buffer(enc->screen, PIPE_USAGE_STAGING, 0, 4096);
+   if (!fb_buf) {
+      RADEON_ENC_ERR("Can't create feedback buffer.\n");
+      return;
+   }
+
    enc->get_buffer(destination, &enc->bs_handle, NULL);
    enc->bs_size = destination->width0;
    enc->bs_offset = 0;
 
    *fb = enc->fb = CALLOC_STRUCT(radeon_enc_fb_buffer);
 
-   enc->fb->res = si_vid_create_buffer(enc->screen, PIPE_USAGE_STAGING, 0, 4096);
-   if (!enc->fb->res) {
-      RADEON_ENC_ERR("Can't create feedback buffer.\n");
-      return;
-   }
-
+   enc->fb->res = fb_buf;
    enc->fb->data = radeon_vcn_enc_encode_headers(enc);
    enc->fb->max_bitstream_size = enc->bs_size - enc->bs_offset;
    enc->enc_pic.enc_params.allowed_max_bitstream_size = enc->fb->max_bitstream_size;

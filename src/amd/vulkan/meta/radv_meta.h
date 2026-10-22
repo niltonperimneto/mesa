@@ -135,6 +135,26 @@ enum radv_meta_object_key_type {
    RADV_META_OBJECT_KEY_BVH_HEADER,
 };
 
+enum radv_meta_htile_preserve_flags {
+   /* Implied when the depth aspect bit is not set. */
+   RADV_HTILE_PRESERVE_Z_COMPRESSION = BITFIELD_BIT(0),
+   RADV_HTILE_PRESERVE_HIZ_RANGE = BITFIELD_BIT(1),
+
+   /* Implied when the stencil aspect bit is not set. */
+   RADV_HTILE_PRESERVE_STENCIL_COMPRESSION = BITFIELD_BIT(2),
+
+   /* PRESERVE_VRS is never implied. */
+   RADV_HTILE_PRESERVE_VRS = BITFIELD_BIT(3),
+
+   RADV_HTILE_PRESERVE_ALL = BITFIELD_MASK(4),
+
+   /* Whether ZRANGE_PRECISION can be dynamic. If not set, it's assumed that ZRANGE_PRECISION == 1.
+    * It only affects images where radv_image_has_tc_compat_zrange_metadata is true.
+    * Only allowed to be passed to radv_clear_htile_rmw_to_uncompressed.
+    */
+   RADV_HTILE_DYNAMIC_ZRANGE_PRECISION = BITFIELD_BIT(31),
+};
+
 VkResult radv_device_init_meta(struct radv_device *device);
 void radv_device_finish_meta(struct radv_device *device);
 
@@ -290,6 +310,10 @@ VkFormat vk_format_for_size(int bs);
 struct radv_meta_blit2d_surf radv_blit_surf_for_image_level_layer(struct radv_image *image, VkImageLayout layout,
                                                                   const VkImageSubresourceLayers *subres);
 
+void radv_meta_fixup_dst_metadata(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
+                                  VkImageLayout image_layout, const VkImageSubresourceLayers *subresource,
+                                  const VkOffset3D *offset, const VkExtent3D *extent, bool before);
+
 void radv_gfx_copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf *src,
                          struct radv_meta_blit2d_surf *dst, const VkOffset3D *src_offset, const VkOffset3D *dst_offset,
                          const VkExtent3D *extent);
@@ -317,9 +341,9 @@ void radv_meta_image_to_image_cs(struct radv_cmd_buffer *cmd_buffer, struct radv
 void radv_meta_clear_image_cs(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf *dst,
                               const VkClearColorValue *clear_color);
 
-void radv_expand_depth_stencil(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
-                               const VkImageSubresourceRange *subresourceRange,
-                               const VkSampleLocationsInfoEXT *sample_locs);
+void radv_decompress_depth_stencil(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
+                                   const VkImageSubresourceRange *subresourceRange,
+                                   const VkSampleLocationsInfoEXT *sample_locs);
 void radv_decompress_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
                          const VkImageSubresourceRange *subresourceRange);
 void radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image);
@@ -358,8 +382,12 @@ uint32_t radv_clear_fmask(struct radv_cmd_buffer *cmd_buffer, struct radv_image 
                           const VkImageSubresourceRange *range, uint32_t value);
 uint32_t radv_clear_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
                         const VkImageSubresourceRange *range, uint32_t value);
-uint32_t radv_clear_htile(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *image,
-                          const VkImageSubresourceRange *range, uint32_t value, bool is_clear);
+uint32_t radv_clear_htile_rmw(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *image,
+                              const VkImageSubresourceRange *range, uint32_t value,
+                              enum radv_meta_htile_preserve_flags flags);
+uint32_t radv_clear_htile_rmw_to_uncompressed(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *image,
+                                              const VkImageSubresourceRange *range,
+                                              enum radv_meta_htile_preserve_flags preserve);
 
 uint32_t radv_clear_hiz(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
                         const VkImageSubresourceRange *range, uint32_t value);

@@ -843,12 +843,13 @@ _va_drivers = [
   with_gallium_r600,
   with_gallium_radeonsi,
   with_gallium_virgl,
+  with_gallium_zink,
 ]
 
 allow_fallback_for_libva = get_option('allow-fallback-for').contains('libva')
 _va = get_option('gallium-va') \
   .require(_va_drivers.contains(true),
-           error_message : 'VA state tracker requires at least one of the following gallium drivers: r600, radeonsi, nouveau, d3d12 (with option gallium-d3d12-video), virgl.')
+           error_message : 'VA state tracker requires at least one of the following gallium drivers: r600, radeonsi, nouveau, zink, d3d12 (with option gallium-d3d12-video), virgl.')
 _dep_va_name = host_machine.system() == 'windows' ? 'libva-win32' : 'libva'
 dep_va = dependency(
   _dep_va_name, version : '>= 1.8.0',
@@ -1957,7 +1958,7 @@ if dep_libudev.found()
   pre_args += '-DHAVE_LIBUDEV'
 endif
 
-llvm_modules = ['bitwriter', 'engine', 'mcdisassembler', 'mcjit', 'core', 'executionengine', 'scalaropts', 'transformutils', 'instcombine']
+llvm_modules = ['bitwriter', 'engine', 'mcdisassembler', 'core', 'executionengine', 'scalaropts', 'transformutils', 'instcombine']
 llvm_optional_modules = ['coroutines']
 if with_amd_vk or with_gallium_radeonsi
   llvm_modules += ['amdgpu', 'bitreader', 'ipo']
@@ -1986,6 +1987,12 @@ endif
 # ORCJIT for llvmpipe functionality.
 llvm_has_mcjit = host_machine.cpu_family() in ['aarch64', 'arm', 'mips', 'mips64', 'ppc', 'ppc64', 's390x', 'x86', 'x86_64']
 llvm_with_orcjit = get_option('llvm-orcjit') or not llvm_has_mcjit
+
+if llvm_with_orcjit
+  llvm_modules += ['orcjit']
+else
+  llvm_modules += ['mcjit']
+endif
 
 if (with_amd_vk or with_gallium_radeonsi) and amd_with_llvm
   _llvm_version = '>= 18.0.0'
@@ -2424,7 +2431,7 @@ with_teflon = get_option('teflon')
 
 with_torx = get_option('torx')
 dep_executorch = null_dep
-dep_executorch_portable_ops = null_dep
+dep_executorch_cpu_ops = null_dep
 dep_executorch_quantized_ops = null_dep
 if with_torx
   py_mod = import('python')
@@ -2433,8 +2440,12 @@ if with_torx
   _et_libdir = dep_executorch.get_variable(pkgconfig : 'libdir', default_value : '')
   # The Torx test suite needs the operators registered by these libraries, but libexecutorch
   # doesn't link to them, so Torx needs to link to them explicitly.
-  dep_executorch_portable_ops = cc.find_library('executorch_portable_ops',
-    dirs : _et_libdir)
+  dep_executorch_cpu_ops = cc.find_library('executorch_kernels_optimized',
+    dirs : _et_libdir, required : false)
+  if not dep_executorch_cpu_ops.found()
+    dep_executorch_cpu_ops = cc.find_library('executorch_portable_ops',
+      dirs : _et_libdir)
+  endif
   dep_executorch_quantized_ops = cc.find_library('executorch_kernels_quantized',
     dirs : _et_libdir, required : false)
   if not dep_executorch_quantized_ops.found()

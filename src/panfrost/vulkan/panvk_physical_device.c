@@ -89,14 +89,18 @@ create_kmod_dev(struct panvk_physical_device *device,
       flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
 
    device->kmod.dev = pan_kmod_dev_create(fd, flags, &instance->kmod.allocator);
-
-   if (PANVK_DEBUG(STARTUP) && device->kmod.dev) {
-      mesa_logi("Found compatible device '%s'.", path);
-   } else if (!device->kmod.dev) {
+   if (!device->kmod.dev) {
       close(fd);
+
+      if (errno != -ENOMEM)
+         return VK_ERROR_INCOMPATIBLE_DRIVER;
+
       return panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
                           "cannot create device");
    }
+
+   if (PANVK_DEBUG(STARTUP))
+      mesa_logi("Found compatible device '%s'.", path);
 
    return VK_SUCCESS;
 }
@@ -210,6 +214,60 @@ get_core_masks(struct panvk_physical_device *device,
    return result;
 }
 
+static simple_mtx_t heap_budgets_mutex = SIMPLE_MTX_INITIALIZER;
+static struct list_head heap_budgets = {&heap_budgets, &heap_budgets};
+
+static struct panvk_heap_budget *
+get_memory_budget(dev_t rdev)
+{
+   struct panvk_heap_budget *heap_budget = NULL;
+
+   simple_mtx_lock(&heap_budgets_mutex);
+
+   list_for_each_entry(struct panvk_heap_budget, b, &heap_budgets, link) {
+      if (b->rdev == rdev) {
+         heap_budget = b;
+         break;
+      }
+   }
+
+   if (!heap_budget) {
+      /* We can't use the instance's allocator, because this object gets
+       * shared among multiple instances with different lifetimes. So
+       * let's just use standard allocators instead here.
+       */
+      heap_budget = calloc(1, sizeof(*heap_budget));
+      if (!heap_budget) {
+         simple_mtx_unlock(&heap_budgets_mutex);
+         return NULL;
+      }
+
+      heap_budget->ref_count = 1;
+      heap_budget->rdev = rdev;
+      list_addtail(&heap_budget->link, &heap_budgets);
+   } else {
+      heap_budget->ref_count++;
+   }
+
+   simple_mtx_unlock(&heap_budgets_mutex);
+
+   return heap_budget;
+}
+
+static void
+release_memory_budget(struct panvk_heap_budget *heap_budget)
+{
+   simple_mtx_lock(&heap_budgets_mutex);
+
+   if (--heap_budget->ref_count == 0) {
+      list_del(&heap_budget->link);
+      free(heap_budget);
+   }
+
+   simple_mtx_unlock(&heap_budgets_mutex);
+}
+
+
 static VkResult
 get_device_heaps(struct panvk_physical_device *device,
                  struct panvk_instance *instance)
@@ -298,6 +356,10 @@ get_device_heaps(struct panvk_physical_device *device,
    device->memory.max_supported_va =
       pan_clamp_to_usable_va_range(device->kmod.dev, request_va);
 
+   device->memory.budget = get_memory_budget(device->drm.render_rdev);
+   if (!device->memory.budget)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
    return VK_SUCCESS;
 }
 
@@ -356,6 +418,8 @@ panvk_physical_device_finish(struct panvk_physical_device *device)
 
    pan_kmod_dev_destroy(device->kmod.dev);
 
+   release_memory_budget(device->memory.budget);
+
    vk_physical_device_finish(&device->vk);
 }
 
@@ -370,8 +434,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    if (result != VK_SUCCESS)
       return result;
 
+   unsigned core_count =
+      pan_query_core_count(&device->kmod.dev->props);
    device->model = pan_get_model(device->kmod.dev->props.gpu_id,
-                                 device->kmod.dev->props.gpu_variant);
+                                 device->kmod.dev->props.gpu_variant,
+                                 core_count,
+                                 device->kmod.dev->props.gpu_features);
 
    unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
 
@@ -415,11 +483,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    device->formats.all = pan_format_table(arch);
    device->formats.blendable = pan_blendable_format_table(arch);
 
-   unsigned core_count =
-      pan_query_core_count(&device->kmod.dev->props);
-
-   memset(device->name, 0, sizeof(device->name));
-   sprintf(device->name, "%s MC%u", device->model->name, core_count);
+   pan_model_device_name(device->name, sizeof(device->name), device->model, core_count, "");
 
    result = get_core_masks(device, instance);
    if (result != VK_SUCCESS)
@@ -481,6 +545,9 @@ panvk_physical_device_init(struct panvk_physical_device *device,
 
 fail:
    free_disk_cache(device);
+
+   if (device->memory.budget)
+      release_memory_budget(device->memory.budget);
 
    if (device->vk.instance)
       vk_physical_device_finish(&device->vk);
@@ -577,6 +644,12 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
             vk_find_struct(p->pNext, QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR);
          if (prio)
             panvk_fill_global_priority(physical_device, family, prio);
+
+         VkQueueFamilyOptimalImageTransferGranularityPropertiesKHR *gran =
+            vk_find_struct(p->pNext,
+                           QUEUE_FAMILY_OPTIMAL_IMAGE_TRANSFER_GRANULARITY_PROPERTIES_KHR);
+         if (gran)
+            gran->optimalImageTransferGranularity = (VkExtent3D){1, 1, 1};
       }
    }
 }
@@ -714,7 +787,7 @@ panvk_GetPhysicalDeviceMemoryProperties2(
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
          VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = ext;
 
-         uint64_t used = p_atomic_read(&physical_device->memory.heap_used);
+         uint64_t used = p_atomic_read(&physical_device->memory.budget->heap_used);
          uint64_t heap_size = physical_device->memory.heaps[0].size;
 
          /* From the Vulkan 1.3.278 spec:

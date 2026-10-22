@@ -37,7 +37,6 @@
 #include "pan_jm.h"
 #include "pan_job.h"
 #include "pan_pool.h"
-#include "pan_precomp.h"
 #include "libpan_copy.h"
 #include "pan_resource.h"
 #include "pan_samples.h"
@@ -48,6 +47,10 @@
 #include "pan_trace.h"
 #include "panfrost_tracepoints.h"
 #include "panfrost_perfetto.h"
+
+#if PAN_ARCH >= 6
+#include "pan_precomp.h"
+#endif
 
 /* JOBX() is used to select the job backend helpers to call from generic
  * functions. */
@@ -4649,8 +4652,10 @@ screen_destroy(struct pipe_screen *pscreen)
    struct panfrost_device *dev = pan_device(pscreen);
    GENX(pan_fb_preload_cache_cleanup)(&dev->fb_preload_cache);
    pan_blend_shader_cache_cleanup(&dev->blend_shaders);
+#if PAN_ARCH >= 6
    if (dev->precomp_cache)
       GENX(panfrost_precomp_cache_cleanup)(dev->precomp_cache);
+#endif
 }
 
 static void
@@ -4906,14 +4911,14 @@ GENX(panfrost_cmdstream_screen_init)(struct panfrost_screen *screen)
    screen->vtbl.get_conv_desc = get_conv_desc;
    screen->vtbl.draw_fullscreen = panfrost_draw_fullscreen;
 
-   pan_blend_shader_cache_init(&dev->blend_shaders, panfrost_device_gpu_id(dev),
-                               dev->kmod.dev->props.gpu_variant,
+   pan_blend_shader_cache_init(&dev->blend_shaders, dev->model,
                                &screen->mempools.bin.base);
 
    GENX(pan_fb_preload_cache_init)
-   (&dev->fb_preload_cache, panfrost_device_gpu_id(dev),
-    dev->kmod.dev->props.gpu_variant, &dev->blend_shaders,
+   (&dev->fb_preload_cache, dev->model, &dev->blend_shaders,
     &screen->mempools.bin.base, &screen->mempools.desc.base);
 
+#if PAN_ARCH >= 6
    dev->precomp_cache = GENX(panfrost_precomp_cache_init)(screen);
+#endif
 }

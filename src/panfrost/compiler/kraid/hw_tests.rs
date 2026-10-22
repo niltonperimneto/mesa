@@ -97,7 +97,7 @@ static F32_CURATED: &[f32] = &[
 static F16_CURATED: &[F16] = &[
     // Trivial values
     F16::ZERO,
-    F16::from_bits(0x3C00), // 1.0
+    F16::ONE,
     F16::from_bits(0x3800), // 0.5
     F16::from_bits(0x4000), // 2.0
     F16::from_bits(0x4800), // 8.0
@@ -1303,6 +1303,79 @@ fn test_op_clz() {
 }
 
 #[test]
+fn test_op_cmp() {
+    const DATA_TYPES: &[DataType] = &[
+        DataType::V4S8,
+        DataType::V4U8,
+        DataType::V2F16,
+        DataType::V2S16,
+        DataType::V2U16,
+        DataType::F32,
+        DataType::S32,
+        DataType::U32,
+    ];
+
+    const CMP_OPS: &[CmpOp] = &[
+        CmpOp::Eq,
+        CmpOp::Gt,
+        CmpOp::Ge,
+        CmpOp::Ne,
+        CmpOp::Lt,
+        CmpOp::Le,
+        CmpOp::GtLt,
+        CmpOp::Total,
+    ];
+
+    const ACCUM_OPS: &[CmpAccumOp] =
+        &[CmpAccumOp::None, CmpAccumOp::And, CmpAccumOp::Or];
+
+    const RES_TYPES: &[CmpResultType] =
+        &[CmpResultType::I1, CmpResultType::F1, CmpResultType::M1];
+
+    let mut a = Acorn::new();
+    let run = RunSingleton::get();
+    for &src_type in DATA_TYPES {
+        // 8-bits are only supported in arch <= v10
+        if src_type.bits() == 8 && run.model.arch() > 10 {
+            continue;
+        }
+        for &cmp_op in CMP_OPS {
+            // GtLt and Total only exist for floats
+            if matches!(cmp_op, CmpOp::GtLt | CmpOp::Total)
+                && !src_type.is_float_type()
+            {
+                continue;
+            }
+            for &accum_op in ACCUM_OPS {
+                for &res_type in RES_TYPES {
+                    // No 8-bit floats
+                    if src_type.bits() == 8 && res_type == CmpResultType::F1 {
+                        continue;
+                    }
+
+                    let op = OpCmp {
+                        dst: DstRef::None.into(),
+                        src_type,
+                        res_type,
+                        cmp_op,
+                        srcs: [0_u32.into(), 0_u32.into()],
+                        accum: 0_u32.into(),
+                        accum_op,
+                    };
+                    // Accum is always treated as a bool so let's use 0-1
+                    // (otherwise it would always be true)
+                    let rng = |i, dt| match i {
+                        2 => a.get_u32() % 2,
+                        _ => sample_datatype(&mut a, dt),
+                    };
+                    test_foldable_op_with(op, Precision::Exact, rng);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_op_csel() {
     const DATA_TYPES: &[DataType] = &[
         DataType::S32,
@@ -1371,41 +1444,6 @@ fn test_op_f16_to_f32() {
         src: 0_u32.into(),
     };
     test_foldable_op(op, Precision::Ulp(0));
-}
-
-#[test]
-fn test_op_f32_to_f16() {
-    let run = RunSingleton::get();
-
-    // F32_TO_F16 only available from v11
-    if run.model.arch() < 11 {
-        return;
-    }
-
-    const ROUND_MODES: &[FRound] = &[
-        FRound::NearestEven,
-        FRound::Up,
-        FRound::Down,
-        FRound::TowardsZero,
-    ];
-
-    const CLAMP_MODES: &[FClamp] = &[
-        FClamp::None,
-        FClamp::ZeroToInf,
-        FClamp::NegOneToOne,
-        FClamp::ZeroToOne,
-    ];
-    for &round in ROUND_MODES {
-        for &clamp in CLAMP_MODES {
-            let op = OpF32ToF16 {
-                dst: DstRef::None.into(),
-                src: 0_u32.into(),
-                round,
-                clamp,
-            };
-            test_foldable_op(op, Precision::Ulp(0));
-        }
-    }
 }
 
 #[test]
@@ -1495,54 +1533,6 @@ fn test_op_fadd_lscale() {
             // FRound is not emulated correctly
             let ulps = if round == FRound::NearestEven { 0 } else { 1 };
             test_foldable_op(op, Precision::Ulp(ulps));
-        }
-    }
-}
-
-#[test]
-fn test_op_fcmp() {
-    const DATA_TYPES: &[DataType] = &[DataType::F32, DataType::V2F16];
-
-    const CMP_OPS: &[CmpOp] = &[
-        CmpOp::Eq,
-        CmpOp::Gt,
-        CmpOp::Ge,
-        CmpOp::Ne,
-        CmpOp::Lt,
-        CmpOp::Le,
-        CmpOp::GtLt,
-        CmpOp::Total,
-    ];
-
-    const ACCUM_OPS: &[CmpAccumOp] =
-        &[CmpAccumOp::None, CmpAccumOp::And, CmpAccumOp::Or];
-
-    const RES_TYPES: &[CmpResultType] =
-        &[CmpResultType::I1, CmpResultType::F1, CmpResultType::M1];
-
-    let mut a = Acorn::new();
-    for &src_type in DATA_TYPES {
-        for &cmp_op in CMP_OPS {
-            for &accum_op in ACCUM_OPS {
-                for &res_type in RES_TYPES {
-                    let op = OpFCmp {
-                        dst: DstRef::None.into(),
-                        src_type,
-                        res_type,
-                        cmp_op,
-                        srcs: [0_u32.into(), 0_u32.into()],
-                        accum: 0_u32.into(),
-                        accum_op,
-                    };
-                    // Accum is always treated as a bool so let's use 0-1
-                    // (otherwise it would always be true)
-                    let rng = |i, dt| match i {
-                        2 => a.get_u32() % 2,
-                        _ => sample_datatype(&mut a, dt),
-                    };
-                    test_foldable_op_with(op, Precision::Exact, rng);
-                }
-            }
         }
     }
 }
@@ -1860,69 +1850,6 @@ fn test_op_iadd() {
                     saturate,
                 };
                 test_foldable_op(op, Precision::Exact);
-            }
-        }
-    }
-}
-
-#[test]
-fn test_op_icmp() {
-    const DATA_TYPES: &[DataType] = &[
-        DataType::V4S8,
-        DataType::V4U8,
-        DataType::V2S16,
-        DataType::V2U16,
-        DataType::S32,
-        DataType::U32,
-    ];
-
-    const CMP_OPS: &[CmpOp] = &[
-        CmpOp::Eq,
-        CmpOp::Gt,
-        CmpOp::Ge,
-        CmpOp::Ne,
-        CmpOp::Lt,
-        CmpOp::Le,
-    ];
-
-    const ACCUM_OPS: &[CmpAccumOp] =
-        &[CmpAccumOp::None, CmpAccumOp::And, CmpAccumOp::Or];
-
-    const RES_TYPES: &[CmpResultType] =
-        &[CmpResultType::I1, CmpResultType::F1, CmpResultType::M1];
-
-    let mut a = Acorn::new();
-    let run = RunSingleton::get();
-    for &src_type in DATA_TYPES {
-        // 8-bits are only supported in arch <= v10
-        if src_type.bits() == 8 && run.model.arch() > 10 {
-            continue;
-        }
-        for &cmp_op in CMP_OPS {
-            for &accum_op in ACCUM_OPS {
-                for &res_type in RES_TYPES {
-                    // No 8-bit floats
-                    if src_type.bits() == 8 && res_type == CmpResultType::F1 {
-                        continue;
-                    }
-
-                    let op = OpICmp {
-                        dst: DstRef::None.into(),
-                        src_type,
-                        res_type,
-                        cmp_op,
-                        srcs: [0_u32.into(), 0_u32.into()],
-                        accum: 0_u32.into(),
-                        accum_op,
-                    };
-                    // Accum is always treated as a bool so let's use 0-1
-                    // (otherwise it would always be true)
-                    let rng = |i, dt| match i {
-                        2 => a.get_u32() % 2,
-                        _ => sample_datatype(&mut a, dt),
-                    };
-                    test_foldable_op_with(op, Precision::Exact, rng);
-                }
             }
         }
     }

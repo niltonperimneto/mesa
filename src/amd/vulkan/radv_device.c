@@ -1054,8 +1054,8 @@ radv_emit_default_sample_locations(const struct radv_physical_device *pdev, stru
     * support 16 samples.
     */
    if (pdev->info.gfx_level >= GFX7 && pdev->info.gfx_level < GFX12) {
-      radeon_set_context_reg(R_02882C_PA_SU_PRIM_FILTER_CNTL,
-                             S_02882C_XMAX_RIGHT_EXCLUSION(1) | S_02882C_YMAX_BOTTOM_EXCLUSION(1));
+      radeon_opt_set_context_reg(R_02882C_PA_SU_PRIM_FILTER_CNTL, AC_TRACKED_PA_SU_PRIM_FILTER_CNTL,
+                                 S_02882C_XMAX_RIGHT_EXCLUSION(1) | S_02882C_YMAX_BOTTOM_EXCLUSION(1));
    }
 
    if (pdev->info.gfx_level >= GFX12) {
@@ -1121,10 +1121,6 @@ radv_device_is_cache_disabled(const struct radv_device *device)
 
    /* The buffer address used for validating VAs is hardcoded. */
    if (device->debug_nir.valid_va.buffer_addr)
-      return true;
-
-   /* The buffer address used for shader abort is hardcoded. */
-   if (device->shader_abort.buffer_addr)
       return true;
 
    /* Pipeline caches can be disabled with RADV_DEBUG=nocache, with MESA_GLSL_CACHE_DISABLE=1 and
@@ -1290,7 +1286,6 @@ radv_device_init_compiler_info(struct radv_device *device)
             .trap_excp_flags = instance->trap_excp_flags,
             .debug_report = &instance->vk.debug_report,
             .debug_nir = &device->debug_nir,
-            .shader_abort = &device->shader_abort,
             .shader_dump_mtx = &instance->shader_dump_mtx,
             .keep_shader_info = device->keep_shader_info,
             .capture_shaders = RADV_DEBUG_DUMP_SHADERS(instance) || device->keep_shader_info,
@@ -1595,8 +1590,8 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++)
       total_queue_count += pCreateInfo->pQueueCreateInfos[i].queueCount;
 
-   device->queues = vk_zalloc(&device->vk.alloc, total_queue_count * sizeof(struct radv_queue), 8,
-                              VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   device->queues =
+      vk_zalloc(&device->vk.alloc, total_queue_count * sizeof(struct radv_queue), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!device->queues) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto fail;
@@ -2257,7 +2252,8 @@ radv_GetDeviceFaultReportsKHR(VkDevice _device, uint64_t timeout, uint32_t *pFau
       };
       strncpy(fault_info.description, "A GPUVM fault has been detected", sizeof(fault_info.description));
 
-      vk_outarray_append_typed(VkDeviceFaultInfoKHR, &out, elem) {
+      vk_outarray_append_typed(VkDeviceFaultInfoKHR, &out, elem)
+      {
          *elem = fault_info;
          device->fault.fault_addr_reported = true;
       }
@@ -2272,7 +2268,8 @@ radv_GetDeviceFaultReportsKHR(VkDevice _device, uint64_t timeout, uint32_t *pFau
       strncpy(fault_info.description, "A device lost due to OpAbortKHR has been detected",
               sizeof(fault_info.description));
 
-      vk_outarray_append_typed(VkDeviceFaultInfoKHR, &out, elem) {
+      vk_outarray_append_typed(VkDeviceFaultInfoKHR, &out, elem)
+      {
          *elem = fault_info;
          device->fault.shader_abort_reported = true;
       }
@@ -2283,7 +2280,8 @@ radv_GetDeviceFaultReportsKHR(VkDevice _device, uint64_t timeout, uint32_t *pFau
       };
       strncpy(fault_info.description, "A device lost has been detected", sizeof(fault_info.description));
 
-      vk_outarray_append_typed(VkDeviceFaultInfoKHR, &out, elem) {
+      vk_outarray_append_typed(VkDeviceFaultInfoKHR, &out, elem)
+      {
          *elem = fault_info;
          device->fault.device_lost_reported = true;
       }

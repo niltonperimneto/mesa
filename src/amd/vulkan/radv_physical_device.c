@@ -122,7 +122,7 @@ radv_transfer_queue_enabled(const struct radv_physical_device *pdev)
    if (!radv_compute_queue_enabled(pdev))
       return false;
 
-   return pdev->info.gfx_level >= GFX9 && !(instance->queue_disable_flags & RADV_QUEUE_DISABLE_TRANSFER);
+   return pdev->info.gfx_level >= GFX7 && !(instance->queue_disable_flags & RADV_QUEUE_DISABLE_TRANSFER);
 }
 
 static bool
@@ -226,12 +226,9 @@ bool
 radv_host_image_copy_enabled(const struct radv_physical_device *pdev)
 {
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
-   /* TODO: HIC is supported on GFX10 but the recent addrlib bump introduced few regressions that
-    * should be fixed soon, it's also still missing AVX for some formats. Let's not enable it by
-    * default for now.
-    */
-   return pdev->info.gfx_level >= GFX10_3 ||
-          (pdev->info.gfx_level == GFX10 && (instance->experimental_flags & RADV_EXPERIMENTAL_HIC));
+   /* TODO: HIC is supported on GFX9 but it's still experimental there. */
+   return pdev->info.gfx_level >= GFX10 ||
+          (pdev->info.gfx_level == GFX9 && (instance->experimental_flags & RADV_EXPERIMENTAL_HIC));
 }
 
 static bool
@@ -245,6 +242,14 @@ radv_compression_control_enabled(const struct radv_physical_device *pdev)
 {
    /* Not useful on GFX12. */
    return pdev->info.gfx_level < GFX12;
+}
+
+static bool
+radv_shader_abort_enabled(const struct radv_physical_device *pdev)
+{
+   const struct radv_instance *instance = radv_physical_device_instance(pdev);
+
+   return !pdev->use_llvm && !(instance->experimental_flags & RADV_EXPERIMENTAL_ELF);
 }
 
 bool
@@ -763,7 +768,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_abort = true,
+      .KHR_shader_abort = radv_shader_abort_enabled(pdev),
       .KHR_shader_atomic_int64 = true,
       .KHR_shader_bfloat16 = radv_bfloat16_enabled(pdev),
       .KHR_shader_clock = true,
@@ -1678,7 +1683,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .deviceFaultDeviceLostOnMasked = false,
 
       /* VK_KHR_shader_abort */
-      .shaderAbort = true,
+      .shaderAbort = radv_shader_abort_enabled(pdev),
 
       /* VK_EXT_shader_split_barrier */
       .shaderSplitBarrier = radv_split_barrier_enabled(pdev),
@@ -2181,9 +2186,8 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .fragmentShadingRateNonTrivialCombinerOps = true,
       .maxFragmentSize = (VkExtent2D){2, 2},
       .maxFragmentSizeAspectRatio = 2,
-      .maxFragmentShadingRateCoverageSamples = pdev->info.gfx_level >= GFX12 ? 16 : 32,
-      .maxFragmentShadingRateRasterizationSamples =
-         pdev->info.gfx_level >= GFX12 ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_8_BIT,
+      .maxFragmentShadingRateCoverageSamples = 16,
+      .maxFragmentShadingRateRasterizationSamples = VK_SAMPLE_COUNT_4_BIT,
       .fragmentShadingRateWithShaderDepthStencilWrites = !pdev->info.has_vrs_ds_export_bug,
       .fragmentShadingRateWithSampleMask = true,
       .fragmentShadingRateWithShaderSampleMask = false,
@@ -2815,9 +2819,9 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       }
    }
 
-   pdev->use_ngg = (pdev->info.gfx_level >= GFX10 && pdev->info.family != CHIP_NAVI14 &&
-                    !(RADV_DEBUG(instance, NO_NGG))) ||
-                   pdev->info.gfx_level >= GFX11;
+   pdev->use_ngg =
+      (pdev->info.gfx_level >= GFX10 && pdev->info.family != CHIP_NAVI14 && !(RADV_DEBUG(instance, NO_NGG))) ||
+      pdev->info.gfx_level >= GFX11;
 
    /* TODO: Investigate if NGG culling helps on GFX11. */
    pdev->use_ngg_culling = pdev->use_ngg &&
@@ -3645,16 +3649,14 @@ fill_matrix_prop2_ext(struct __vk_outarray *base, struct matrix_prop *prop, void
 
    vk_outarray_append_typed(VkCooperativeMatrixProperties2EXT, out, p)
    {
-      *p = (struct VkCooperativeMatrixProperties2EXT){
-         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_2_EXT,
-         .MGranularity = 16,
-         .NGranularity = 16,
-         .KGranularity = 16,
-         .AType = prop->a_type,
-         .BType = prop->b_type,
-         .CType = prop->c_type,
-         .ResultType = prop->r_type
-      };
+      *p = (struct VkCooperativeMatrixProperties2EXT){.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_2_EXT,
+                                                      .MGranularity = 16,
+                                                      .NGranularity = 16,
+                                                      .KGranularity = 16,
+                                                      .AType = prop->a_type,
+                                                      .BType = prop->b_type,
+                                                      .CType = prop->c_type,
+                                                      .ResultType = prop->r_type};
    }
 }
 

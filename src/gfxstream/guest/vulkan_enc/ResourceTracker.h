@@ -458,6 +458,11 @@ class ResourceTracker {
                                    VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
                                    uint32_t set, uint32_t descriptorWriteCount,
                                    const VkWriteDescriptorSet* pDescriptorWrites);
+    void on_vkCmdPushDescriptorSetKHR(void* context, VkCommandBuffer commandBuffer,
+                                      VkPipelineBindPoint pipelineBindPoint,
+                                      VkPipelineLayout layout, uint32_t set,
+                                      uint32_t descriptorWriteCount,
+                                      const VkWriteDescriptorSet* pDescriptorWrites);
     void on_vkCmdPushDescriptorSetWithTemplate(void* context, VkCommandBuffer commandBuffer,
                                                VkDescriptorUpdateTemplate descriptorUpdateTemplate,
                                                VkPipelineLayout layout, uint32_t set,
@@ -567,8 +572,6 @@ class ResourceTracker {
                                           const VkAllocationCallbacks* pAllocator,
                                           VkPipeline* pPipelines);
 
-    uint8_t* getMappedPointer(VkDeviceMemory memory);
-    VkDeviceSize getMappedSize(VkDeviceMemory memory);
     VkDeviceSize getNonCoherentExtendedSize(VkDevice device, VkDeviceSize basicSize) const;
     bool isValidMemoryRange(const VkMappedMemoryRange& range);
 
@@ -579,8 +582,6 @@ class ResourceTracker {
     bool hostSupportsVulkan() const;
     bool usingDirectMapping() const;
     uint32_t getStreamFeatures() const;
-    uint32_t getApiVersionFromInstance(VkInstance instance);
-    uint32_t getApiVersionFromDevice(VkDevice device);
     VkDevice getDevice(VkCommandBuffer commandBuffer) const;
     void addToCommandPool(VkCommandPool commandPool, uint32_t commandBufferCount,
                           VkCommandBuffer* pCommandBuffers);
@@ -706,9 +707,6 @@ class ResourceTracker {
     VkResult exportSyncFdForQSRILocked(VkImage image, int* fd);
 #endif
 
-    void setInstanceInfo(VkInstance instance, uint32_t enabledExtensionCount,
-                         const char* const* ppEnabledExtensionNames, uint32_t apiVersion);
-
     void resetCommandBufferStagingInfo(VkCommandBuffer commandBuffer, bool alsoResetPrimaries,
                                        bool alsoClearPendingDescriptorSets);
 
@@ -756,7 +754,6 @@ class ResourceTracker {
     GOLDFISH_VK_LIST_TRIVIAL_HANDLE_TYPES(HANDLE_DEFINE_TRIVIAL_INFO_STRUCT)
 
     struct VkInstance_Info {
-        uint32_t highestApiVersion;
         // Fodder for vkEnumeratePhysicalDevices.
         std::vector<VkPhysicalDevice> physicalDevices;
     };
@@ -765,7 +762,6 @@ class ResourceTracker {
         VkPhysicalDevice physdev;
         VkPhysicalDeviceProperties props;
         VkPhysicalDeviceMemoryProperties memProps;
-        uint32_t apiVersion;
         std::vector<std::pair<PFN_vkDeviceMemoryReportCallbackEXT, void*>>
             deviceMemoryReportCallbacks;
     };
@@ -780,10 +776,7 @@ class ResourceTracker {
         zx_handle_t vmoHandle = ZX_HANDLE_INVALID;
         VkDevice device;
 
-        uint8_t* ptr = nullptr;
-
         uint64_t blobId = 0;
-        uint64_t allocationSize = 0;
         uint32_t memoryTypeIndex = 0;
         uint64_t coherentMemorySize = 0;
         uint64_t coherentMemoryOffset = 0;
@@ -938,6 +931,15 @@ class ResourceTracker {
 
     VkDescriptorImageInfo filterNonexistentSampler(const VkDescriptorImageInfo& inputInfo);
 
+    // The template writes are expanded on the guest; khr picks the KHR entry points for the
+    // pushes, which is what a device below 1.4 with VK_KHR_push_descriptor has.
+    void pushDescriptorSetWithTemplate(void* context, VkCommandBuffer commandBuffer,
+                                       VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+                                       VkPipelineLayout layout, uint32_t set, const void* pData,
+                                       bool khr);
+    void pushDescriptorSetWithTemplate2(
+        void* context, VkCommandBuffer commandBuffer,
+        const VkPushDescriptorSetWithTemplateInfo* pPushDescriptorSetWithTemplateInfo, bool khr);
     void sanitizePushDescriptorWrites(uint32_t descriptorWriteCount,
                                       const VkWriteDescriptorSet* pDescriptorWrites,
                                       std::vector<VkWriteDescriptorSet>& transformedWrites,

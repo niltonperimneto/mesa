@@ -1084,6 +1084,16 @@ void ac_fill_bug_info(struct radeon_info *info)
    info->has_streamout_vgt_hang_bug = info->family == CHIP_HAWAII ||
                                       info->family == CHIP_TONGA ||
                                       info->family == CHIP_FIJI;
+
+   /* The GE can compute an incorrect number of indices for back-to-back
+    * opaque draws (DrawTransformFeedback) if the DRAW_OPAQUE registers are
+    * updated within 5 cycles on different contexts. 3 SQ_NON_EVENTs are
+    * required after the DRAW_OPAQUE packet to work around it.
+    *
+    * See drawOpaqueSqNonEvents in PAL.
+    */
+   info->has_draw_opaque_ge_bug = info->gfx_level >= GFX11_5 &&
+                                  info->gfx_level <= GFX12;
 }
 
 void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info_device *device_info)
@@ -1103,13 +1113,22 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
     */
    info->cp_dma_supports_sparse = info->gfx_level >= GFX10;
 
-   /* Disable sparse mappings on GFX6 due to VM faults in CP DMA. Enable them once
-    * these faults are mitigated in software.
-    * Disable sparse mappings on GFX7-8 due to GPU hangs in the VK CTS,
-    * except Polaris where it happens to work "well enough".
-    * Enable them when these are investigated and fixed in the driver.
+   /* Sparse is supported on all generations, but the feature set varies.
+    * Memory controller support:
+    * - GFX6-8: sparse is supported through the PRT aperture
+    * - GFX9+: sparse is supported through the PRT page table entry flag
+    * Tiling support:
+    * - GFX6: no sparse-specific tiling modes (thus unaligned mip size)
+    * - GFX7+: standard block size for 2D images, non-standard for 3D images
+    * - GFX9+: standard block size for 2D and 3D images
+    *
+    * TODO: figure out VK CTS test failures on GFX6 and GFX7-8 APUs.
     */
-   info->has_sparse = info->family >= CHIP_POLARIS10;
+   info->has_sparse = info->gfx_level >= GFX7 &&
+                      info->family != CHIP_STONEY &&
+                      info->family != CHIP_CARRIZO &&
+                      info->family != CHIP_KABINI &&
+                      info->family != CHIP_KAVERI;
    info->has_sparse_image_3d = info->gfx_level >= GFX7;
    info->has_sparse_image_standard_3d = info->gfx_level >= GFX9;
    info->has_sparse_unaligned_mip_size = info->gfx_level >= GFX7;

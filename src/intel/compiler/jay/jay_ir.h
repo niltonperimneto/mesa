@@ -768,6 +768,9 @@ struct jay_register_block {
 
    /** Special feature of the block */
    enum jay_block_type type:3;
+
+   /** Logarithmic split index. 0 full SIMD, 1 half-SIMD, 2 quarter */
+   unsigned split:3;
 };
 static_assert(sizeof(struct jay_register_block) == 8, "packed");
 
@@ -1070,6 +1073,17 @@ jay_simd_width_physical(jay_shader *s, const jay_inst *I)
    return jay_simd_width_logical(s, I) >> I->simd_split;
 }
 
+/*
+ * Returns whether a given Jay instruction will map to a compressed GEN
+ * instruction <==> an execution width exceeding the native SIMD width for
+ * the platform. These require special handling.
+ */
+static inline bool
+jay_is_compressed(jay_shader *shader, jay_inst *I)
+{
+   return jay_simd_width_logical(shader, I) > 8 * reg_unit(shader->devinfo);
+}
+
 /**
  * Representation of an (implemented) function in the Jay IR. This corresponds
  * to nir_function_impl in NIR.
@@ -1224,6 +1238,12 @@ typedef struct jay_block {
    /** True if all non-exited lanes execute this block together */
    bool uniform;
 
+   /**
+    * Normalized factor for how many times this block is estimated to execute,
+    * used to weight static cycle count estimates.
+    */
+   float weight;
+
    /* Register demand metadata calculated for scheduling use */
    unsigned demand_max[JAY_NUM_SSA_FILES];
    unsigned demand_out[JAY_NUM_SSA_FILES];
@@ -1239,7 +1259,7 @@ _jay_block_destructor(void *_block)
 }
 
 static inline jay_block *
-jay_new_block(jay_function *f)
+jay_new_block(jay_function *f, float weight)
 {
    jay_block *block = rzalloc(f, jay_block);
    ralloc_set_destructor(block, &_jay_block_destructor);
@@ -1253,6 +1273,7 @@ jay_new_block(jay_function *f)
    list_inithead(&block->instructions);
 
    block->index = f->num_blocks++;
+   block->weight = weight;
    return block;
 }
 

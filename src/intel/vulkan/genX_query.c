@@ -1137,6 +1137,22 @@ emit_zero_queries(struct anv_cmd_buffer *cmd_buffer,
    }
 }
 
+static bool
+append_query_copy_flush(struct anv_cmd_buffer *cmd_buffer,
+                        struct anv_query_pool *pool,
+                        const char *reason)
+{
+   if (cmd_buffer->state.queries.copy_bits == 0)
+      return false;
+
+   anv_add_pending_pipe_bits(cmd_buffer,
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                             cmd_buffer->state.queries.copy_bits,
+                             reason);
+   return true;
+}
+
 void genX(CmdResetQueryPool)(
     VkCommandBuffer                             commandBuffer,
     VkQueryPool                                 queryPool,
@@ -1146,6 +1162,10 @@ void genX(CmdResetQueryPool)(
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
    const struct anv_physical_device *pdevice = cmd_buffer->device->physical;
+
+   if (append_query_copy_flush(cmd_buffer, pool,
+                               "CmdResetQueryPool* flush query copies"))
+      genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
 
    /* Shader clearing is only possible on render/compute when not in protected
     * mode.
@@ -1458,7 +1478,6 @@ append_query_clear_flush(struct anv_cmd_buffer *cmd_buffer,
                              reason);
    return true;
 }
-
 
 void genX(CmdBeginQueryIndexedEXT)(
     VkCommandBuffer                             commandBuffer,
@@ -2125,8 +2144,6 @@ gpu_write_query_result(struct anv_cmd_buffer *cmd_buffer,
     * write any value.
     */
    if (flags & VK_QUERY_RESULT_PARTIAL_BIT) {
-      mi_store(b, mi_reg64(MI_PREDICATE_SRC0), mi_mem64(poll_addr));
-
       gpu_write_query_on_predicate(cmd_buffer, b, dst_addr, value_index,
                                    flags & VK_QUERY_RESULT_64_BIT,
                                    query_result, 1);
@@ -2191,6 +2208,19 @@ copy_query_results_with_cs(struct anv_cmd_buffer *cmd_buffer,
       genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
    }
 
+
+#if GFX_VER >= 20
+   /* On Gfx20+, if we're waiting for the results but there is no CS stall, we
+    * need to fence the MI write emitted by previous vkCmdQuery(Begin|End)*
+    * commands so the results are visible by MI read commands.
+    */
+   if (needed_flushes == 0 && (flags & VK_QUERY_RESULT_WAIT_BIT)) {
+      anv_batch_emit(&cmd_buffer->batch, GENX(MI_MEM_FENCE), fence) {
+         fence.FenceType = FENCE_TYPE_MI_WRITE;
+      }
+   }
+#endif
+
    struct mi_builder b;
    mi_builder_init(&b, cmd_buffer->device->info, &cmd_buffer->batch);
    mi_builder_set_mocs(&b, anv_mocs_for_address(
@@ -2210,6 +2240,9 @@ copy_query_results_with_cs(struct anv_cmd_buffer *cmd_buffer,
             sem.SemaphoreAddress    = query_addr;
          }
       }
+
+      if (flags & VK_QUERY_RESULT_PARTIAL_BIT)
+         mi_store(&b, mi_reg64(MI_PREDICATE_SRC0), mi_mem64(query_addr));
 
       uint32_t idx = 0;
       switch (pool->vk.query_type) {
@@ -2464,7 +2497,8 @@ copy_query_results_with_shader(struct anv_cmd_buffer *cmd_buffer,
     * HDC/Data cache depending on the generation. Also stall at pixel
     * scoreboard in case we're doing the copy with a fragment shader.
     */
-   cmd_buffer->state.queries.buffer_write_bits |= ANV_QUERY_WRITES_DATA_FLUSH;
+   cmd_buffer->state.queries.copy_bits |=
+      anv_cmd_buffer_shader_query_sync_bits(cmd_buffer);
 
    trace_intel_end_query_copy_shader(&cmd_buffer->trace, query_count);
 }

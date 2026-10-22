@@ -264,6 +264,11 @@ impl LegalizeFAU<'_> {
 
     fn extract_srcs(&mut self, model: &dyn Model, op: &Op) {
         for (src_idx, src) in op.srcs().iter().enumerate() {
+            // Fake sources don't count towards FAU bounds
+            if model.op_src_is_fake(op, src) {
+                continue;
+            }
+
             if matches!(src.src_ref, SrcRef::Zero) {
                 self.reads_k0 = true;
             }
@@ -495,6 +500,11 @@ fn legalize_fau_srcs(
     if !ctx.slots.is_empty() {
         if b.model().op_is_message(op) {
             ctx.legalize_message();
+            // BLEND and ATEST act either as ALU or as message instructions
+            // depending on state so we have to legalize both ways.
+            if matches!(op, Op::Blend(_) | Op::BlendCall(_) | Op::ATest(_)) {
+                ctx.legalize_execution_unit();
+            }
         } else {
             ctx.legalize_execution_unit();
         }

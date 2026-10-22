@@ -33,6 +33,7 @@
 #include "etnaviv_screen.h"
 #include "etnaviv_translate.h"
 
+#include "layout/eil_format.h"
 #include "util/box.h"
 #include "util/detect_arch.h"
 #include "util/hash_table.h"
@@ -135,7 +136,7 @@ etna_resource_alloc_render_shadow(struct pipe_context *pctx,
    struct etna_screen *screen = ctx->screen;
    struct etna_resource *res = etna_resource(prsc);
    bool need_multitiled = screen->specs.pe_multitiled;
-   bool want_supertiled = screen->specs.can_supertile;
+   bool want_supertiled = VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED);
    struct pipe_resource templat;
    unsigned layout;
 
@@ -172,15 +173,16 @@ etna_resource_can_use_ts(struct etna_screen *screen,
       return false;
 
    /* Can be handled by the resolve engine */
-   if (!etna_resource_hw_tileable(screen->specs.use_blt, prsc))
+   if (!etna_resource_hw_tileable(VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE), prsc))
       return false;
 
    /* Do not use TS for emulated 128 bit formats */
-   if (format_is_128bit(prsc->format))
+   if (eil_format_is_emulated_128bit(prsc->format))
       return false;
 
    /* Without BLT_8bpp_256TILE_FC_FIX the BLT can not fast clear 8 bpp MSAA */
-   if (screen->specs.use_blt && prsc->nr_samples > 1 &&
+   if (VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE) &&
+       prsc->nr_samples > 1 &&
        util_format_get_blocksize(prsc->format) == 1 &&
        !VIV_FEATURE(screen, ETNA_FEATURE_BLT_8BPP_256TILE_FC_FIX))
       return false;
@@ -212,7 +214,7 @@ etna_screen_resource_alloc_ts(struct pipe_screen *pscreen,
     * v4 compression can be enabled everywhere without any known drawback,
     * except that in-place resolve must go through a slower path
     */
-   if ((screen->specs.v4_compression &&
+   if ((VIV_FEATURE(screen, ETNA_FEATURE_V4_COMPRESSION) &&
         (!modifier || (modifier & VIVANTE_MOD_COMP_DEC400))) ||
        (!modifier && prsc->nr_samples > 1))
       ts_compress_fmt = translate_ts_format(prsc->format);
@@ -333,7 +335,7 @@ setup_miptree(struct etna_resource *rsc, unsigned paddingX, unsigned paddingY,
               unsigned msaa_xscale, unsigned msaa_yscale)
 {
    struct pipe_resource *prsc = &rsc->base;
-   enum pipe_format fmt = translate_format_128bit_to_64bit(prsc->format);
+   enum pipe_format fmt = eil_format_emulated(prsc->format);
    unsigned level, size = 0;
    unsigned width = prsc->width0;
    unsigned height = prsc->height0;
@@ -352,7 +354,7 @@ setup_miptree(struct etna_resource *rsc, unsigned paddingX, unsigned paddingY,
       mip->layer_stride = mip->stride * util_format_get_nblocksy(fmt, mip->padded_height);
       mip->size = prsc->array_size * mip->layer_stride;
 
-      if (format_is_128bit(prsc->format))
+      if (eil_format_is_emulated_128bit(prsc->format))
          mip->size *= 2;
 
       /* align levels to 64 bytes to be able to render to them */
@@ -375,11 +377,13 @@ etna_layout_multiple(const struct etna_screen *screen,
                      unsigned *paddingX, unsigned *paddingY, unsigned *halign)
 {
    const struct etna_specs *specs = &screen->specs;
+   const bool use_blt = VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE);
+
    /* If we have the TEXTURE_HALIGN feature, we can always align to the resolve
     * engine's width.  If not, we must not align resources used only for
     * textures. If this GPU uses the BLT engine, never do RS align.
     */
-   bool rs_align = !specs->use_blt && (!etna_resource_sampler_only(templat) ||
+   bool rs_align = !use_blt && (!etna_resource_sampler_only(templat) ||
                    VIV_FEATURE(screen, ETNA_FEATURE_TEXTURE_HALIGN));
    int msaa_xscale = 1, msaa_yscale = 1;
 
@@ -399,7 +403,7 @@ etna_layout_multiple(const struct etna_screen *screen,
    switch (layout) {
    case ETNA_LAYOUT_LINEAR:
       *paddingX = rs_align ? 16 : 4;
-      *paddingY = !specs->use_blt ? 4 : 1;
+      *paddingY = !use_blt ? 4 : 1;
       *halign = rs_align ? TEXTURE_HALIGN_SIXTEEN : TEXTURE_HALIGN_FOUR;
       break;
    case ETNA_LAYOUT_TILED:
@@ -503,7 +507,7 @@ etna_resource_border_tail(const struct etna_resource *rsc)
 {
    const struct pipe_resource *prsc = &rsc->base;
    const struct etna_resource_level *lvl = &rsc->levels[prsc->last_level];
-   enum pipe_format fmt = translate_format_128bit_to_64bit(prsc->format);
+   enum pipe_format fmt = eil_format_emulated(prsc->format);
    int msaa_xscale = 1, msaa_yscale = 1;
    unsigned tile_w = 1, tile_h = 1;
    unsigned tail = 0;
@@ -688,25 +692,25 @@ etna_resource_create(struct pipe_screen *pscreen,
    if (templat->bind & PIPE_BIND_DEPTH_STENCIL) {
       if (screen->specs.pe_multitiled)
          layout |= ETNA_LAYOUT_BIT_MULTI;
-      if (screen->specs.can_supertile)
+      if (VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED))
          layout |= ETNA_LAYOUT_BIT_SUPER;
-   } else if (screen->specs.can_supertile &&
+   } else if (VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED) &&
               VIV_FEATURE(screen, ETNA_FEATURE_SUPERTILED_TEXTURE) &&
-              etna_resource_hw_tileable(screen->specs.use_blt, templat)) {
+              etna_resource_hw_tileable(VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE), templat)) {
       layout |= ETNA_LAYOUT_BIT_SUPER;
    }
 
    if (/* MSAA render target */
        (templat->nr_samples > 1) &&
        (templat->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL))) {
-      if (screen->specs.pixel_pipes > 1 && !screen->specs.single_buffer)
+      if (screen->specs.pixel_pipes > 1 && !VIV_FEATURE(screen, ETNA_FEATURE_SINGLE_BUFFER))
          layout |= ETNA_LAYOUT_BIT_MULTI;
-      if (screen->specs.can_supertile)
+      if (VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED))
          layout |= ETNA_LAYOUT_BIT_SUPER;
    }
 
    /* 128 bit format needs to be CPU tiled specially */
-   if (format_is_128bit(templat->format))
+   if (eil_format_is_emulated_128bit(templat->format))
       layout = ETNA_LAYOUT_TILED;
 
    if (/* linear base or scanout without modifier requested */
@@ -743,8 +747,8 @@ select_best_modifier(const struct etna_screen * screen,
                      const struct pipe_resource *templat,
                      const uint64_t *modifiers, const unsigned count)
 {
-   bool can_supertile = screen->specs.can_supertile &&
-                        etna_resource_hw_tileable(screen->specs.use_blt, templat);
+   bool can_supertile = VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED) &&
+                        etna_resource_hw_tileable(VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE), templat);
    enum modifier_priority prio = MODIFIER_PRIORITY_INVALID;
    uint64_t best_modifier, base_modifier;
 
@@ -902,10 +906,7 @@ static void etna_resource_finish_ts_import(struct etna_screen *screen,
    rsc->ts_scanout = ts_rsc->scanout;
    ts_rsc->scanout = NULL;
 
-   /* Get TS layout/usage information from the SW meta. FIXME: clear color may
-    * change over the lifetime of the resource, so might need to look this up
-    * at a few other places. For now it's not an issue, as buffers with shared
-    * TS get re-imported all the time. */
+   /* Get TS layout/usage information from the SW meta. */
    lvl->ts_meta = etna_bo_map(rsc->ts_bo) + ts_rsc->levels[0].offset;
    lvl->ts_compress_fmt = drmfourcc_to_ts_format(lvl->ts_meta->v0.comp_format);
    lvl->ts_offset = ts_rsc->levels[0].offset + lvl->ts_meta->v0.data_offset;
@@ -1246,7 +1247,7 @@ etna_resource_set_damage_region(struct pipe_screen *pscreen,
        * uses upper-left so we need to flip it. */
       damage->y = prsc->height0 - (damage->y + damage->height);
 
-      if (!screen->specs.use_blt)
+      if (!VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE))
          etna_align_box_for_rs(screen, etna_resource(rsc->render), damage);
    }
 
@@ -1362,7 +1363,7 @@ etna_buffer_rebind(struct etna_context *ctx, struct pipe_resource *prsc)
 
       u_foreach_bit(i, cb->enabled_mask) {
          if (cb->cb[i].buffer == prsc)
-            ctx->dirty |= ETNA_DIRTY_CONSTBUF;
+            ctx->dirty |= etna_constbuf_dirty(stage);
       }
    }
 

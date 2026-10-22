@@ -15,9 +15,9 @@
 #include "radv_shader.h"
 #include "vk_semaphore.h"
 
+#include "util/u_memory.h"
 #include "ac_rgp.h"
 #include "ac_sqtt.h"
-#include "util/u_memory.h"
 
 void
 radv_sqtt_emit_relocated_shaders(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline)
@@ -126,7 +126,7 @@ radv_sqtt_reloc_graphics_shaders(struct radv_device *device, struct radv_graphic
       else
          dest_ptr = slab_ptr + offset;
 
-      memcpy(dest_ptr, shader->code, shader->code_size);
+      radv_shader_get_code(device, shader, dest_ptr);
 
       offset += align(shader->code_size, RADV_SHADER_ALLOC_ALIGNMENT);
    }
@@ -726,7 +726,6 @@ radv_sqtt_wsi_submit(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *
 
       FREE(new_cmdbufs);
    }
-
 
    return result;
 
@@ -1465,7 +1464,8 @@ radv_fill_code_object_record(struct radv_device *device, struct rgp_shader_data 
    shader_data->hash[1] = (uint64_t)(uintptr_t)shader >> 32;
    shader_data->code_size =
       shader->exec_size; /* Only include executable size so RGP doesn't try to disassemble constant data. */
-   shader_data->code = shader->code;
+   shader_data->code = malloc(shader->code_size);
+   radv_shader_get_code(device, shader, shader_data->code);
    shader_data->vgpr_count = shader->config.num_vgprs;
    shader_data->sgpr_count = shader->config.num_sgprs;
    shader_data->scratch_memory_size = shader->config.scratch_bytes_per_wave;
@@ -1601,8 +1601,8 @@ radv_register_rt_stage(struct radv_device *device, struct radv_ray_tracing_pipel
    result = ac_sqtt_add_code_object_loader_event(&device->sqtt, *(uint64_t *)blake3, shader->va);
    if (!result)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   result =
-      radv_add_rt_record(device, &device->sqtt.rgp_code_object, pipeline, shader, stack_size, index, *(uint64_t *)blake3);
+   result = radv_add_rt_record(device, &device->sqtt.rgp_code_object, pipeline, shader, stack_size, index,
+                               *(uint64_t *)blake3);
    return result;
 }
 
@@ -1716,6 +1716,8 @@ radv_unregister_records(struct radv_device *device, uint64_t hash)
       if (record->pipeline_hash[0] == hash) {
          code_object->record_count--;
          list_del(&record->list);
+         u_foreach_bit (i, record->shader_stages_mask)
+            free(record->shader_data[i].code);
          free(record);
          break;
       }

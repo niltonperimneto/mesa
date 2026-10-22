@@ -169,7 +169,8 @@ radv_alloc_memory(struct radv_device *device, const VkMemoryAllocateInfo *pAlloc
        * (see DCC tiling flags).
        */
       if (pdev->info.gfx_level >= GFX12 && pdev->info.gfx12_supports_dcc_write_compress_disable &&
-          domain == RADEON_DOMAIN_VRAM && (flags & RADEON_FLAG_NO_CPU_ACCESS) && !radv_is_dcc_disabled(pdev)) {
+          domain == RADEON_DOMAIN_VRAM && (flags & RADEON_FLAG_NO_CPU_ACCESS) && !radv_is_dcc_disabled(pdev) &&
+          (!mem->image || mem->image->planes[0].surface.u.gfx9.gfx12_enable_dcc)) {
          flags |= RADEON_FLAG_GFX12_ALLOW_DCC;
       }
 
@@ -235,12 +236,9 @@ radv_alloc_memory(struct radv_device *device, const VkMemoryAllocateInfo *pAlloc
    *pMem = radv_device_memory_to_handle(mem);
    radv_rmv_log_heap_create(device, *pMem, is_internal, mem->vk.alloc_flags);
 
-   vk_device_memory_report_emit(&device->vk, result, /* is_alloc */ true,
-                                mem->vk.import_handle_type != 0,
-                                result == VK_SUCCESS ? mem->bo->obj_id : 0,
-                                result == VK_SUCCESS ? mem->bo->size : 0,
-                                VK_OBJECT_TYPE_DEVICE_MEMORY,
-                                (uintptr_t)mem, mem->heap_index);
+   vk_device_memory_report_emit(&device->vk, result, /* is_alloc */ true, mem->vk.import_handle_type != 0,
+                                result == VK_SUCCESS ? mem->bo->obj_id : 0, result == VK_SUCCESS ? mem->bo->size : 0,
+                                VK_OBJECT_TYPE_DEVICE_MEMORY, (uintptr_t)mem, mem->heap_index);
 
    if (import_info)
       close(import_info->fd);
@@ -248,11 +246,9 @@ radv_alloc_memory(struct radv_device *device, const VkMemoryAllocateInfo *pAlloc
    return VK_SUCCESS;
 
 fail:
-   vk_device_memory_report_emit(&device->vk, result, /* is_alloc */ true,
-                                mem->vk.import_handle_type != 0,
-                                0 /* obj_id */, 0 /* obj_size */,
-                                VK_OBJECT_TYPE_DEVICE_MEMORY,
-                                (uintptr_t)mem, mem->heap_index);
+   vk_device_memory_report_emit(&device->vk, result, /* is_alloc */ true, mem->vk.import_handle_type != 0,
+                                0 /* obj_id */, 0 /* obj_size */, VK_OBJECT_TYPE_DEVICE_MEMORY, (uintptr_t)mem,
+                                mem->heap_index);
    radv_free_memory(device, pAllocator, mem);
    return result;
 }
@@ -272,12 +268,9 @@ radv_FreeMemory(VkDevice _device, VkDeviceMemory _mem, const VkAllocationCallbac
    VK_FROM_HANDLE(radv_device_memory, mem, _mem);
 
    if (mem)
-      vk_device_memory_report_emit(&device->vk, VK_SUCCESS, /* is_alloc */ false,
-                                   mem->vk.import_handle_type != 0,
-                                   mem->bo->obj_id,
-                                   mem->bo->size,
-                                   VK_OBJECT_TYPE_DEVICE_MEMORY,
-                                   (uintptr_t)mem, mem->heap_index);
+      vk_device_memory_report_emit(&device->vk, VK_SUCCESS, /* is_alloc */ false, mem->vk.import_handle_type != 0,
+                                   mem->bo->obj_id, mem->bo->size, VK_OBJECT_TYPE_DEVICE_MEMORY, (uintptr_t)mem,
+                                   mem->heap_index);
 
    radv_free_memory(device, pAllocator, mem);
 }

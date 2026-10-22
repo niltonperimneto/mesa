@@ -384,6 +384,13 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
       radv_amdgpu_global_bo_list_del(ws, bo);
 
    const uint64_t va_size = radv_amdgpu_bo_va_size(bo->base.size, bo->flags);
+
+   if (bo->flags & RADEON_FLAG_VM_PAD_1PAGE) {
+      /* Unmap the VM padding separately because the ioctl can only unmap one mapping at a time. */
+      radv_amdgpu_bo_va_op(ws, bo->bo_handle, 0, 4096, bo->base.va + align64(bo->base.size, 4096), 0, 0,
+                           AMDGPU_VA_OP_UNMAP);
+   }
+
    radv_amdgpu_bo_va_op(ws, bo->bo_handle, 0, va_size, bo->base.va, 0, 0, AMDGPU_VA_OP_UNMAP);
    ac_drm_bo_free(ws->dev, bo->bo);
 
@@ -548,8 +555,8 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
                              (flags & RADEON_FLAG_REPLAYABLE ? AMDGPU_VA_RANGE_REPLAYABLE : 0);
    uint64_t va_gap_size = ws->debug_vm ? MAX2(4 * virt_alignment, 64 * 1024) : 0;
 
-   r = ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, va_size + va_gap_size, virt_alignment, replay_address,
-                             &va, &va_handle, va_flags);
+   r = ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, va_size + va_gap_size, virt_alignment,
+                             replay_address, &va, &va_handle, va_flags);
    if (r) {
       result = replay_address ? VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
       goto error_va_alloc;
