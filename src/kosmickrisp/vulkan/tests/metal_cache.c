@@ -12,7 +12,7 @@ mock_os_time_get_nano(void)
    return now ? now : os_time_get_nano();
 }
 
-#define os_time_get_nano mock_os_time_get_nano
+#define os_time_get_nano                 mock_os_time_get_nano
 #define mtl_new_render_pipeline mock_new_render_pipeline
 #define mtl_specialize_render_pipeline mock_specialize_render_pipeline
 #define mtl_new_compute_pipeline_state mock_new_compute_pipeline_state
@@ -1235,7 +1235,8 @@ test_shutdown_budget(void)
       defer_locked(cache, &descs[i]);
    }
    /* Hand the complete queue to the worker's shutdown drain. */
-   atomic_store_explicit(&mock_time_ns, os_time_get_nano(), memory_order_relaxed);
+   atomic_store_explicit(&mock_time_ns, os_time_get_nano(),
+                         memory_order_relaxed);
    cache->closing = cache->stopping = true;
    mtx_unlock(&cache->mutex);
    kk_metal_cache_destroy(cache);
