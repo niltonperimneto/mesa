@@ -1,3 +1,18 @@
+#include "util/os_time.h"
+
+#include <stdatomic.h>
+
+static atomic_int_fast64_t mock_time_ns;
+static const int64_t mock_compile_ns = 25000000;
+
+static int64_t
+mock_os_time_get_nano(void)
+{
+   int64_t now = atomic_load_explicit(&mock_time_ns, memory_order_relaxed);
+   return now ? now : os_time_get_nano();
+}
+
+#define os_time_get_nano mock_os_time_get_nano
 #define mtl_new_render_pipeline mock_new_render_pipeline
 #define mtl_specialize_render_pipeline mock_specialize_render_pipeline
 #define mtl_new_compute_pipeline_state mock_new_compute_pipeline_state
@@ -19,6 +34,7 @@
 #define disk_cache_put mock_disk_cache_put
 #define disk_cache_wait_for_idle mock_disk_cache_wait_for_idle
 #include "../kk_metal_cache.c"
+#undef os_time_get_nano
 
 #include "util/mesa-blake3.h"
 
@@ -95,7 +111,6 @@ static struct {
    unsigned disk_gets;
    unsigned serialize_failures;
    unsigned max_batch;
-   unsigned delay_ms;
    struct mock_entry disk[MAX_DISK];
    unsigned disk_count;
 } mock;
@@ -216,10 +231,10 @@ mock_compile(mtl_compiler *compiler, void *descriptor)
       fragment[*count] = desc->fragment;
       ids[(*count)++] = desc->id;
    }
-   unsigned delay = mock.delay_ms;
    mtx_unlock(&mock.lock);
-   if (delay)
-      thrd_sleep(&(struct timespec){ .tv_nsec = delay * 1000000l }, NULL);
+   if (atomic_load_explicit(&mock_time_ns, memory_order_relaxed))
+      atomic_fetch_add_explicit(&mock_time_ns, mock_compile_ns,
+                                memory_order_relaxed);
    return fail ? NULL : &pipeline;
 }
 
@@ -421,7 +436,7 @@ mock_reset(bool clear_disk)
    mock.archives = NULL;
    mock.archive_count = mock.archives_dead = 0;
    mock.archive_creates = mock.disk_gets = 0;
-   mock.serialize_failures = mock.max_batch = mock.delay_ms = 0;
+   mock.serialize_failures = mock.max_batch = 0;
    mock.archive_gate = mock.archive_gated = mock.archive_reject = false;
    if (clear_disk) {
       for (unsigned i = 0; i < mock.disk_count; ++i)
@@ -1212,7 +1227,6 @@ test_shutdown_budget(void)
    setenv("MESA_KK_CACHE_LOG", path, 1);
    setenv("MESA_KK_PSO_CACHE_SHUTDOWN_MS", "60", 1);
    mock_reset(true);
-   mock.delay_ms = 20;
    struct kk_metal_cache *cache = make_cache(0, 0);
    static struct mock_desc descs[24];
    mtx_lock(&cache->mutex);
@@ -1220,17 +1234,18 @@ test_shutdown_budget(void)
       descs[i] = (struct mock_desc){ .id = 15000 + i };
       defer_locked(cache, &descs[i]);
    }
+   /* Hand the complete queue to the worker's shutdown drain. */
+   atomic_store_explicit(&mock_time_ns, os_time_get_nano(), memory_order_relaxed);
+   cache->closing = cache->stopping = true;
    mtx_unlock(&cache->mutex);
-   int64_t start = os_time_get_nano();
    kk_metal_cache_destroy(cache);
-   int64_t elapsed = os_time_get_nano() - start;
-   CHECK(elapsed < 350000000ll);
+   atomic_store_explicit(&mock_time_ns, 0, memory_order_relaxed);
    mtx_lock(&mock.lock);
    unsigned compiled = mock.call_count;
-   CHECK(compiled > 0 && compiled < ARRAY_SIZE(descs) && mock.serializes >= 1);
+   /* Three 25 ms compiles cross the 60 ms deadline. */
+   CHECK(compiled == 3 && mock.serializes >= 1);
    for (unsigned i = 0; i < compiled; ++i)
       CHECK(mock.calls[i] == descs[i].id);
-   mock.delay_ms = 0;
    mtx_unlock(&mock.lock);
    unsigned skipped = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(descs); ++i) {
